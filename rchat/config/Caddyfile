@@ -1,0 +1,61 @@
+# Caddy as a layer-4 (TCP passthrough) front end for the RChat relay
+#
+# Needs Caddy built with the caddy-l4 plugin (github.com/mholt/caddy-l4),
+# which provides the `layer4` global option used below:
+#   xcaddy build --with github.com/mholt/caddy-l4
+#
+# Protocol v2 binds each client's key-authentication proof, and the relay's
+# identity signature, to the relay's OWN TLS session, so Caddy must NOT
+# terminate TLS for the relay: a `reverse_proxy` site block makes every
+# connection fail. Here Caddy forwards the raw bytes from public :443 to the
+# relay on 127.0.0.1:8443, which terminates TLS 1.3 itself, and prefixes each
+# connection with a PROXY protocol v2 header naming the client's address. The
+# relay reads that header (config/server-behind-proxy.toml:
+# proxy_protocol = true) for its per-source fair shares; it accepts it only
+# from loopback and refuses connections without it.
+#
+# Per-client connection caps: the relay's per-address caps must be 0 in this
+# layout, and as far as we know caddy-l4 cannot cap concurrent connections
+# per client address (its throttle handler limits bandwidth only). If you
+# need one, use HAProxy (stick-table example in config/server-behind-proxy.toml)
+# or let the relay own :443 directly.
+#
+# This file has no site blocks, so Caddy's HTTP app does not claim :443.
+# Place it at /etc/caddy/Caddyfile, or run `caddy run --config /path/to/Caddyfile`.
+
+{
+	layer4 {
+		:443 {
+			route {
+				proxy {
+					proxy_protocol v2
+					upstream 127.0.0.1:8443
+				}
+			}
+		}
+	}
+}
+
+# The equivalent JSON (caddy-l4's native form), for reference:
+#
+# {
+#   "apps": {
+#     "layer4": {
+#       "servers": {
+#         "rchat": {
+#           "listen": [":443"],
+#           "routes": [{
+#             "handle": [{
+#               "handler": "proxy",
+#               "proxy_protocol": "v2",
+#               "upstreams": [{ "dial": ["127.0.0.1:8443"] }]
+#             }]
+#           }]
+#         }
+#       }
+#     }
+#   }
+# }
+#
+# Metrics: the relay's endpoint stays on 127.0.0.1:9090 (unauthenticated).
+# Reach it over an SSH tunnel rather than publishing it through Caddy.

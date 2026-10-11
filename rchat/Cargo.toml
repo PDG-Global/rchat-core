@@ -1,0 +1,168 @@
+[package]
+name = "rchat-server"
+version = "1.1.0"
+edition = "2021"
+authors = ["RChat Team"]
+description = "Secure end-to-end encrypted chat server"
+license = "AGPL-3.0-or-later"
+rust-version = "1.75"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "parking_lot"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# WebSocket
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+bincode = "1.3"
+
+# Cryptography
+ring = "0.17"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "reusable_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+blake3 = "1.5"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+rand = { version = "0.8", features = ["getrandom"] }
+getrandom = "0.2"
+
+# Security
+zeroize = { version = "1.7", features = ["derive"] }
+constant_time_eq = "0.3"
+subtle = "2.5"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+prometheus = { version = "0.13", default-features = false }
+lazy_static = "1.4"
+
+# Configuration
+config = "0.14"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Concurrent data structures
+dashmap = "5.5"
+parking_lot = "0.12"
+
+# Bytes
+bytes = "1.5"
+
+# Bitflags
+bitflags = { version = "2.4", features = ["serde"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Hex encoding
+hex = "0.4"
+# statfs (memory-filesystem check) and geteuid for the queue key (RCQ2)
+libc = "0.2"
+
+# Home directory detection
+dirs = "5.0"
+
+# RChat core library (for test binaries)
+rchat-core = { path = "shared/rchat-core", default-features = false }
+# Test binaries only (test-e2ee-automated's software device key, spec §18.14
+# E16); the same version and features as rchat-core, so nothing new is built.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+# Metrics endpoint (HTTP/1.1 only)
+hyper = { version = "1.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+http = "1.0"
+
+# TLS 1.3 (mandatory - no TLS 1.2 support). Always compiled in; plaintext only
+# via the explicit, dev-only `--no-tls` flag. Default features are off so the
+# server does not ask for aws-lc-rs or rustls's TLS 1.2 code itself; the
+# protocol version is also pinned to TLS 1.3 in src/tls.rs regardless.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+
+# Built-in Let's Encrypt (ACME, TLS-ALPN-01 on the existing listener).
+# 0.15.x targets rustls 0.23. Default features are off: no aws-lc-rs, and no
+# TLS 1.2 for the ACME HTTP client either.
+rustls-acme = { version = "0.15.4", default-features = false, features = ["ring", "webpki-roots"] }
+# Certificate expiry checks (same version rustls-acme already uses).
+x509-parser = "0.18"
+
+# HTTP/3 (QUIC) support - disabled for now due to dependency issues
+# h3 = "0.0.6"
+# h3-quinn = "0.0.7"
+# quinn = { version = "0.11", features = ["rustls", "ring"] }
+
+# TOML parsing
+toml = "0.8"
+
+[[bin]]
+name = "rchat-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-e2ee-automated"
+path = "src/bin/test-e2ee-automated.rs"
+
+[[bin]]
+name = "test-e2ee-integration"
+path = "src/bin/test-e2ee-integration.rs"
+
+[[bin]]
+name = "test-ios-companion"
+path = "src/bin/test-ios-companion.rs"
+
+[features]
+# Guard only: the native-tls stack has no TLS exporter, which key
+# authentication needs (spec §4.1). Enabling it is a compile error.
+native-tls = []
+# Malicious-relay harness for end-to-end test E5. NEVER enable in a build
+# that serves real users; the server refuses to start with it unless
+# RCHAT_MITM_I_UNDERSTAND=1 and the bind address is loopback.
+test-mitm = []
+
+[dev-dependencies]
+# Tests only: a TLS 1.2-capable client, used to prove the server refuses 1.2,
+# and rcgen for throwaway self-signed certificates.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+# Paused-clock tests for the ACME retry floor.
+tokio = { version = "1.35", features = ["full", "parking_lot", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# The relay is one multi-tenant process: unwinding lets tokio confine a
+# panic to the one connection task it happened in (its state is removed by
+# `ConnectionCleanup` while unwinding) instead of aborting every user's
+# circuits and the in-memory queue (S-5). Overflow checks turn a silent
+# integer wrap into such a contained panic (S-6). rchat-core keeps
+# panic = "abort" in its own profile (no unwinding across extern "C").
+panic = "unwind"
+overflow-checks = true
+
+[profile.release.build-override]
+opt-level = 3

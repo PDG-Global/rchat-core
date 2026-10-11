@@ -1,0 +1,74 @@
+[package]
+name = "rchat-core"
+version = "1.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "rchat_core"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi"]
+
+[profile.release]
+opt-level = 'z'
+lto = false
+strip = "none"
+panic = "abort"
+debug = false
+# Integer overflow aborts instead of wrapping silently (S-6).
+overflow-checks = true
+
+[features]
+default = []
+uniffi = ["dep:uniffi", "dep:uniffi_macros"]
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli", "tokio"], optional = true }
+uniffi_macros = { version = "0.28", optional = true }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+thiserror = "2.0"
+once_cell = "1.19"
+dashmap = "6.0"
+parking_lot = "0.12"
+socket2 = "0.5"
+tracing = "0.1"
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+hkdf = "0.12"
+hmac = "0.12"
+constant_time_eq = "0.3"
+zeroize = "1.7"
+uuid = { version = "1.0", features = ["v4"] }
+log = "0.4"
+boring = "5.1.0"
+tokio-boring = "5.0.0"
+
+# Platform-specific dependencies for blake3
+# iOS: Use pure Rust implementation (no NEON assembly due to ___chkstk_darwin issue)
+[target.'cfg(target_os = "ios")'.dependencies]
+blake3 = { version = "1.5", default-features = false, features = ["pure"] }
+security-framework = "3.0"
+
+# Android ARMv7: Use pure Rust (no NEON due to hard float ABI issues)
+[target.'cfg(all(target_os = "android", target_arch = "arm"))'.dependencies]
+blake3 = { version = "1.5", default-features = false, features = ["pure"] }
+
+# Other platforms: Use NEON optimizations
+[target.'cfg(not(any(target_os = "ios", all(target_os = "android", target_arch = "arm"))))'.dependencies]
+blake3 = { version = "1.5", features = ["neon"] }
+

@@ -1,0 +1,240 @@
+# rChat server configuration template.
+#
+# TLS is mandatory and always TLS 1.3 (no TLS 1.2, no 0-RTT); the version is
+# not configurable. Configure EXACTLY ONE certificate source below:
+#   [server.acme]  automatic Let's Encrypt certificates (recommended for a
+#                  server that owns public port 443 directly), or
+#   [server.tls]   a static certificate and key from disk.
+# Configuring both, or neither, makes the server refuse to start. The only way
+# to run without TLS is the explicit development flag `--no-tls`.
+# A missing or unreadable config file is a startup error.
+
+[server]
+bind_addr = "0.0.0.0:443"
+
+# ---------------------------------------------------------------------------
+# Resource limits (see docs/deployment/07-resource-limits.md)
+#
+# The server refuses to start if any of these is missing a sane value
+# (e.g. 0 or an out-of-range number) - there is no "unlimited" setting.
+# ---------------------------------------------------------------------------
+
+# Maximum simultaneous TCP connections, counted from accept() (including the
+# TLS handshake and HTTP upgrade). Connection N+1 is closed immediately,
+# before any TLS or HTTP work, and counted in
+# rchat_rejections_total{reason="max_connections"}. Default: 10000.
+# Make sure the process file-descriptor limit (ulimit -n / LimitNOFILE) is
+# comfortably above this.
+max_connections = 10000
+
+# Maximum simultaneous connections from one source address (an IPv4 address,
+# or an IPv6 /64). Extra connections are closed immediately and counted in
+# rchat_rejections_total{reason="per_ip_cap"}. Addresses are never logged;
+# the server keeps only a keyed hash in memory while connections are open.
+# 0 disables the cap - REQUIRED behind a layer-4 front end, where every
+# connection comes from the front end's address. Default: 64.
+max_connections_per_ip = 64
+
+# Aggregate cap on simultaneous connections from one IPv6 /48 (65,536 /64s,
+# each of which gets its own max_connections_per_ip). Extra connections are
+# closed immediately (rchat_rejections_total{reason="per_prefix_cap"}).
+# IPv4 is unaffected. 0 disables it. Default: 256.
+max_connections_per_ipv6_48 = 256
+
+# Inbound bandwidth per connection, in BYTES per second (despite the name).
+# Token bucket; burst = max(rate_limit_bps, max_message_bytes). Each message
+# is charged its size plus 256 bytes, so tiny-frame floods are limited too
+# (~4096 messages/s at the default). A connection over budget is throttled,
+# not disconnected: the server stops reading from it until the budget
+# refills, and TCP flow control pushes back on the client. Each pause is
+# counted in rchat_rejections_total{reason="rate_limit"}. Minimum 1024.
+# Default: 1048576 (1 MiB/s).
+rate_limit_bps = 1048576
+
+# Largest WebSocket message or frame accepted from a client, in bytes.
+# Anything larger closes the connection
+# (rchat_rejections_total{reason="oversized_frame"}). Must be between
+# 65536 and 67108864. Default: 4194304 (4 MiB) - room for compressed images.
+# Clients accept at most 4 MiB + 64 KiB per message from the relay
+# (rchat-core MAX_INBOUND_MESSAGE_BYTES), so raising this past the default
+# lets clients send messages other clients will refuse to receive.
+max_message_bytes = 4194304
+
+# Close a connection that has sent nothing for this many seconds. Clients
+# send a keepalive every 30 s, so live clients are never affected.
+# 60-86400. Default: 300.
+connection_timeout_secs = 300
+# Only WebSocket upgrades to exactly this path reach the relay; every other
+# request (including upgrades elsewhere) gets the decoy website. Default "/".
+# Recommended for anti-probing: a long random path, e.g. "/" + 32 random
+# URL-safe characters (openssl rand -base64 24 | tr '+/' '-_'). The client's
+# server URL MUST include it, e.g. wss://host/<path>.
+# The default "/" provides NO protection against active probing: set a long
+# random path and put it in clients' server URL. Enforced even if the decoy
+# is disabled (mismatched upgrades then get a plain 404).
+# The server REFUSES TO START while this still contains "CHANGE-ME".
+websocket_path = "/CHANGE-ME-to-a-long-random-path"
+
+# A new connection must prove an identity (an authenticated key-bundle
+# publish; a hello alone does not count) within this many seconds or it is
+# closed (rchat_rejections_total{reason="identification_timeout"}).
+# Real clients do so immediately. 1-300, at most connection_timeout_secs.
+# Hellos plus publishes are also budgeted per connection (6, then one per
+# 10 s); a connection over budget is closed (reason="auth_rate").
+# Default: 15.
+identification_timeout_secs = 15
+
+# Most pending CircuitAsks in the whole server: one-sided asks waiting for the
+# other identity to ask back. An ask expires after 540 s (gone within 10
+# minutes with the sweep) or when its asker disconnects. When full, see
+# max_pending_per_source below; otherwise a new ask is refused with
+# RateLimited (rchat_rejections_total{reason="pending_targets"}).
+# 1-1000000. Default: 10000.
+max_pending_circuit_targets = 10000
+
+# Most distinct targets ONE connection may ask without an answer within 540 s
+# (so one client cannot use up the global budget above). Re-asking the same
+# target is free. Default: 32.
+max_pending_per_connection = 32
+
+# Most pending CircuitAsks all connections from ONE source (an IPv4 address or
+# an IPv6 /48) may hold at once. When max_pending_circuit_targets is reached,
+# an ask from a lighter source evicts the oldest ask of the heaviest source
+# (reason="pending_evicted") instead of being refused.
+# 1..=max_pending_circuit_targets. Default: 1024.
+# Per-source limits (this one, max_circuits_per_source, the knock share and
+# the asker-quota share) are OFF when max_connections_per_ip = 0 - behind a
+# layer-4 front end every connection has the front end's address - unless
+# proxy_protocol = true (below) supplies the client's address.
+max_pending_per_source = 1024
+
+# Behind a layer-4 (TCP passthrough) front end ON THIS HOST only: every
+# connection must start with a PROXY protocol v2 header (HAProxy
+# send-proxy-v2, caddy-l4 proxy_protocol v2), read before TLS; its source
+# address is used for the per-source limits. Connections from a non-loopback
+# peer or without a valid v2 header are refused. Needs a loopback bind_addr
+# and max_connections_per_ip = max_connections_per_ipv6_48 = 0. Any local
+# process can send a header naming any source, so this is for fair shares
+# only, never authentication, logging or caps. See
+# config/server-behind-proxy.toml. Default: false.
+# proxy_protocol = false
+
+# Most circuits one connection may have created that still exist - and most
+# circuits one IDENTITY may be a member of, whichever side asked first, across
+# reconnects - and most circuit routing entries in the whole server (two per
+# pair). Beyond either per-connection/identity cap, the CircuitAsk that would
+# form the pair is refused with RateLimited
+# (rchat_rejections_total{reason="circuit_cap"}). With the whole table full,
+# the heaviest source's newest pair is torn down for a lighter source's
+# (reason="circuit_evicted"); without a heavier source it is refused.
+# Defaults: 256 and 200000.
+max_circuits_per_connection = 256
+max_circuits = 200000
+
+# Most circuits (pair sides) the identities that asked from ONE source may
+# hold at once; counted when the pair is created and kept across reconnects.
+# 2..=max_circuits. Default (unset): max_circuits / 64 = 3125, so no fewer
+# than 64 sources can fill max_circuits. When the table is full anyway, a
+# pair from a lighter source evicts the heaviest source's newest pair
+# (reason="circuit_evicted") instead of being refused.
+# max_circuits_per_source = 3125
+
+# Offline message store (messages for recipients that are not connected).
+# A message that would exceed either cap is REFUSED: the sender gets no
+# MessageAck and receives a RateLimited error instead
+# (rchat_rejections_total{reason="queue_overflow"}). Queued messages are
+# never dropped to make room. There is also a fixed cap of 1000 messages per
+# recipient. Retention: see [server.offline_queue] below (72 h by default).
+# Defaults: 268435456 (256 MiB) total, 16777216 (16 MiB) per recipient.
+offline_queue_max_total_bytes = 268435456
+offline_queue_max_bytes_per_recipient = 16777216
+
+# Relay-wide memory budgets. When one is spent, the heaviest source's
+# heaviest connection is shed. Size them with the offline queue to the host's
+# RAM (defaults suit 4 GB+; on a 2 GB host use about 256 MiB and 128 MiB).
+outbound_budget_bytes = 1073741824   # bytes queued for sending, all connections
+buffer_budget_bytes = 536870912      # WebSocket buffers, all connections
+
+# Seconds a client gets to finish the TLS handshake (1-120).
+tls_handshake_timeout_secs = 10
+
+# Development only (--no-tls): the relay origin exactly as clients connect,
+# "scheme://host:port". Required with --no-tls, ignored with TLS.
+# dev_origin = "ws://127.0.0.1:18443"
+
+# Offline store (messages and message requests for recipients who are not
+# connected). Held in memory by default; nothing is written to disk.
+[server.offline_queue]
+# Lifetime of a queued message in seconds (3600-604800). Default 72 h.
+# Message requests ("knocks") live min(ttl_secs, 72 h).
+ttl_secs = 259200
+# Separate budget for knocks (2048 bytes each). One source may hold at most
+# 1/16 of it (its own oldest knock goes beyond that); when the budget is full
+# the oldest knock of the heaviest source is evicted (among equally heavy
+# sources, the oldest knock).
+knock_budget_bytes = 16777216
+# Keep queued items across restarts, encrypted. Requires a 32-byte key on a
+# memory filesystem (tmpfs/ramfs/mfs), owned by the service user, mode 0600
+# or stricter, on a different filesystem from persist_path.
+persist = false
+# Paths must be writable by the service: the systemd units allow only
+# /var/lib/rchat (state) and /run/rchat (RuntimeDirectory, a tmpfs kept
+# across restarts; the units create /run/rchat/queue.key once per boot).
+# FreeBSD (docs/deployment/04-freebsd-deployment.md): /var/db/rchat/queue.rcq
+# and /var/run/rchat/queue.key on a tmpfs mount.
+# persist_path     = "/var/lib/rchat/queue.rcq"
+# persist_key_path = "/run/rchat/queue.key"
+# Dev/exception only: skip the memory-filesystem check for the key.
+# allow_persistent_key = false
+
+# --- Option 1: automatic certificates (Let's Encrypt, TLS-ALPN-01) ---------
+# Requirements: a public DNS A/AAAA record for every domain pointing at this
+# host, and public TCP port 443 reaching this listener directly (no TLS
+# terminating proxy in front; a plain port forward is fine). Port 80 is never
+# used. Until the first certificate is issued (normally under a minute) TLS
+# handshakes fail. Renewal is automatic and needs no restart.
+[server.acme]
+enabled = true
+domains = ["chat.example.com"]
+# Optional; plain addresses get a mailto: prefix.
+contacts = ["ops@example.com"]
+# Absolute path. Holds the ACME account key and certificate private keys;
+# created 0700, files 0600. Must persist across restarts.
+cache_dir = "/var/lib/rchat/acme"
+# Start with true (untrusted certs, no rate-limit risk), then set false.
+staging = true
+
+# --- Option 2: static certificate --------------------------------------------
+# Remove [server.acme] above (or set enabled = false) and uncomment:
+# [server.tls]
+# cert_path = "/etc/rchat/tls/fullchain.pem"
+# key_path = "/etc/rchat/tls/privkey.pem"
+# Send SIGHUP (systemctl reload rchat-server) to load a renewed certificate.
+
+[logging]
+format = "pretty"
+output = "stdout"
+# Include client IPs in debug log lines (abuse handling). Default false; never
+# affects info/warn/error. See docs/security/01-threat-model.md "What the Relay Logs".
+# log_client_ips = false
+
+[metrics]
+enabled = true
+# Unauthenticated: keep it on loopback. A non-loopback address is a startup
+# error unless allow_public = true (then firewall it). At most 8 connections
+# are served at once, each with a 5 s header and 30 s total timeout.
+bind_addr = "127.0.0.1:9090"
+# allow_public = false
+
+# Decoy website served to non-WebSocket HTTP requests (scanners, probes).
+# With no `root`, a small generic built-in page is served.
+[server.decoy]
+enabled = true
+# Absolute path to a static site (index.html, css, images...). The directory
+# must exist at startup or the server refuses to start. Symlinks that point
+# outside it are never followed.
+# root = "/var/www/decoy"
+# Value of the `Server` response header; keep it consistent with your site.
+server_header = "nginx/1.24.0"
+# Timeout for writing a whole decoy response.
+write_timeout_secs = 30

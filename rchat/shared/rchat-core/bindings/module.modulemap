@@ -1,0 +1,4 @@
+module rchat_coreFFI {
+    header "rchat_coreFFI.h"
+    export *
+}

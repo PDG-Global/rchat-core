@@ -1,0 +1,108 @@
+# RChat Server Configuration — behind a layer-4 (TCP passthrough) front end
+#
+# Protocol v2 binds each client's key-authentication proof, and the relay's
+# identity signature, to the relay's OWN TLS session, so the relay must
+# terminate TLS itself. A proxy that terminates TLS (Caddy reverse_proxy,
+# an nginx ssl listener, HAProxy mode http, a CDN) makes every
+# connection fail and is not supported.
+#
+# Supported front ends: a TCP passthrough on public :443 that forwards raw
+# bytes to 127.0.0.1:8443 and prefixes each connection with a PROXY
+# protocol v2 header naming the client's address (proxy_protocol = true
+# below). Only these two are supported; otherwise let the relay own :443
+# itself (scripts/rchat-server-direct.service).
+#
+#   HAProxy, with a per-client connection cap (64 concurrent connections per
+#   client address; set it like max_connections_per_ip in the direct layout):
+#     frontend rchat
+#         mode tcp
+#         bind :::443 v4v6
+#         stick-table type ipv6 size 1m expire 10m store conn_cur
+#         tcp-request connection track-sc0 src
+#         tcp-request connection reject if { sc0_conn_cur gt 64 }
+#         default_backend relay
+#     backend relay
+#         mode tcp
+#         server r1 127.0.0.1:8443 send-proxy-v2
+#
+#   caddy-l4: the proxy handler's  proxy_protocol: v2  (in Caddyfile syntax
+#   `proxy_protocol v2`; see config/Caddyfile). As far as we know caddy-l4
+#   has no matcher or handler that caps concurrent connections per client
+#   address (its throttle handler limits bandwidth only). If you need a
+#   per-client connection cap, use HAProxy as above, or the direct layout,
+#   where the relay enforces max_connections_per_ip itself.
+#
+# The relay accepts PROXY protocol version 2 only; a version 1 (text)
+# header is refused. Stock nginx's stream module sends only v1, so nginx is
+# not a supported front end.
+#
+# Trust boundary: the relay believes the PROXY header from ANY process that
+# can connect to 127.0.0.1:8443 on this host, so any local user or process
+# can name any source address. The address is used for the per-source fair
+# shares only, never for authentication, logging or connection caps; on a
+# shared host, a local process could at worst skew those shares.
+#
+# Usage (scripts/rchat-server.service runs the second command):
+#   rchat-server --config /etc/rchat/server.toml --init-relay-identity   # once, as the service user
+#   rchat-server --config /etc/rchat/server.toml
+
+[server]
+bind_addr = "127.0.0.1:8443"
+max_connections = 10000
+# Behind a TCP front end every connection comes from the front end's address,
+# so the per-address connection caps must be disabled here (otherwise the
+# whole server would be limited to that many connections; with
+# proxy_protocol = true the relay refuses to start unless both are 0).
+# Enforce per-client connection caps in the front end (HAProxy example above).
+max_connections_per_ip = 0
+max_connections_per_ipv6_48 = 0
+# Every connection starts with the front end's PROXY v2 header, read before
+# TLS; its source address keeps the per-source fair shares (pending asks,
+# circuits, knocks, asker quota, shedding) working here. Connections from a
+# non-loopback peer, or without a valid v2 header, are refused, and
+# bind_addr must be a loopback address. Without
+# PROXY v2 (proxy_protocol = false behind a passthrough) those fair shares
+# are off.
+proxy_protocol = true
+# Bytes/second per connection; throttles (does not disconnect) when exceeded.
+rate_limit_bps = 1048576
+max_message_bytes = 4194304
+connection_timeout_secs = 300
+offline_queue_max_total_bytes = 268435456
+offline_queue_max_bytes_per_recipient = 16777216
+# See docs/deployment/07-resource-limits.md for what each limit does.
+# Offline queue retention and opt-in encrypted persistence: [server.offline_queue]
+# (see config/server.toml); queued messages are memory-only by default.
+
+# Only WebSocket upgrades to exactly this path reach the relay. The server
+# refuses to start while it still contains "CHANGE-ME"; put the same path in
+# clients' server URL (wss://host/<path>).
+websocket_path = "/CHANGE-ME-to-a-long-random-path"
+
+# The relay identity key must be owned by the service user and its directory
+# writable by it for --init-relay-identity and --rotate-relay-identity.
+# Default: relay_identity.key next to this file.
+relay_identity_path = "/var/lib/rchat/relay_identity.key"
+
+# The relay terminates TLS 1.3 itself. This template uses a static
+# certificate (renew it out of band and send SIGHUP — systemctl reload
+# rchat-server — to load the renewed one). Built-in ACME ([server.acme]) also
+# works if the front end forwards every connection for the domain on public
+# :443 to this listener, so Let's Encrypt's TLS-ALPN-01 check reaches it.
+[server.tls]
+cert_path = "/etc/rchat/tls/fullchain.pem"
+key_path = "/etc/rchat/tls/privkey.pem"
+
+[logging]
+format = "json"
+output = "stdout"
+
+[metrics]
+enabled = true
+# Bind metrics to localhost only so they're not exposed to the internet directly.
+# Access them through an authenticated front end or an SSH tunnel.
+bind_addr = "127.0.0.1:9090"
+
+# Decoy mode stays off here: the TCP front end owns public :443.
+[decoy]
+enabled = false
