@@ -11,7 +11,17 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 pub const RECORD_MAGIC: &[u8; 4] = b"RCS1";
-pub const RECORD_VERSION: u8 = 1;
+/// 9 since Task 14b fix round 0: the timer also carries whether the peer
+/// acknowledged our change and the latest carrier's id (ruling R32). 8,
+/// Task 14b: peer records carry the contact's disappearing timer
+/// (protocol v3 §I.2). 7, Task 10 fix round 2: the steady unheard
+/// count (R26). 6, Task 9 fix round 2: the last acted-on knock hour (N-2). 5, fix round 1: session snapshots carry the blind-asking
+/// clock and the last identity fallback (R20) in place of 4's blind-ask
+/// timeout count (4 added the blinded mark and a pending session-init's
+/// origin; 3, Task 7, the pair secret and epoch; 2, Task 4, the
+/// session-init state). An older record is refused
+/// (`RestoreError::Version`), never migrated: there were no users before v3.
+pub const RECORD_VERSION: u8 = 9;
 pub const KIND_META: u8 = 1;
 pub const KIND_PEER: u8 = 2;
 pub const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
@@ -46,8 +56,55 @@ impl Drop for CircuitV1 {
     }
 }
 
+/// A 32-byte secret in a record, wiped when the record goes.
 #[derive(Serialize, Deserialize)]
-pub struct SessionSnapshotV1 {
+pub struct Secret32(pub [u8; 32]);
+
+impl Drop for Secret32 {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// `ChatSession::init_out` (§A.4): the initiator's session-init until the
+/// peer's first reply. No secret: `ct` and `sent_payload` went on the wire,
+/// `confirm` is a MAC over `ct`.
+#[derive(Serialize, Deserialize)]
+pub struct InitOutV1 {
+    pub ct: Vec<u8>,
+    pub confirm: [u8; 32],
+    /// The sealed init, once built (`sent_id` is its message id).
+    pub sent_id: Option<[u8; 16]>,
+    pub sent_payload: Vec<u8>,
+}
+
+/// A responder's wait for session-init (§A.3), so a restart can still open
+/// the init. The KEM ephemeral is kept as its 64-byte seed (R4).
+#[derive(Serialize, Deserialize)]
+pub struct PendingInitV1 {
+    pub kem_seed: Vec<u8>,
+    pub ek_r: [u8; 32],
+    pub i_ek: [u8; 32],
+    pub peer_ak: [u8; 32],
+    pub circuit: CircuitV1,
+    pub expires_at_unix: u64,
+    /// When the circuit was set up: the wait never outlives the relay's
+    /// offline queue (72 h) from then (ruling R8).
+    pub created_at_unix: u64,
+    /// The pair came from a blind match: its PS is kept at install (R14).
+    pub blind: bool,
+}
+
+/// The ephemeral secrets are wiped when the record goes.
+impl Drop for PendingInitV1 {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.kem_seed);
+        zeroize::Zeroize::zeroize(&mut self.ek_r);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionSnapshotV2 {
     pub ratchet: RatchetSnapshotV1,
     pub is_established: bool,
     pub is_initiator: bool,
@@ -62,8 +119,20 @@ pub struct SessionSnapshotV1 {
     pub created_at_unix: u64,
     /// `ChatSession::reported_lost`: (id, last reason, made eligible).
     pub reported_lost: Vec<([u8; 16], u8, bool)>,
-    /// `ChatSession::session_binding` (D45): a hash of SK, not SK.
+    /// `ChatSession::session_binding` (D45, v3 domain): a hash of SK, not SK.
     pub session_binding: [u8; 32],
+    /// `ChatSession::init_out` (§A.4).
+    pub init_out: Option<InitOutV1>,
+    /// The pair secret PS (§C.1); `None` for a session without a ratchet.
+    pub pair_secret: Option<Secret32>,
+    /// The pair epoch (§C.1).
+    pub pair_epoch: crate::pairing::PairEpoch,
+    /// `ChatSession::blinded` (§C.2): never resumed by id.
+    pub blinded: bool,
+    /// `ChatSession::blind_since_unix` (R20).
+    pub blind_since_unix: Option<u64>,
+    /// `ChatSession::last_identity_fallback_unix` (R20).
+    pub last_identity_fallback_unix: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,9 +158,9 @@ pub struct SentIdV1 {
 /// and callers move fields out of it (F3). `lost_unstored_ids` holds the
 /// reason-2 ids (F4).
 #[derive(Serialize, Deserialize, Default)]
-pub struct PeerRecordV1 {
+pub struct PeerRecordV2 {
     pub peer_ik: [u8; 32],
-    pub session: Option<SessionSnapshotV1>,
+    pub session: Option<SessionSnapshotV2>,
     pub retired: Option<RetiredSnapshotV1>,
     pub sent_ids: Vec<SentIdV1>,
     pub received_ids: Vec<[u8; 16]>,
@@ -108,6 +177,32 @@ pub struct PeerRecordV1 {
     /// Flags of the notice still owed (`FLAG_NO_PRIOR_SESSION` or 0).
     pub notice_flags: u8,
     pub auto_resends_unix: Vec<u64>,
+    /// A session-init still awaited from the peer (§A.3).
+    pub pending_init: Option<PendingInitV1>,
+    /// Issue hour and digest of the last knock from this contact that was
+    /// acted on (fix round 2 N-2): an older knock, or that same knock, is
+    /// ignored, also after a restart, so a replay cannot force another
+    /// identity ask.
+    pub last_knock: Option<(u64, [u8; 32])>,
+    /// Steady slots sent to this contact since anything from it last
+    /// decrypted (R23/R26), so a relaunch cannot reset the liveness gate
+    /// and widen the gap past the receiver's skip limit.
+    pub steady_unheard: u32,
+    /// The contact's disappearing timer (§I.2), when one was ever set.
+    pub timer: Option<TimerV1>,
+}
+
+/// A contact's disappearing timer: the value, when it was changed and
+/// whether this device changed it (the tie-break needs who, §I.2).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerV1 {
+    pub secs: u32,
+    pub changed_at_ms: u64,
+    pub by_me: bool,
+    /// The peer's delivered receipt for our change came back (R32).
+    pub acked: bool,
+    /// The latest `0x09` carrying this state.
+    pub out_id: Option<[u8; 16]>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -185,10 +280,37 @@ impl StateKeys {
         counter: u64,
         body: &[u8],
     ) -> Vec<u8> {
+        self.seal_versioned(our_ik, record_key, RECORD_VERSION, kind, counter, body)
+    }
+
+    /// Tests: a record sealed under another format version (a version-1
+    /// record from before protocol v3).
+    #[cfg(test)]
+    pub(crate) fn seal_as_version(
+        &self,
+        our_ik: &[u8; 32],
+        record_key: &str,
+        version: u8,
+        kind: u8,
+        counter: u64,
+        body: &[u8],
+    ) -> Vec<u8> {
+        self.seal_versioned(our_ik, record_key, version, kind, counter, body)
+    }
+
+    fn seal_versioned(
+        &self,
+        our_ik: &[u8; 32],
+        record_key: &str,
+        version: u8,
+        kind: u8,
+        counter: u64,
+        body: &[u8],
+    ) -> Vec<u8> {
         debug_assert!(kind == KIND_META || kind == KIND_PEER);
         let mut nonce = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let aad = Self::aad(our_ik, record_key, RECORD_VERSION, kind, counter);
+        let aad = Self::aad(our_ik, record_key, version, kind, counter);
         let ct = self
             .aead(our_ik)
             .encrypt(
@@ -201,7 +323,7 @@ impl StateKeys {
             .expect("XChaCha20-Poly1305 encrypt cannot fail");
         let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
         out.extend_from_slice(RECORD_MAGIC);
-        out.push(RECORD_VERSION);
+        out.push(version);
         out.push(kind);
         out.extend_from_slice(&counter.to_be_bytes());
         out.extend_from_slice(&nonce);
@@ -300,10 +422,10 @@ mod tests {
             RestoreError::Tag,
             "record key is bound"
         );
-        let mut v2 = sealed.clone();
-        v2[4] = 2;
+        let mut v_next = sealed.clone();
+        v_next[4] = RECORD_VERSION + 1;
         assert_eq!(
-            keys.open(&me, META_KEY, &v2).unwrap_err(),
+            keys.open(&me, META_KEY, &v_next).unwrap_err(),
             RestoreError::Version
         );
         let huge = vec![0u8; MAX_RECORD_BYTES + 1];
@@ -314,6 +436,30 @@ mod tests {
     }
 
     /// SP4: record keys are opaque, derived, distinct and valid.
+    /// Task 4 (snapshot V2): a version-1 record, validly sealed under its
+    /// own version, is refused with the typed `Version` error, never parsed
+    /// or migrated (no users before protocol v3).
+    #[test]
+    fn v1_record_is_refused_with_a_version_error() {
+        assert_eq!(RECORD_VERSION, 9);
+        let keys = StateKeys::new([1; 32]);
+        let me = [0xA1; 32];
+        let v1 = keys.seal_as_version(&me, META_KEY, 1, KIND_META, 1, &body());
+        assert_eq!(v1[4], 1);
+        assert_eq!(
+            keys.open(&me, META_KEY, &v1).unwrap_err(),
+            RestoreError::Version
+        );
+        let v2 = keys.seal_as_version(&me, META_KEY, 2, KIND_META, 1, &body());
+        assert_eq!(v2[4], 2);
+        assert_eq!(
+            keys.open(&me, META_KEY, &v2).unwrap_err(),
+            RestoreError::Version
+        );
+        let v3 = keys.seal(&me, META_KEY, KIND_META, 1, &body());
+        assert!(keys.open(&me, META_KEY, &v3).is_ok());
+    }
+
     #[test]
     fn sp4_record_keys_are_opaque_hmac_names() {
         let k1 = StateKeys::new([1; 32]);
@@ -326,7 +472,7 @@ mod tests {
         assert_ne!(ka, StateKeys::new([2; 32]).record_key_for(&a));
         assert!(!hex::encode(a).contains(&ka));
         // A peer record naming `a`: sealed, neither its raw bytes nor its hex appear (F28).
-        let rec = PeerRecordV1 {
+        let rec = PeerRecordV2 {
             peer_ik: a,
             received_ids: vec![[4; 16]],
             ..Default::default()
@@ -348,7 +494,7 @@ mod tests {
         );
         let (kind, _, plain) = k1.open(&[3; 32], &ka, &sealed).unwrap();
         assert_eq!(kind, KIND_PEER);
-        let back: PeerRecordV1 = bincode::deserialize(&plain).unwrap();
+        let back: PeerRecordV2 = bincode::deserialize(&plain).unwrap();
         assert_eq!(
             (back.peer_ik, back.received_ids),
             (a, vec![[4; 16]]),
@@ -360,7 +506,7 @@ mod tests {
     /// buffer that never reallocates, and matches plain bincode.
     #[test]
     fn encode_body_fills_an_exactly_sized_wiped_buffer() {
-        let rec = PeerRecordV1 {
+        let rec = PeerRecordV2 {
             peer_ik: [7; 32],
             seen_ids: vec![[5; 16]; 3],
             ..Default::default()

@@ -6,6 +6,7 @@
 //! flags; the relay links the same code through the `rchat-core` crate.
 
 use crate::crypto::IdentityKeyPair;
+use crate::kem::{self, KEM_PK_LEN};
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -13,18 +14,19 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-pub const BUNDLE_DOMAIN: &[u8; 16] = b"rchat/bundle/v1\0";
-pub const CONN_DOMAIN: &[u8; 19] = b"rchat/conn-auth/v1\0";
-pub const KNOCK_DOMAIN: &[u8; 15] = b"rchat/knock/v1\0";
+pub const BUNDLE_DOMAIN_V3: &[u8; 16] = b"rchat/bundle/v3\0";
+pub const CONN_DOMAIN: &[u8; 19] = b"rchat/conn-auth/v3\0";
+pub const KNOCK_DOMAIN: &[u8; 15] = b"rchat/knock/v3\0";
 pub const NO_TLS_BINDING_DOMAIN: &[u8; 29] = b"rchat/conn-binding/no-tls/v1\0";
 /// TLS 1.3 exporter label (RFC 8446 §7.5); empty context, 32 bytes.
 pub const EXPORTER_LABEL: &[u8; 27] = b"EXPORTER-rchat-conn-auth-v1";
-const KNOCK_MAC_INFO: &[u8] = b"rchat/knock-mac/v1";
-const INTRO_INFO: &[u8] = b"rchat/intro/v1";
+/// HKDF info prefix of the knock v3 keys (§A.5); both identities follow.
+const KNOCK_KEYS_INFO_V3: &[u8] = b"rchat/knock/v3";
 
-pub const BUNDLE_TRANSCRIPT_LEN: usize = 112;
-pub const CONN_TRANSCRIPT_LEN: usize = 243;
-pub const KNOCK_MAC_INPUT_LEN: usize = 215;
+/// `BUNDLE_DOMAIN_V3 || ik(32) || ak(32) || kem_pk(1184)` (protocol v3 §A.2).
+pub const BUNDLE_TRANSCRIPT_LEN_V3: usize = 16 + 32 + 32 + KEM_PK_LEN;
+pub const CONN_TRANSCRIPT_LEN: usize = 211;
+pub const KNOCK_MAC_INPUT_LEN: usize = 183;
 pub const DK_BIND_MSG_LEN: usize = 118;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -47,27 +49,34 @@ pub enum KeyAuthError {
     BadOrigin,
 }
 
-/// A key bundle as signed by its identity key (fixed-size fields).
+/// A v3 key bundle as signed by its identity key (protocol v3 §A.2):
+/// fixed-size fields, no signed pre-key (it always equalled `ak` in v2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedBundle {
     pub identity_key: [u8; 32],
     pub identity_agreement_key: [u8; 32],
-    pub signed_pre_key: [u8; 32],
+    /// ML-KEM-768 public key; boxed so the bundle stays cheap to move.
+    pub kem_pk: Box<[u8; KEM_PK_LEN]>,
     pub bundle_signature: [u8; 64],
 }
 
 impl SignedBundle {
-    /// Build from wire slices, checking every length.
-    pub fn from_slices(
+    /// Build from wire bytes, checking every length (`kem_pk` exactly 1184).
+    pub fn from_wire(
         identity_key: &[u8],
         identity_agreement_key: &[u8],
-        signed_pre_key: &[u8],
+        kem_pk: &[u8],
         bundle_signature: &[u8],
     ) -> Result<Self, KeyAuthError> {
+        if kem_pk.len() != KEM_PK_LEN {
+            return Err(KeyAuthError::BadLength);
+        }
+        let mut boxed = Box::new([0u8; KEM_PK_LEN]);
+        boxed.copy_from_slice(kem_pk);
         Ok(Self {
             identity_key: arr32(identity_key)?,
             identity_agreement_key: arr32(identity_agreement_key)?,
-            signed_pre_key: arr32(signed_pre_key)?,
+            kem_pk: boxed,
             bundle_signature: bundle_signature
                 .try_into()
                 .map_err(|_| KeyAuthError::BadLength)?,
@@ -92,21 +101,22 @@ fn arr32(s: &[u8]) -> Result<[u8; 32], KeyAuthError> {
     s.try_into().map_err(|_| KeyAuthError::BadLength)
 }
 
-/// `BUNDLE_DOMAIN || identity_key || identity_agreement_key || signed_pre_key` (112 B).
+/// `BUNDLE_DOMAIN_V3 || ik || ak || kem_pk` (1264 B, protocol v3 §A.2).
 pub fn bundle_transcript(
-    identity_key: &[u8],
-    identity_agreement_key: &[u8],
-    signed_pre_key: &[u8],
-) -> Result<[u8; BUNDLE_TRANSCRIPT_LEN], KeyAuthError> {
-    let mut t = [0u8; BUNDLE_TRANSCRIPT_LEN];
-    t[..16].copy_from_slice(BUNDLE_DOMAIN);
-    t[16..48].copy_from_slice(&arr32(identity_key)?);
-    t[48..80].copy_from_slice(&arr32(identity_agreement_key)?);
-    t[80..112].copy_from_slice(&arr32(signed_pre_key)?);
-    Ok(t)
+    ik: &[u8; 32],
+    ak: &[u8; 32],
+    kem_pk: &[u8; KEM_PK_LEN],
+) -> [u8; BUNDLE_TRANSCRIPT_LEN_V3] {
+    let mut t = [0u8; BUNDLE_TRANSCRIPT_LEN_V3];
+    t[..16].copy_from_slice(BUNDLE_DOMAIN_V3);
+    t[16..48].copy_from_slice(ik);
+    t[48..80].copy_from_slice(ak);
+    t[80..].copy_from_slice(kem_pk);
+    t
 }
 
-/// `CONN_DOMAIN || nonce || binding || ik || ak || spk || bundle_signature` (243 B).
+/// `CONN_DOMAIN || nonce || binding || ik || ak || bundle_signature` (211 B).
+/// `kem_pk` is bound through `bundle_signature`, which signs it.
 pub fn conn_transcript(
     nonce: &[u8],
     binding: &[u8],
@@ -118,23 +128,76 @@ pub fn conn_transcript(
     t[51..83].copy_from_slice(&arr32(binding)?);
     t[83..115].copy_from_slice(&bundle.identity_key);
     t[115..147].copy_from_slice(&bundle.identity_agreement_key);
-    t[147..179].copy_from_slice(&bundle.signed_pre_key);
-    t[179..243].copy_from_slice(&bundle.bundle_signature);
+    t[147..211].copy_from_slice(&bundle.bundle_signature);
     Ok(t)
 }
 
-/// Sign this identity's bundle. The signed pre-key is the identity
-/// agreement key (one-time pre-keys are not used in v2).
+/// Sign this identity's v3 bundle: `ik`, `ak` and the identity's ML-KEM key.
 pub fn sign_bundle(identity: &IdentityKeyPair) -> Result<SignedBundle, KeyAuthError> {
     let identity_key = identity.public_signing_key().to_bytes();
     let agreement = identity.public_agreement_key().to_bytes();
-    let t = bundle_transcript(&identity_key, &agreement, &agreement)?;
+    let kem_pk = Box::new(*identity.kem_public());
+    let t = bundle_transcript(&identity_key, &agreement, &kem_pk);
     Ok(SignedBundle {
         identity_key,
         identity_agreement_key: agreement,
-        signed_pre_key: agreement,
+        kem_pk,
         bundle_signature: identity.sign(&t).to_bytes(),
     })
+}
+
+/// Domain of an ask's signature over its own ephemerals (ruling R7,
+/// PQXDH-style): without it a relay could hand the initiator its own KEM
+/// key as the responder's and decapsulate the post-quantum half.
+pub const ASK_EPH_DOMAIN: &[u8; 17] = b"rchat/ask-eph/v3\0";
+/// `ASK_EPH_DOMAIN || asker_ik(32) || ephemeral_key(32) || kem_ephemeral_pk(1184)`.
+pub const ASK_EPH_TRANSCRIPT_LEN: usize = 17 + 32 + 32 + kem::KEM_PK_LEN;
+
+/// The transcript an ask's ephemeral signature covers.
+pub fn ask_eph_transcript(
+    asker_ik: &[u8; 32],
+    ephemeral_key: &[u8; 32],
+    kem_ephemeral_pk: &[u8; kem::KEM_PK_LEN],
+) -> Vec<u8> {
+    let mut t = Vec::with_capacity(ASK_EPH_TRANSCRIPT_LEN);
+    t.extend_from_slice(ASK_EPH_DOMAIN);
+    t.extend_from_slice(asker_ik);
+    t.extend_from_slice(ephemeral_key);
+    t.extend_from_slice(kem_ephemeral_pk);
+    t
+}
+
+/// Sign an ask's X25519 and ML-KEM ephemerals with the identity key (R7).
+pub fn sign_ask_ephemerals(
+    identity: &IdentityKeyPair,
+    ephemeral_key: &[u8; 32],
+    kem_ephemeral_pk: &[u8; kem::KEM_PK_LEN],
+) -> [u8; 64] {
+    let ik = identity.public_signing_key().to_bytes();
+    identity
+        .sign(&ask_eph_transcript(&ik, ephemeral_key, kem_ephemeral_pk))
+        .to_bytes()
+}
+
+/// Check a peer ask's ephemeral signature under the peer's pinned identity
+/// key (`verify_strict`, as for bundles). A wrong-length signature is
+/// `BadLength`.
+pub fn verify_ask_ephemerals(
+    asker_ik: &[u8; 32],
+    ephemeral_key: &[u8; 32],
+    kem_ephemeral_pk: &[u8],
+    sig: &[u8],
+) -> Result<(), KeyAuthError> {
+    let sig: [u8; 64] = sig.try_into().map_err(|_| KeyAuthError::BadLength)?;
+    let kem_pk: &[u8; kem::KEM_PK_LEN] = kem_ephemeral_pk
+        .try_into()
+        .map_err(|_| KeyAuthError::BadLength)?;
+    let vk = verifying_key(asker_ik)?;
+    vk.verify_strict(
+        &ask_eph_transcript(asker_ik, ephemeral_key, kem_pk),
+        &Signature::from_bytes(&sig),
+    )
+    .map_err(|_| KeyAuthError::BadSignature)
 }
 
 /// Prove possession of the identity key for this connection.
@@ -168,20 +231,23 @@ pub fn is_low_order_x25519(public: &[u8; 32]) -> bool {
         .was_contributory()
 }
 
-/// Check a bundle: strong Ed25519 identity, contributory X25519 keys, and a
-/// strict signature over the bundle transcript.
+/// Check a v3 bundle: strong Ed25519 identity, a contributory X25519
+/// agreement key, a well-formed ML-KEM-768 key (length and FIPS 203 modulus)
+/// and a strict signature over the v3 transcript.
 pub fn verify_bundle(bundle: &SignedBundle) -> Result<(), KeyAuthError> {
     let vk = verifying_key(&bundle.identity_key)?;
-    if is_low_order_x25519(&bundle.identity_agreement_key)
-        || is_low_order_x25519(&bundle.signed_pre_key)
-    {
+    if is_low_order_x25519(&bundle.identity_agreement_key) {
         return Err(KeyAuthError::WeakKey);
     }
+    kem::validate_public_key(&bundle.kem_pk[..]).map_err(|e| match e {
+        kem::KemError::BadLength => KeyAuthError::BadLength,
+        _ => KeyAuthError::WeakKey,
+    })?;
     let t = bundle_transcript(
         &bundle.identity_key,
         &bundle.identity_agreement_key,
-        &bundle.signed_pre_key,
-    )?;
+        &bundle.kem_pk,
+    );
     vk.verify_strict(&t, &Signature::from_bytes(&bundle.bundle_signature))
         .map_err(|_| KeyAuthError::BadSignature)
 }
@@ -328,39 +394,63 @@ pub(crate) fn scrub_stack() {
     std::hint::black_box(&mut buf);
 }
 
-/// `k_mac` and `k_intro` from the static-static DH, salted with the
-/// envelope's ephemeral key. Both sides pass (sender, recipient) in that
-/// order; the recipient's DH is the mirror of the sender's.
-pub fn knock_keys(
-    my_agreement_secret: &StaticSecret,
-    their_agreement_key: &[u8; 32],
+/// Which side of a knock is deriving its keys. The two sides compute the
+/// same static DH from opposite ends; the salt names the recipient's
+/// agreement key, which the sender has as `their_ak` and the recipient as
+/// its own public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnockRole {
+    Sender,
+    Recipient,
+}
+
+/// Knock v3 keys (§A.5): `k_mac || k_intro` = HKDF-SHA256(
+/// salt = env_eph_pub || recipient_ak, ikm = DH_static || kem_ss,
+/// info = "rchat/knock/v3" || sender_ik || recipient_ik), 64 bytes.
+/// `kem_ss` is the ML-KEM-768 secret encapsulated to the recipient's static
+/// KEM key (`ct_k` in the knock). Both sides pass (sender, recipient)
+/// identities in that order. The DH result and the combined input are
+/// wiped when this returns; the keys are wiped when `KnockKeys` drops.
+pub fn knock_keys_v3(
+    my_ak_secret: &StaticSecret,
+    their_ak: &[u8; 32],
     env_eph_pub: &[u8; 32],
+    kem_ss: &[u8; 32],
     sender_identity_key: &[u8; 32],
     recipient_identity_key: &[u8; 32],
+    role: KnockRole,
 ) -> Result<KnockKeys, KeyAuthError> {
-    let ss = dh_checked(my_agreement_secret, their_agreement_key)?;
+    let dh = dh_checked(my_ak_secret, their_ak)?;
+    let recipient_ak = match role {
+        KnockRole::Sender => *their_ak,
+        KnockRole::Recipient => X25519PublicKey::from(my_ak_secret).to_bytes(),
+    };
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(env_eph_pub);
+    salt[32..].copy_from_slice(&recipient_ak);
+    let mut ikm = Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(&*dh);
+    ikm[32..].copy_from_slice(kem_ss);
+    let mut info = [0u8; KNOCK_KEYS_INFO_V3.len() + 64];
+    info[..KNOCK_KEYS_INFO_V3.len()].copy_from_slice(KNOCK_KEYS_INFO_V3);
+    info[KNOCK_KEYS_INFO_V3.len()..KNOCK_KEYS_INFO_V3.len() + 32]
+        .copy_from_slice(sender_identity_key);
+    info[KNOCK_KEYS_INFO_V3.len() + 32..].copy_from_slice(recipient_identity_key);
+    let mut okm = Zeroizing::new([0u8; 64]);
+    with_hkdf(Some(&salt), &ikm[..], |hk| {
+        hk.expand(&info, &mut okm[..]).expect("64-byte HKDF output")
+    });
     let mut keys = KnockKeys {
         k_mac: [0u8; 32],
         k_intro: [0u8; 32],
     };
-    with_hkdf(Some(env_eph_pub), &*ss, |hk| {
-        let mut info = Vec::with_capacity(KNOCK_MAC_INFO.len() + 64);
-        info.extend_from_slice(KNOCK_MAC_INFO);
-        info.extend_from_slice(sender_identity_key);
-        info.extend_from_slice(recipient_identity_key);
-        hk.expand(&info, &mut keys.k_mac)
-            .expect("32-byte HKDF output");
-        info.clear();
-        info.extend_from_slice(INTRO_INFO);
-        info.extend_from_slice(sender_identity_key);
-        info.extend_from_slice(recipient_identity_key);
-        hk.expand(&info, &mut keys.k_intro)
-            .expect("32-byte HKDF output");
-    });
+    keys.k_mac.copy_from_slice(&okm[..32]);
+    keys.k_intro.copy_from_slice(&okm[32..]);
     Ok(keys)
 }
 
-/// `KNOCK_DOMAIN || recipient_ik || sender_ik || ak || spk || sig || issued_hour BE` (215 B).
+/// `KNOCK_DOMAIN || recipient_ik || sender_ik || ak || sig || issued_hour BE` (183 B).
+/// The sender's `kem_pk` is bound through `sig`, which signs it.
 pub fn knock_mac_input(
     recipient_identity_key: &[u8; 32],
     sender: &SignedBundle,
@@ -371,9 +461,8 @@ pub fn knock_mac_input(
     m[15..47].copy_from_slice(recipient_identity_key);
     m[47..79].copy_from_slice(&sender.identity_key);
     m[79..111].copy_from_slice(&sender.identity_agreement_key);
-    m[111..143].copy_from_slice(&sender.signed_pre_key);
-    m[143..207].copy_from_slice(&sender.bundle_signature);
-    m[207..215].copy_from_slice(&issued_hour.to_be_bytes());
+    m[111..175].copy_from_slice(&sender.bundle_signature);
+    m[175..183].copy_from_slice(&issued_hour.to_be_bytes());
     m
 }
 
@@ -393,6 +482,51 @@ pub fn knock_mac(
         issued_hour,
     ));
     Ok(mac.finalize().into_bytes().into())
+}
+
+/// `knock_mac` over the knock's flags too (protocol v3 §A.5, ruling R35):
+/// flags 0 is exactly `knock_mac`; any other flags byte is appended to the
+/// MAC input, so a relay can neither set nor clear one.
+pub fn knock_mac_flagged(
+    k_mac: &[u8; 32],
+    recipient_identity_key: &[u8; 32],
+    sender: &SignedBundle,
+    issued_hour: u64,
+    flags: u8,
+) -> Result<[u8; 32], KeyAuthError> {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(k_mac).map_err(|_| KeyAuthError::BadLength)?;
+    mac.update(&knock_mac_input(
+        recipient_identity_key,
+        sender,
+        issued_hour,
+    ));
+    if flags != 0 {
+        mac.update(&[flags]);
+    }
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// Constant-time check of a flagged knock MAC (`knock_mac_flagged`).
+pub fn verify_knock_mac_flagged(
+    k_mac: &[u8; 32],
+    recipient_identity_key: &[u8; 32],
+    sender: &SignedBundle,
+    issued_hour: u64,
+    flags: u8,
+    tag: &[u8],
+) -> Result<(), KeyAuthError> {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(k_mac).map_err(|_| KeyAuthError::BadLength)?;
+    mac.update(&knock_mac_input(
+        recipient_identity_key,
+        sender,
+        issued_hour,
+    ));
+    if flags != 0 {
+        mac.update(&[flags]);
+    }
+    mac.verify_slice(tag).map_err(|_| KeyAuthError::BadMac)
 }
 
 /// Constant-time check of a knock MAC.

@@ -308,7 +308,9 @@ fn rp11_queued_message_after_publish_ok_is_delivered() {
             .collect()
     };
 
-    let early = p.a.seal_ratchet(&p.pb.hex, [1; 16], b"\x01early").unwrap();
+    let early =
+        p.a.seal_ratchet(&p.pb.hex, [1; 16], b"\x01\0\0\0\0early")
+            .unwrap();
     crate::RChatClient::handle_frame(
         &mut p.b,
         Frame::Control(ControlMessage::QueuedMessage {
@@ -322,7 +324,9 @@ fn rp11_queued_message_after_publish_ok_is_delivered() {
     feed_signaling(&mut p.b, publish_ok([0x55; 32]));
     assert!(p.b.is_key_bundle_published);
 
-    let queued = p.a.seal_ratchet(&p.pb.hex, [2; 16], b"\x01queued").unwrap();
+    let queued =
+        p.a.seal_ratchet(&p.pb.hex, [2; 16], b"\x01\0\0\0\0queued")
+            .unwrap();
     crate::RChatClient::handle_frame(
         &mut p.b,
         Frame::Control(ControlMessage::QueuedMessage {
@@ -494,5 +498,56 @@ fn rp6_signed_version_skips_and_u32_max_are_refused() {
     assert_eq!(
         walk_relay_chain(&at_max, &pin, u32::MAX - 1, &p1, u32::MAX),
         Ok(())
+    );
+}
+
+/// Part J: an invite pre-sets the pin before the first connect (version
+/// unknown, as the app saves it). A first relay with a different key is
+/// refused through the relay-identity-changed path, never trusted on first
+/// use; the invite's own relay is accepted as pinned.
+#[test]
+fn invite_pin_is_enforced_on_the_first_connect() {
+    let invite_for = |key: &SigningKey| {
+        let link = format!(
+            "rchat://relay?u=ws%3A%2F%2F127.0.0.1%3A18443&pin={}",
+            encode_pin(&key.verifying_key().to_bytes())
+        );
+        crate::invite::parse_invite_allowing_loopback_ws(&link).unwrap()
+    };
+    let first_connect = |invite: crate::invite::Invite| {
+        let (mut inner, rx) = inner_with_identity(0xA1);
+        inner.config = ClientConfig {
+            server_url: invite.url,
+            relay_pin: Some(invite.pin),
+            relay_pin_version: None,
+            relay_pin_strict: false,
+            ..ClientConfig::default()
+        };
+        let rec = Recorder::default();
+        inner.callbacks = Some(Box::new(rec.clone()));
+        inner.publish_requested = true;
+        inner.is_connected = false;
+        (inner, rx, rec)
+    };
+
+    let other = SigningKey::from_bytes(&[0x12; 32]);
+    let (mut inner, mut rx, rec) = first_connect(invite_for(&other));
+    feed_signaling(&mut inner, hello_response([0x4e; 32]));
+    assert!(!inner.is_connected, "a mismatching first relay is refused");
+    assert_eq!(publishes(&mut rx), 0);
+    assert!(rec
+        .take()
+        .contains(&format!("error:{}", RChatError::RelayIdentityChanged)));
+    assert!(inner.relay_pin_info_json().is_none());
+
+    let (mut inner, mut rx, _rec) = first_connect(invite_for(&test_relay()));
+    feed_signaling(&mut inner, hello_response([0x4e; 32]));
+    assert!(inner.is_connected);
+    assert_eq!(publishes(&mut rx), 1);
+    let info: serde_json::Value =
+        serde_json::from_str(&inner.relay_pin_info_json().unwrap()).unwrap();
+    assert_eq!(
+        info["source"], "pinned",
+        "checked against the invite, not TOFU"
     );
 }

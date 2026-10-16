@@ -1,0 +1,6 @@
+# Deterministic ML-KEM encapsulation is only safe with uniformly random `m`;
+# production code must use `kem::encapsulate` (OS RNG). The KAT helper in
+# src/kem.rs is the single, test-only, explicitly allowed caller.
+disallowed-methods = [
+    { path = "ml_kem::EncapsulateDeterministic::encapsulate_deterministic", reason = "fixed-randomness encapsulation: KAT use only (src/kem.rs test helper)" },
+]

@@ -11,14 +11,14 @@ use crate::protocol::relay::CircuitToken;
 async fn created(ws: &mut Ws) -> (CircuitId, Vec<u8>, CircuitId) {
     loop {
         match super::test_support::next_control(ws, Duration::from_secs(3)).await {
-            Some(ControlMessage::CircuitCreatedV2 {
+            Some(ControlMessage::CircuitCreatedV3 {
                 circuit_id,
                 token,
                 target_circuit_id,
                 ..
             }) => return (circuit_id, token, target_circuit_id),
             Some(_) => continue,
-            None => panic!("no CircuitCreatedV2"),
+            None => panic!("no CircuitCreatedV3"),
         }
     }
 }
@@ -112,7 +112,13 @@ async fn m2_raw_identities_only_in_connection_bundles_and_pending_asks() {
         seen.extend([e.key().0, e.slot_a.0, e.token_a.key, e.token_b.key]);
     }
     for e in state.circuits.iter() {
-        seen.extend([e.tag_a.0, e.tag_b.0, e.pair.0, e.token_a.key, e.token_b.key]);
+        seen.extend([
+            e.tag_a.0,
+            e.tag_b.0,
+            e.pair.raw(),
+            e.token_a.key,
+            e.token_b.key,
+        ]);
     }
     for e in state.message_queues.iter() {
         seen.push(e.key().0);
@@ -124,11 +130,11 @@ async fn m2_raw_identities_only_in_connection_bundles_and_pending_asks() {
         }
     }
     for e in state.pending_asks.iter() {
-        seen.push(e.key().0);
+        seen.push(e.key().raw());
     }
     for conn in state.connections.iter() {
         for (t, _) in &conn.pending_charges {
-            seen.push(t.0);
+            seen.push(t.raw());
         }
     }
     for r in raw {
@@ -156,11 +162,11 @@ fn links_either(state: &RelayState, ids: &[&TestIdentity]) -> Vec<&'static str> 
     if !state.pending_asks.is_empty() {
         found.push("pending asks");
     }
-    if state
-        .connections
-        .iter()
-        .any(|c| c.pending_charges.iter().any(|(t, _)| tags.contains(t)))
-    {
+    if state.connections.iter().any(|c| {
+        c.pending_charges
+            .iter()
+            .any(|(t, _)| matches!(t, ChargeKey::Target(t) if tags.contains(t)))
+    }) {
         found.push("pending charges");
     }
     if state

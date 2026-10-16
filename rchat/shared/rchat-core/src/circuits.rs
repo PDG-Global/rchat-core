@@ -1,18 +1,20 @@
-//! Protocol v2 circuits on the client (spec §4.4, §6.3): verify the relay's
-//! `CircuitCreatedV2`, run X3DH v2, and keep pins, blocks and sessions in step.
+//! Circuits on the client (spec §4.4, §6.3; protocol v3 §A.3–A.4): verify
+//! the relay's `CircuitCreatedV3`, run X3DH v3 (X25519 + ML-KEM-768), send
+//! or await the session-init, and keep pins, blocks and sessions in step.
 
-use crate::crypto::{x3dh_v2_initiator, x3dh_v2_responder, EphemeralKeyPair, RatchetHeader};
+use crate::crypto::{x3dh_v3_initiator, RatchetHeader};
+use crate::kem::KEM_PK_LEN;
 use crate::keyauth;
 use crate::knock;
 use crate::notice;
-use crate::peers::{key_from_hex, PeerKeyState, PinError};
+use crate::peers::{key_from_hex, AskKeys, PeerKeyState, PinError};
 use crate::persistence::{
     push_capped, unpush_capped, MAX_DELIVERED_UNSTORED, MAX_RECEIVED_IDS, MAX_UNDECRYPTABLE,
 };
 use crate::protocol::{CircuitId, ControlMessage, PacketFlags, PeerBundle, RelayPacket};
 use crate::receipts;
-use crate::sealed::{self, Opened, KIND_KNOCK, KIND_RATCHET};
-use crate::session::{ChatSession, DecryptedBy};
+use crate::sealed::{self, Opened, KIND_RATCHET};
+use crate::session::{ChatSession, DecryptedBy, InitOut};
 use crate::state_store::SentIdV1;
 use crate::status::StatusEvent;
 use crate::{
@@ -51,6 +53,12 @@ type UnlistedLost = (Option<(usize, u64)>, Option<usize>);
 /// "No resume" on the wire (spec §5.7): the client always sends `Some`, so
 /// every ask has the same size, and the relay treats the all-zero id as none (§5.3).
 pub(crate) const ZERO_CIRCUIT: CircuitId = CircuitId([0; 16]);
+
+/// How long a pinned contact's knock digest is remembered (M-2): a knock
+/// is accepted up to ~73 h after it is issued.
+pub(crate) const KNOCK_SEEN_SECS: u64 = 74 * 3600;
+/// Knock digests remembered per contact (M-2); the oldest goes first.
+pub(crate) const MAX_KNOCKS_SEEN_PER_PEER: usize = 64;
 
 /// Closes kept for the next accepted publish (M-1); the oldest goes first.
 pub(crate) const MAX_PENDING_CLOSES: usize = 256;
@@ -97,8 +105,8 @@ pub(crate) fn now_hour() -> u64 {
     crate::unix_now_secs() / 3600
 }
 
-/// The fields of `ControlMessage::CircuitCreatedV2`.
-pub(crate) struct CircuitCreatedV2Frame {
+/// The fields of `ControlMessage::CircuitCreatedV3`.
+pub(crate) struct CircuitCreatedV3Frame {
     pub circuit_id: CircuitId,
     pub token: Vec<u8>,
     pub target_circuit_id: CircuitId,
@@ -106,6 +114,87 @@ pub(crate) struct CircuitCreatedV2Frame {
     pub peer: PeerBundle,
     pub initiator_ephemeral_key: Vec<u8>,
     pub responder_ephemeral_key: Vec<u8>,
+    /// ML-KEM-768 ephemeral public keys of both asks (§A.3). Task 3 checks
+    /// only their shape; X3DH v3 (Task 4) encapsulates to the responder's.
+    pub initiator_kem_ephemeral_pk: Vec<u8>,
+    pub responder_kem_ephemeral_pk: Vec<u8>,
+    /// Each asker's identity signature over its ephemerals (ruling R7).
+    pub initiator_ephemeral_sig: Vec<u8>,
+    pub responder_ephemeral_sig: Vec<u8>,
+}
+
+/// The longest a responder waits for a session-init, wall clock: the
+/// relay's offline-queue TTL (72 h). Past it the init can no longer reach
+/// us, so the wait is dropped and the pair asked again (ruling R8).
+pub(crate) const PENDING_INIT_MAX_AGE_SECS: u64 = 72 * 3600;
+
+/// A responder's wait for session-init (§A.3): the ask's ephemerals and
+/// the circuit the relay set up. Secrets are wiped when it drops.
+pub(crate) struct PendingInit {
+    /// Our ask's ML-KEM-768 ephemeral, and the seed it was built from (R4).
+    pub kem: crate::kem::KemKeyPair,
+    pub kem_seed: Zeroizing<[u8; crate::kem::KEM_SEED_LEN]>,
+    /// Our ask's X25519 ephemeral secret (wipes itself on drop).
+    pub ek_r: crate::crypto::X25519SecretKey,
+    /// The initiator's X25519 ephemeral (public).
+    pub i_ek: [u8; 32],
+    /// The agreement key of the verified, pinned bundle.
+    pub peer_ak: [u8; 32],
+    pub circuit_id: CircuitId,
+    pub target_circuit_id: CircuitId,
+    pub token: Zeroizing<[u8; 32]>,
+    /// Transport epoch the circuit was set up (or resumed) in.
+    pub circuit_epoch: u64,
+    /// Unix time the wait ends: `ASK_TTL` of online time (pushed back on
+    /// every reconnect and restore, ruling R8), never past
+    /// `created_at_unix + PENDING_INIT_MAX_AGE_SECS`.
+    pub expires_at_unix: u64,
+    /// Unix time the circuit was set up.
+    pub created_at_unix: u64,
+    /// The ask the relay matched: a blind pair keeps its PS at install and
+    /// raises no recovery warning (R14). Persisted.
+    pub origin: crate::blind::InstallOrigin,
+}
+
+impl PendingInit {
+    /// The wait can no longer be answered: older than the offline queue.
+    pub(crate) fn too_old(&self, now_unix: u64) -> bool {
+        now_unix
+            >= self
+                .created_at_unix
+                .saturating_add(PENDING_INIT_MAX_AGE_SECS)
+    }
+
+    /// Ruling R8: the wait counts online time only. On a reconnect or a
+    /// restore it is pushed back to `now + ASK_TTL`, capped at the
+    /// offline-queue age.
+    pub(crate) fn refresh(&mut self, now_unix: u64) {
+        let cap = self
+            .created_at_unix
+            .saturating_add(PENDING_INIT_MAX_AGE_SECS);
+        let wanted = now_unix.saturating_add(crate::peers::ASK_TTL.as_secs());
+        self.expires_at_unix = self.expires_at_unix.max(wanted).min(cap);
+    }
+}
+
+/// What `install_session` needs. `ek` is our ask's X25519 ephemeral
+/// secret for the initiator, the initiator's ephemeral (public) for the
+/// responder.
+struct NewSession<'a> {
+    role: u8,
+    sk: &'a Zeroizing<[u8; 32]>,
+    my_ik: [u8; 32],
+    peer_ik: [u8; 32],
+    peer_ak: [u8; 32],
+    ek: Zeroizing<[u8; 32]>,
+    circuit_id: CircuitId,
+    target_circuit_id: CircuitId,
+    token: Vec<u8>,
+    circuit_epoch: u64,
+    init_out: Option<Box<InitOut>>,
+    answered: bool,
+    /// Identity or blind match (R14), carried from the matched ask.
+    origin: crate::blind::InstallOrigin,
 }
 
 /// 32 hex characters → 16 bytes.
@@ -114,6 +203,30 @@ pub(crate) fn message_id_from_hex(s: &str) -> Option<[u8; 16]> {
         return None;
     }
     hex::decode(s).ok()?.try_into().ok()
+}
+
+/// A hex ML-KEM-768 public key (2368 hex digits) that passes the FIPS 203
+/// encapsulation-key check; None otherwise.
+pub(crate) fn parse_kem_hex(h: &str) -> Option<Box<[u8; KEM_PK_LEN]>> {
+    let bytes = hex::decode(h).ok()?;
+    crate::kem::validate_public_key(&bytes).ok()?;
+    let mut k = Box::new([0u8; KEM_PK_LEN]);
+    k.copy_from_slice(&bytes);
+    Some(k)
+}
+
+/// `on_peer_key_event` code: a pinned contact's ML-KEM key was learned from
+/// a bundle their identity signed (a knock); the third argument is the key
+/// as 2368 hex. The app stores it with the pin (R11).
+pub(crate) const KEM_KEY_LEARNED: u8 = 5;
+
+/// The app-facing error for a refused pin.
+pub(crate) fn pin_error(e: PinError) -> RChatError {
+    match e {
+        PinError::Conflict => RChatError::PinConflict,
+        PinError::AgreementKeyInUse => RChatError::AgreementKeyInUse,
+        PinError::RotationTooSoon => RChatError::RotationTooSoon,
+    }
 }
 
 fn ek32(v: &[u8]) -> Option<[u8; 32]> {
@@ -127,7 +240,7 @@ impl ClientInner {
     /// was accepted (a reconnect in progress) or one that could not be
     /// queued (offline) would be lost; the session and its circuit id are
     /// usually dropped with it, so nothing else would close the pair.
-    fn close_circuit_id(&mut self, circuit_id: &CircuitId) {
+    pub(crate) fn close_circuit_id(&mut self, circuit_id: &CircuitId) {
         let frame = ControlMessage::CloseCircuit {
             circuit_id: circuit_id.clone(),
         };
@@ -175,7 +288,7 @@ impl ClientInner {
         }
     }
 
-    fn jitter(&self) -> f64 {
+    pub(crate) fn jitter(&self) -> f64 {
         self.ask_jitter_override
             .unwrap_or_else(|| rand::Rng::gen_range(&mut rand::thread_rng(), -0.2..=0.2))
     }
@@ -203,17 +316,30 @@ impl ClientInner {
         now: Instant,
     ) -> Result<(), RChatError> {
         self.require_askable(peer_hex)?;
-        if self.has_live_circuit(peer_hex) {
+        if self.has_live_circuit(peer_hex) || self.awaiting_live_init(peer_hex) {
             // A live pair needs no ask, and an ask without a valid resume
-            // would make the relay tear it down (§6.2 step 2).
+            // would make the relay tear it down (§6.2 step 2). A pair
+            // waiting for its session-init is live too (§A.3).
             return Ok(());
         }
         let identity = peer_hex.to_string();
-        if !self.is_key_bundle_published {
+        // A background drain asks nothing (§H.1): kept for the next
+        // foreground publish, like an ask made before one.
+        if !self.is_key_bundle_published || self.in_drain() {
             if !self.deferred_asks.iter().any(|p| p == peer_hex) {
                 self.deferred_asks.push(identity);
             }
             return Ok(());
+        }
+        // Fix round 1 M-2: an ask that can't carry a knock (no pinned KEM
+        // key) charges no backoff. T5 N-1: it is kept in `deferred_asks`,
+        // not dropped: the next accepted publish retries it, and a KEM key
+        // arriving through a pin call asks at once (`ask_if_kem_arrived`).
+        if self.peers.kem_pk_for(peer_hex).is_none() {
+            if !self.deferred_asks.iter().any(|p| p == peer_hex) {
+                self.deferred_asks.push(identity.clone());
+            }
+            return Err(RChatError::NoKemKey { identity });
         }
         let jitter = self.jitter();
         match trigger {
@@ -267,6 +393,13 @@ impl ClientInner {
         now: Instant,
     ) -> Result<String, RChatError> {
         self.require_askable(peer_hex)?;
+        // R33 I-2: an intro carries no disappearing timer, so none goes
+        // while the conversation has one.
+        if self.timer_secs(peer_hex) != 0 {
+            return Err(RChatError::InvalidParameter {
+                message: "no intro while disappearing messages are on".into(),
+            });
+        }
         if self.session_manager.get(peer_hex).is_some() {
             return Err(RChatError::Internal {
                 message: "an intro only precedes the first circuit".into(),
@@ -310,15 +443,37 @@ impl ClientInner {
         Ok(hex::encode(message_id))
     }
 
-    /// Build and send one `CircuitAsk`: fresh EK into the ring, 2048-byte
-    /// knock, and the resume (or the all-zero id).
-    fn send_ask(&mut self, peer_hex: &str, now: Instant) -> Result<(), RChatError> {
+    /// Build and send one `CircuitAsk`: fresh EK into the ring, 5120-byte
+    /// knock v3, and the resume (or the all-zero id). The knock needs the
+    /// peer's pinned ML-KEM key: without one this fails with `NoKemKey`
+    /// before anything is built or charged, and there is no X25519-only
+    /// fallback (§A.5, R1).
+    /// A known contact (protocol v3 §C.3, Task 9) is asked blind instead:
+    /// `CircuitAskBlind` under the pair token, no target and no knock.
+    pub(crate) fn send_ask(&mut self, peer_hex: &str, now: Instant) -> Result<(), RChatError> {
+        if self.in_drain() {
+            // Never from a background drain (§H.1); callers keep it deferred.
+            return Err(RChatError::NotConnected);
+        }
+        if self.blind_path(peer_hex) {
+            if self.peers.pin_for(peer_hex).is_none() {
+                return Err(RChatError::PeerNotAccepted {
+                    identity: peer_hex.to_string(),
+                });
+            }
+            return self.send_blind_plan(peer_hex, now, crate::blind::BlindPlan::Own);
+        }
         let peer_ak = self
             .peers
             .pin_for(peer_hex)
             .ok_or_else(|| RChatError::PeerNotAccepted {
                 identity: peer_hex.to_string(),
             })?;
+        if self.peers.kem_pk_for(peer_hex).is_none() {
+            return Err(RChatError::NoKemKey {
+                identity: peer_hex.to_string(),
+            });
+        }
         let peer_ik = key_from_hex(peer_hex).ok_or_else(|| RChatError::InvalidRecipient {
             identity: peer_hex.to_string(),
         })?;
@@ -346,6 +501,16 @@ impl ClientInner {
             // (Task 17c minor).
             self.rotation_knocks.pop_back();
         }
+        // Final re-review N-1: on a flagged knock's identity path, blind
+        // asks run beside the identity ask while we still hold a PS.
+        if sent.is_ok()
+            && self.blind_alongside_due(peer_hex)
+            && self
+                .send_blind_plan(peer_hex, now, crate::blind::BlindPlan::Own)
+                .is_err()
+        {
+            log::debug!("[RUST] blind ask beside the identity ask not sent");
+        }
         sent
     }
 
@@ -359,31 +524,65 @@ impl ClientInner {
         now: Instant,
     ) -> Result<(), RChatError> {
         let identity = self.identity.as_ref().ok_or(RChatError::NotConnected)?;
+        let peer_kem = self
+            .peers
+            .kem_pk_for(peer_hex)
+            .ok_or_else(|| RChatError::NoKemKey {
+                identity: peer_hex.to_string(),
+            })?;
         let intro = self.intros.get(peer_hex).cloned();
+        // R35: declare (under the knock MAC) that we hold no session with
+        // the peer: first contact, lost sessions, or our new identity after
+        // a rotation.
+        let no_prior_session = self.rotation_unreached.contains(peer_hex)
+            || !self
+                .session_manager
+                .get(peer_hex)
+                .is_some_and(|s| s.ratchet.is_some() && s.is_established);
         let knock = knock::build_knock(
             identity,
             bundle,
             peer_ik,
             peer_ak,
+            peer_kem,
             now_hour(),
             intro.as_ref(),
             rotation.as_ref(),
+            no_prior_session,
         )
         .map_err(|e| RChatError::EncryptionFailed {
             message: e.to_string(),
         })?;
-        let ek = EphemeralKeyPair::generate();
-        let ek_pub = ek.public_key().to_bytes();
+        // Protocol v3 (§A.3): fresh X25519 and ML-KEM-768 ephemerals per
+        // ask, kept in the ask ring until the relay pairs the ask (or
+        // `ASK_TTL`); the responder then keeps its pair for session-init.
+        let keys = AskKeys::generate();
+        let ek_pub = keys.ek.public_key().to_bytes();
+        // R7: both ephemerals signed by our identity, so the peer can tell
+        // a relay-substituted key from ours.
+        let ephemeral_sig = keyauth::sign_ask_ephemerals(identity, &ek_pub, keys.kem.public());
         let resume_circuit = Some(self.resume_circuit_for(peer_hex).unwrap_or(ZERO_CIRCUIT));
         self.send_control_now(ControlMessage::CircuitAsk {
             target_identity: peer_ik.to_vec(),
             ephemeral_key: ek_pub.to_vec(),
+            kem_ephemeral_pk: keys.kem.public().to_vec(),
+            ephemeral_sig: ephemeral_sig.to_vec(),
             knock,
             resume_circuit,
         })?;
-        self.peers.push_ask(peer_hex, ek, now);
+        self.peers.push_ask(peer_hex, keys, now);
+        self.note_recent_ask(peer_hex, ek_pub, now, false);
         self.unanswered_asks
             .insert(peer_hex.to_string(), (now, self.transport_epoch));
+        // Final review H-1: the first identity ask a pinned contact's knock
+        // caused on this connection starts its clock (`fire_blind_timeouts`
+        // sends the pair back to blind when it runs out unmatched).
+        let epoch = self.transport_epoch;
+        if let Some(w) = self.identity_wanted.get_mut(peer_hex) {
+            if w.asked.map_or(true, |(_, e)| e != epoch) {
+                w.asked = Some((now, epoch));
+            }
+        }
         self.persist_meta();
         Ok(())
     }
@@ -417,6 +616,8 @@ impl ClientInner {
 
     /// Send the scheduled re-asks that are due.
     pub(crate) fn fire_due_reasks(&mut self, now: Instant) {
+        // Blind asks held their whole TTL without a match (§C.1, §C.4).
+        self.fire_blind_timeouts(now);
         let due: Vec<String> = self
             .pending_reasks
             .iter()
@@ -439,7 +640,14 @@ impl ClientInner {
                 self.pending_reasks.insert(peer, until);
                 continue;
             }
-            let allowed = self.require_askable(&peer).is_ok();
+            let allowed = self.require_askable(&peer).is_ok() && !self.awaiting_live_init(&peer);
+            if allowed && !self.has_live_circuit(&peer) && !self.ask_pacer.take(now) {
+                // Paced (final review, RateLimited): due again when the
+                // pacer has room.
+                let at = self.ask_pacer.next_at(now);
+                self.pending_reasks.insert(peer, at);
+                continue;
+            }
             if allowed && !self.has_live_circuit(&peer) && self.send_ask(&peer, now).is_err() {
                 // Not lost: retried after the next publish acknowledgement.
                 log::debug!("[RUST] scheduled re-ask could not be sent; deferred");
@@ -452,8 +660,24 @@ impl ClientInner {
 
     /// Resume definition (M9): this run's established, current session,
     /// created before the transport last reconnected, and still holding its circuit.
+    /// A blinded circuit is never resumed by id (§C.3), and a known contact
+    /// on the blind path re-pairs blind instead: v2 resume stays for
+    /// identity circuits before their first blind epoch only.
     pub(crate) fn resume_circuit_for(&self, peer_hex: &str) -> Option<CircuitId> {
+        // A pair waiting for its session-init resumes its own circuit (§A.3).
+        if let Some(p) = self.pending_inits.get(peer_hex) {
+            if p.origin == crate::blind::InstallOrigin::Blind {
+                return None;
+            }
+            return (p.circuit_epoch < self.transport_epoch).then(|| p.circuit_id.clone());
+        }
+        if self.blind_path(peer_hex) {
+            return None;
+        }
         let s = self.session_manager.get(peer_hex)?;
+        if s.blinded {
+            return None;
+        }
         if s.is_established && s.circuit_epoch < self.transport_epoch {
             s.circuit_id.clone()
         } else {
@@ -464,14 +688,82 @@ impl ClientInner {
     /// The relay accepted our publish on this connection: send deferred asks
     /// and resume every circuit that predates the connection.
     pub(crate) fn after_publish_ok(&mut self, now: Instant) {
+        self.drain_note_published(now);
+        if self.in_drain() {
+            // A background drain (§H.1) only receives: no resume, no blind
+            // re-pair, no deferred ask, no close and no timer re-send. All
+            // of it stays as it is for the next foreground publish.
+            return;
+        }
+        // R33 M-3, round 2 N-1: a new connection gives timer re-sends a
+        // fresh budget, and every unacknowledged state goes again now.
+        self.reset_timer_resends();
+        self.requeue_unacked_timers();
         // Closes that could not reach the relay go first (M-1), so a pair
         // the user blocked, unpinned or deleted in the meantime is torn down
         // before anything else is asked on this connection.
         self.flush_pending_closes();
+        // R8: a responder's wait for a session-init counts online time only.
+        let now_unix = crate::unix_now_secs();
+        for w in self.pending_inits.values_mut() {
+            w.refresh(now_unix);
+        }
         let mut asked: Vec<String> = Vec::new();
-        // Resumes first, uncounted: a resume after a reconnect is not a
-        // retry, so it must not push the peer's backoff towards the cap.
+        // §C.3: every known contact on the blind path re-pairs with a blind
+        // ask under its next token, uncounted like a resume. A blind pair
+        // still waiting for its session-init from an earlier connection
+        // cannot resume its circuit, so it asks again too.
         for peer in self.session_manager.get_all_recipients() {
+            if self.blind_path(&peer)
+                && self.require_askable(&peer).is_ok()
+                && !self.has_live_circuit(&peer)
+                && !self.awaiting_live_init(&peer)
+            {
+                // An identity circuit from before this connection is closed
+                // first, not resumed: the relay tears it down at once and
+                // tells the peer, which re-asks blind and meets this ask
+                // (one round trip, instead of the relay's unresumed-pair
+                // grace). It names nothing the relay does not know: an
+                // identity row is keyed by the identity pair already. A
+                // blinded circuit's id is never presented again (§C.3).
+                // Not while our session-init is unanswered: the peer may
+                // still be waiting for it on that circuit (it then ends
+                // after the relay's unresumed-pair grace).
+                let stale_identity_circuit = self
+                    .session_manager
+                    .get(&peer)
+                    .filter(|s| !s.blinded && s.init_out.is_none())
+                    .and_then(|s| s.circuit_id.clone());
+                if let Some(cid) = stale_identity_circuit {
+                    self.close_circuit_id(&cid);
+                    self.detach_circuit(&peer);
+                }
+                // Past the pacer's burst the re-pair waits its turn
+                // (`fire_due_reasks`), uncounted like this one.
+                if !self.ask_pacer.take(now) {
+                    self.pending_reasks.insert(peer.clone(), now);
+                    asked.push(peer);
+                    continue;
+                }
+                self.pending_reasks.remove(&peer);
+                if self.send_ask(&peer, now).is_err() {
+                    log::debug!("[RUST] blind re-pair ask could not be sent");
+                }
+                asked.push(peer);
+            }
+        }
+        // Resumes next, uncounted: a resume after a reconnect is not a
+        // retry, so it must not push the peer's backoff towards the cap.
+        let mut resumable = self.session_manager.get_all_recipients();
+        for peer in self.pending_inits.keys() {
+            if !resumable.contains(peer) {
+                resumable.push(peer.clone());
+            }
+        }
+        for peer in resumable {
+            if asked.contains(&peer) {
+                continue;
+            }
             if self.resume_circuit_for(&peer).is_some()
                 && self.require_askable(&peer).is_ok()
                 && !self.has_live_circuit(&peer)
@@ -490,7 +782,10 @@ impl ClientInner {
             // An ask left unanswered by a replaced transport is sent again
             // uncounted, like a resume: it is not a retry (spec §18.6 D33).
             let sent = if self.unanswered_asks.contains_key(&peer) {
-                if self.require_askable(&peer).is_ok() && !self.has_live_circuit(&peer) {
+                if self.require_askable(&peer).is_ok()
+                    && !self.has_live_circuit(&peer)
+                    && !self.awaiting_live_init(&peer)
+                {
                     self.pending_reasks.remove(&peer);
                     self.send_ask(&peer, now)
                 } else {
@@ -532,9 +827,16 @@ impl ClientInner {
         let _ = self.persist_peer(peer_hex);
     }
 
-    /// Spec §6.3 Receiving a knock. Nothing is ever sent for a request.
-    pub(crate) fn handle_knock(&mut self, opened: Opened) {
+    /// Spec §6.3 Receiving a knock (a knock v3 envelope, §A.5 / R10).
+    /// Nothing is ever sent for a request, and a knock that does not open
+    /// or verify is dropped silently.
+    pub(crate) fn handle_knock(&mut self, payload: &[u8]) {
         let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        let Ok(opened) = sealed::open_knock(identity.agreement_secret(), identity.kem(), payload)
+        else {
+            log::debug!("[RUST] knock did not open");
             return;
         };
         // A contact's intro is never opened (spec §6.3): it would only be
@@ -545,7 +847,7 @@ impl ClientInner {
             .is_none();
         let Ok(parsed) = knock::parse_knock(
             identity,
-            &opened,
+            opened,
             now_hour(),
             self.knock_ttl_hours,
             want_intro,
@@ -557,11 +859,47 @@ impl ClientInner {
         if self.peers.is_blocked(&sender_hex) {
             return;
         }
+        // M-2: a pinned contact's knock is acted on once: a relay replaying
+        // it (valid ~73 h) cannot turn the pair to the identity path again.
+        if self.peers.pin_for(&sender_hex).is_some() && !self.note_knock_seen(&sender_hex, payload)
+        {
+            log::debug!("[RUST] replayed knock dropped");
+            return;
+        }
+        // R11: a signed KEM key other than the pinned one is a mismatch,
+        // like another agreement key.
+        let kem_agrees = self.peers.kem_matches(&sender_hex, &parsed.sender.kem_pk);
         match self.peers.pin_for(&sender_hex) {
-            Some(pin) if constant_time_eq(&pin, &parsed.sender.identity_agreement_key) => {
-                if !self.has_live_circuit(&sender_hex) {
-                    self.schedule_reask(&sender_hex);
+            Some(pin)
+                if kem_agrees && constant_time_eq(&pin, &parsed.sender.identity_agreement_key) =>
+            {
+                // The contact's identity signed this KEM key: it fills a
+                // missing one (§A.5 "an earlier session"); a pinned one is
+                // never replaced from here.
+                // N-2: a knock older than the last one acted on, or that
+                // very knock, is ignored, also after a restart (persisted),
+                // so a replay cannot force another identity ask past R20's
+                // limit. A new knock of the same hour (a peer that lost its
+                // sessions again) still counts.
+                let digest: [u8; 32] = {
+                    use sha2::{Digest, Sha256};
+                    Sha256::digest(payload).into()
+                };
+                if self
+                    .knock_acted
+                    .get(&sender_hex)
+                    .is_some_and(|(h, d)| parsed.issued_hour < *h || constant_time_eq(d, &digest))
+                {
+                    log::debug!(
+                        "[RUST] knock older than, or the same as, the last acted on; dropped"
+                    );
+                    return;
                 }
+                self.knock_acted
+                    .insert(sender_hex.clone(), (parsed.issued_hour, digest));
+                let _ = self.persist_peer(&sender_hex);
+                self.adopt_bundle_kem(&sender_hex, &parsed.sender);
+                self.contact_knocked(&sender_hex, parsed.issued_hour, parsed.no_prior_session);
             }
             Some(_) => {
                 // A knock no newer than the current pin may be a relay
@@ -580,6 +918,11 @@ impl ClientInner {
                 self.peers.mark_mismatch(&sender_hex);
                 self.close_circuit_with(&sender_hex);
                 self.detach_circuit(&sender_hex);
+                // C-8: no session from an ask made before the mismatch.
+                if let Some(p) = self.pending_inits.remove(&sender_hex) {
+                    self.close_circuit_id(&p.circuit_id);
+                    let _ = self.persist_peer(&sender_hex);
+                }
                 self.emit_peer_key_event(
                     &sender_hex,
                     PeerKeyState::Mismatch as u8,
@@ -596,11 +939,10 @@ impl ClientInner {
                 // notice applied on that identity's chainless knock would hand
                 // it the contact. A failed chain falls through to a request.
                 if let Some(block) = parsed.rotation.as_ref() {
-                    if self.try_peer_rotation(
-                        &parsed.sender.identity_key,
-                        &parsed.sender.identity_agreement_key,
-                        block,
-                    ) {
+                    // The new identity's KEM key comes from the bundle it
+                    // signed in this knock, pinned with the rotation before
+                    // the new identity is asked.
+                    if self.try_peer_rotation(&parsed.sender, block) {
                         return;
                     }
                 }
@@ -611,10 +953,16 @@ impl ClientInner {
                     return;
                 }
                 let intro_id = parsed.intro.as_ref().map(|i| i.message_id);
-                if !self
-                    .peers
-                    .note_request(&sender_hex, intro_id, parsed.issued_hour)
-                {
+                let new_request =
+                    self.peers
+                        .note_request(&sender_hex, intro_id, parsed.issued_hour);
+                // Kept for an accept under this agreement key (§A.5).
+                self.peers.note_request_kem(
+                    &sender_hex,
+                    &parsed.sender.identity_agreement_key,
+                    &parsed.sender.kem_pk,
+                );
+                if !new_request {
                     return;
                 }
                 // A version claim counts only with a chain ending at the sender.
@@ -639,12 +987,14 @@ impl ClientInner {
                 let request = MessageRequest {
                     identity_hex: sender_hex,
                     agreement_hex: hex::encode(parsed.sender.identity_agreement_key),
+                    kem_hex: hex::encode(&parsed.sender.kem_pk[..]),
                     issued_hour: parsed.issued_hour,
                     intro_message_id_hex,
                     intro_text,
                     intro_sent_at_ms,
                     key_version,
                 };
+                self.drain_note_request();
                 if let Some(cb) = &self.callbacks {
                     cb.on_message_request(request);
                 }
@@ -652,9 +1002,127 @@ impl ClientInner {
         }
     }
 
+    /// Record a pinned contact's knock (M-2); false if it was seen within
+    /// `KNOCK_SEEN_SECS` (a replay). Bounded per contact.
+    fn note_knock_seen(&mut self, peer_hex: &str, payload: &[u8]) -> bool {
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        let now_unix = crate::unix_now_secs();
+        let q = self.seen_knocks.entry(peer_hex.to_string()).or_default();
+        q.retain(|(_, at)| now_unix.saturating_sub(*at) <= KNOCK_SEEN_SECS);
+        if q.iter().any(|(d, _)| constant_time_eq(d, &digest)) {
+            return false;
+        }
+        if q.len() >= MAX_KNOCKS_SEEN_PER_PEER {
+            q.pop_front();
+        }
+        q.push_back((digest, now_unix));
+        true
+    }
+
+    /// A pinned contact's verified knock (Task 9, §C.4): the contact asked
+    /// on the identity path (it lost its sessions, rotated, or fell back),
+    /// where a blind ask can never meet it, so the answer is an identity
+    /// ask. A live blinded circuit with it is then one it no longer uses:
+    /// closed on this connection (its id is never carried to another) and
+    /// the pair asked again. A live identity circuit is left alone (an
+    /// identity ask without its resume already made the relay end it, §6.2
+    /// step 2). A knock issued in an hour before the current session began
+    /// is stale (queued at the relay up to 72 h) and changes the path of
+    /// nothing; with no live circuit the pair is still re-asked.
+    fn contact_knocked(&mut self, peer_hex: &str, issued_hour: u64, no_prior_session: bool) {
+        let (fresh, blinded) = self
+            .session_manager
+            .get(peer_hex)
+            .map_or((true, false), |s| {
+                (issued_hour >= s.created_at_unix / 3600, s.blinded)
+            });
+        let live = self.has_live_circuit(peer_hex);
+        if live && !(blinded && fresh) {
+            return;
+        }
+        if fresh {
+            if !self.knock_may_repair_by_identity(peer_hex, no_prior_session) {
+                log::debug!("[RUST] contact knock: identity budget spent; staying blind");
+                return;
+            }
+            // H-1: a flagged knock (no session on its side) keeps the pair
+            // on the identity path; any other runs out like the fallback.
+            let w = self.identity_wanted.entry(peer_hex.to_string()).or_insert(
+                crate::blind::IdentityWanted {
+                    no_prior_session,
+                    asked: None,
+                },
+            );
+            w.no_prior_session |= no_prior_session;
+        }
+        if live {
+            self.close_circuit_with(peer_hex);
+            self.detach_circuit(peer_hex);
+        }
+        self.schedule_reask(peer_hex);
+    }
+
+    /// Rulings R35 and M-1 (Task 16 fix round 1): whether a pinned
+    /// contact's fresh knock may move the pair to the identity path. With
+    /// no blind-capable session (no pair secret) the identity path is the
+    /// only one: yes. Otherwise every such re-pair, flagged "no prior
+    /// session" or not, draws on the pair's one identity re-pair per
+    /// `IDENTITY_FALLBACK_INTERVAL_SECS` (`last_identity_fallback_unix`,
+    /// persisted, shared with the timed fallback): the first one acts at once
+    /// and stamps it, and any other within 24 h is ignored for re-pairing
+    /// (the pair stays blind). So a relay that withholds genuine knocks,
+    /// first-contact, reinstall and rotation knocks included, and delivers
+    /// them after blind re-pairs can force at most one identity re-pair (and
+    /// one `SessionReplaced`) per pair per 24 h; a genuine reinstall still
+    /// re-pairs at once unless one already happened that day.
+    fn knock_may_repair_by_identity(&mut self, peer_hex: &str, no_prior_session: bool) -> bool {
+        let now_unix = self.pair_now_unix();
+        let spent = match self.session_manager.get(peer_hex) {
+            None => return true,
+            Some(s) if s.pair_secret.is_none() => return true,
+            Some(s) => s.last_identity_fallback_unix.is_some_and(|t| {
+                now_unix.saturating_sub(t) < crate::blind::IDENTITY_FALLBACK_INTERVAL_SECS
+            }),
+        };
+        if spent {
+            log::debug!(
+                "[RUST] contact knock (no prior session: {no_prior_session}): identity budget spent"
+            );
+            return false;
+        }
+        if let Some(mut s) = self.session_manager.get_mut(peer_hex) {
+            s.last_identity_fallback_unix = Some(now_unix);
+        }
+        let _ = self.persist_peer(peer_hex);
+        true
+    }
+
+    /// Pin the KEM key of `bundle` (verified, signed by `peer_hex`) when
+    /// `peer_hex` is pinned under the bundle's agreement key and has none.
+    fn adopt_bundle_kem(&mut self, peer_hex: &str, bundle: &crate::keyauth::SignedBundle) {
+        let same_ak = self
+            .peers
+            .pin_for(peer_hex)
+            .is_some_and(|ak| constant_time_eq(&ak, &bundle.identity_agreement_key));
+        if same_ak
+            && self.peers.kem_pk_for(peer_hex).is_none()
+            && self.peers.set_kem_pk(peer_hex, bundle.kem_pk.clone())
+        {
+            // The app stores it with the pin and re-pins it at launch (R11,
+            // fix round 1 minor 2): a key event with code 5, the key as hex.
+            self.emit_peer_key_event(peer_hex, KEM_KEY_LEARNED, &hex::encode(&bundle.kem_pk[..]));
+        }
+    }
+
     /// The relay tore our pair down: keep the ratchet (queued messages may
     /// still arrive) but stop sending on the circuit, and re-ask a pinned peer.
     pub(crate) fn handle_circuit_closed(&mut self, circuit_id: CircuitId) {
+        if let Some((peer, _)) = self.pending_init_by_circuit(&circuit_id) {
+            // The pair waiting for its session-init is gone (§A.3).
+            self.abandon_pending_init(&peer, false);
+            return;
+        }
         let peer = self
             .session_manager
             .find_by_circuit_id(&circuit_id)
@@ -688,6 +1156,10 @@ impl ClientInner {
         for (peer, message_id) in refused {
             self.emit_status(crate::status::StatusEvent::SendNotAccepted { peer, message_id });
         }
+        if let Some((peer, _)) = self.pending_init_by_circuit(&circuit_id) {
+            self.abandon_pending_init(&peer, false);
+            return;
+        }
         let peer = self
             .session_manager
             .find_by_target_circuit_id(&circuit_id)
@@ -705,12 +1177,26 @@ impl ClientInner {
         token: Vec<u8>,
         target_circuit_id: CircuitId,
     ) {
-        let Some(peer) = self.session_manager.find_by_circuit_id(&circuit_id) else {
-            return;
-        };
         if token.len() != 32 {
             return;
         }
+        if let Some((peer, _)) = self.pending_init_by_circuit(&circuit_id) {
+            // The pair waiting for its session-init resumed (§A.3).
+            let epoch = self.transport_epoch;
+            if let Some(p) = self.pending_inits.get_mut(&peer) {
+                p.circuit_id = circuit_id;
+                p.target_circuit_id = target_circuit_id;
+                p.token = Zeroizing::new(token.as_slice().try_into().unwrap_or([0; 32]));
+                p.circuit_epoch = epoch;
+            }
+            self.clear_unanswered(&peer);
+            self.pending_reasks.remove(&peer);
+            let _ = self.persist_peer(&peer);
+            return;
+        }
+        let Some(peer) = self.session_manager.find_by_circuit_id(&circuit_id) else {
+            return;
+        };
         // Already live on this connection (the peer resumed): nothing was
         // lost on our side, so nothing is re-sent.
         let was_live = self.has_live_circuit(&peer);
@@ -817,6 +1303,8 @@ impl ClientInner {
         }
         self.receipt_due.remove(peer_hex); // cancels a pending delayed flush
         self.last_heard.remove(peer_hex);
+        self.steady_unheard.remove(peer_hex);
+        self.steady_message_turn.remove(peer_hex);
         self.cover_sent.remove(peer_hex);
         self.cover_replies_charged.remove(peer_hex);
         self.cover_replies_due.retain(|(p, _)| p != peer_hex);
@@ -848,6 +1336,15 @@ impl ClientInner {
         if self.notice_due.contains(peer_hex) && self.notice_flag_pending.contains_key(peer_hex) {
             return;
         }
+        self.send_receipt_batches(peer_hex, usize::MAX);
+    }
+
+    /// Seal and send up to `max_batches` batches (of up to 32 ids) of the
+    /// receipts queued for `peer_hex`, delivered before read; what is not
+    /// sent stays queued. The caller has checked the peer and its circuit.
+    /// Returns how many batches the transport accepted.
+    pub(crate) fn send_receipt_batches(&mut self, peer_hex: &str, max_batches: usize) -> usize {
+        let mut sent = 0usize;
         for kind in [receipts::DELIVERED, receipts::READ] {
             let Some(ids) = self.pending_receipts.remove(&(peer_hex.to_string(), kind)) else {
                 continue;
@@ -856,7 +1353,7 @@ impl ClientInner {
             for chunk in ids.chunks(receipts::MAX_IDS) {
                 // Checked per batch: a queue that filled since the last one
                 // must not cost a chain key for a frame it then refuses.
-                if !self.transport_usable() {
+                if sent >= max_batches || !self.transport_usable() {
                     unsent.extend_from_slice(chunk);
                     continue;
                 }
@@ -892,12 +1389,14 @@ impl ClientInner {
                         ids: chunk.to_vec(),
                     },
                 );
+                sent += 1;
             }
             if !unsent.is_empty() {
                 self.pending_receipts
                     .insert((peer_hex.to_string(), kind), unsent);
             }
         }
+        sent
     }
 
     /// Send the session notice owed to `peer_hex` (spec §18.6 D37), once
@@ -908,7 +1407,8 @@ impl ClientInner {
     /// crash before then re-reports them, never drops them); a lost id
     /// then moves to `lost_reported`. A batch that cannot be sealed or sent
     /// stays owed, with the rest, for a later flush.
-    pub(crate) fn send_notice_now(&mut self, peer_hex: &str) {
+    /// True when a notice batch was handed to the transport.
+    pub(crate) fn send_notice_now(&mut self, peer_hex: &str) -> bool {
         if !self.notice_due.contains(peer_hex)
             || !self.transport_usable()
             || !self.has_live_circuit(peer_hex)
@@ -917,7 +1417,7 @@ impl ClientInner {
                 .get(peer_hex)
                 .is_some_and(|s| s.can_send())
         {
-            return;
+            return false;
         }
         let list = |m: &std::collections::HashMap<String, std::collections::VecDeque<[u8; 16]>>| {
             m.get(peer_hex)
@@ -964,6 +1464,7 @@ impl ClientInner {
             _ => None,
         };
         let more = batches.len() > 1;
+        let mut handed = false;
         for mut n in batches.into_iter().take(1) {
             if let Some((signer, my_ik, peer_ik, binding)) = &signing {
                 n.sig = notice::tbs(my_ik, peer_ik, binding, &n).and_then(|t| signer.sign(&t));
@@ -979,7 +1480,7 @@ impl ClientInner {
                     // Nothing left and no key spent past a durable write
                     // (D28): still owed, retried by a later flush.
                     log::debug!("[RUST] session notice not sealed; still owed");
-                    return;
+                    return false;
                 }
             };
             let (circuit, payload) = (packet.circuit_id.clone(), packet.payload.clone());
@@ -989,8 +1490,9 @@ impl ClientInner {
                 log::debug!("[RUST] session notice not sent; still owed");
                 self.notice_send_stalled
                     .insert(peer_hex.to_string(), self.transport_epoch);
-                return;
+                return false;
             }
+            handed = true;
             // Handed to the transport: if its connection is replaced before
             // the frame leaves, the resume re-sends these bytes, ahead of
             // the receipts tracked after it (I-1).
@@ -1030,10 +1532,11 @@ impl ClientInner {
             // per flush; the next goes with the next tick's
             // `redrive_owed_sends`, so a flood of ids costs one notice per
             // tick, not one per id.
-            return;
+            return handed;
         }
         self.notice_due.remove(peer_hex);
         let _ = self.persist_peer(peer_hex);
+        handed
     }
 
     /// A frame handed to the transport now would leave: connected, the
@@ -1041,7 +1544,10 @@ impl ClientInner {
     /// Checked before sealing what nothing else would re-send, so a down
     /// transport burns no chain keys (the read loop's end closes the queue).
     pub(crate) fn transport_usable(&self) -> bool {
+        // Final review L5: never in a background drain (§H.1), whose
+        // `send_now` gate refuses everything but signaling anyway.
         self.is_connected
+            && !self.in_drain()
             && self.frame_gate_open()
             && self
                 .websocket
@@ -1152,6 +1658,11 @@ impl ClientInner {
         // The flag reports a reset only against what this session's
         // install recorded: the session the peer's flag is about replaced
         // an established one (`reset_since_unix`).
+        // R33 M-2: a peer with no prior session may have lost our shared
+        // timer state; it goes again (a no-op if the peer still has it).
+        if n.flags & notice::FLAG_NO_PRIOR_SESSION != 0 {
+            self.timer_resync(sender);
+        }
         let session_start = if n.flags & notice::FLAG_NO_PRIOR_SESSION != 0 {
             self.session_manager
                 .get_mut(sender)
@@ -1507,6 +2018,7 @@ impl ClientInner {
         id: [u8; 16],
     ) -> Result<(), RChatError> {
         self.peers.mark_seen(sender, id);
+        self.drain_note_stored(sender, id);
         let was_unstored = self.delivered_unstored.get_mut(sender).is_some_and(|q| {
             let before = q.len();
             q.retain(|x| x != &id);
@@ -1593,6 +2105,18 @@ impl ClientInner {
                 self.hello_sync_due.remove(&peer);
             }
         }
+        // Tracked re-sends held behind a session-init that is out now (M-3).
+        let held: Vec<String> = self.resend_after_init.iter().cloned().collect();
+        for peer in held {
+            let init_out = self.session_manager.get(&peer).is_some_and(|s| {
+                !s.init_out
+                    .as_ref()
+                    .is_some_and(|i| !matches!(&i.sent, Some(x) if !x.payload.is_empty()))
+            });
+            if init_out {
+                self.resend_tracked(&peer);
+            }
+        }
         let due: Vec<String> = self
             .notice_due
             .iter()
@@ -1627,6 +2151,12 @@ impl ClientInner {
     /// Schedule queued receipts for `peer_hex` (spec §5.7): a 0.5-3 s window
     /// from the first one, sent at once when a full batch is waiting.
     pub(crate) fn flush_receipts(&mut self, peer_hex: &str) {
+        if self.steady_holds(peer_hex) {
+            // Steady traffic (§B.3): receipts and notices keep their
+            // batching but drain through slots; they go this way again
+            // when steady stops (`apply_steady`).
+            return;
+        }
         let queued: usize = [receipts::DELIVERED, receipts::READ]
             .iter()
             .filter_map(|k| self.pending_receipts.get(&(peer_hex.to_string(), *k)))
@@ -1658,10 +2188,12 @@ impl ClientInner {
 
     /// Send every batch whose window has closed.
     pub(crate) fn fire_due_receipts(&mut self, now: Instant) {
+        // Slots drain a held peer's receipts (§B.3); due again when steady
+        // stops or the peer leaves the draw (R23).
         let due: Vec<String> = self
             .receipt_due
             .iter()
-            .filter(|(_, at)| **at <= now)
+            .filter(|(p, at)| **at <= now && !self.steady_holds(p))
             .map(|(p, _)| p.clone())
             .collect();
         for peer in due {
@@ -1752,6 +2284,9 @@ impl ClientInner {
     /// scheduled in the last hour (security review L-2); a request past
     /// either is dropped silently.
     pub(crate) fn schedule_cover_replies(&mut self, peer_hex: &str, now: Instant) {
+        if self.in_drain() {
+            return; // no cover traffic from a background drain (§H.1)
+        }
         let scheduled =
             |due: &Vec<(String, Instant)>| due.iter().filter(|(p, _)| p == peer_hex).count();
         if scheduled(&self.cover_replies_due) >= MAX_COVER_PER_HOUR
@@ -1800,6 +2335,13 @@ impl ClientInner {
     /// only while cover is enabled and in the foreground, one every
     /// `cover_delay_for` to a random eligible peer.
     pub(crate) fn fire_cover(&mut self, now: Instant) {
+        if self.steady_active() {
+            // Steady traffic replaces cover requests (§B.1): never both.
+            // Due replies wait; a slot's cover packet to the peer stands
+            // for one (`steady_send_cover`), the rest go when steady stops.
+            self.cover_next = None;
+            return;
+        }
         let (due, mut later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.cover_replies_due)
             .into_iter()
             .partition(|(_, at)| *at <= now);
@@ -1843,20 +2385,22 @@ impl ClientInner {
         }
     }
 
-    /// Spec §4.4 steps 1–8, in order. Every outcome answers the peer's ask
-    /// (spec §18.6 D33): on success the session's own meta write carries
-    /// the cleared ask; on any other outcome the meta record is written here.
-    pub(crate) fn handle_circuit_created_v2(&mut self, f: CircuitCreatedV2Frame) {
+    /// Spec §4.4 steps 1–8, in order, with X3DH v3 (§A.3). Every outcome
+    /// answers the peer's ask (spec §18.6 D33): on success the session's own
+    /// meta write carries the cleared ask; on any other outcome (including a
+    /// responder now waiting for session-init) the meta record is written here.
+    pub(crate) fn handle_circuit_created_v3(&mut self, f: CircuitCreatedV3Frame) {
         let asks_before = self.unanswered_asks.len();
-        let installed = self.circuit_created_v2_steps(f);
+        let installed = self.circuit_created_v3_steps(f);
         if !installed && self.unanswered_asks.len() != asks_before {
             self.persist_meta();
         }
     }
 
-    /// `handle_circuit_created_v2`'s steps; true when the session was
-    /// installed (the meta record is written once the session is durable).
-    fn circuit_created_v2_steps(&mut self, f: CircuitCreatedV2Frame) -> bool {
+    /// `handle_circuit_created_v3`'s steps; true when a session was
+    /// installed (role 0; the meta record is written once it is durable).
+    /// Role 1 installs nothing: it keeps a `PendingInit` until session-init.
+    fn circuit_created_v3_steps(&mut self, f: CircuitCreatedV3Frame) -> bool {
         let now = Instant::now();
         // Shape first (RF4): nothing below may index past a short field.
         let (Some(i_ek), Some(r_ek)) = (
@@ -1866,7 +2410,17 @@ impl ClientInner {
             self.close_circuit_id(&f.circuit_id);
             return false;
         };
-        if f.role > 1 || f.token.len() != 32 {
+        let Ok(r_kem) = <&[u8; KEM_PK_LEN]>::try_from(f.responder_kem_ephemeral_pk.as_slice())
+        else {
+            self.close_circuit_id(&f.circuit_id);
+            return false;
+        };
+        if f.role > 1
+            || f.token.len() != 32
+            || f.initiator_kem_ephemeral_pk.len() != KEM_PK_LEN
+            || f.initiator_ephemeral_sig.len() != crate::protocol::ASK_EPH_SIG_LEN
+            || f.responder_ephemeral_sig.len() != crate::protocol::ASK_EPH_SIG_LEN
+        {
             self.close_circuit_id(&f.circuit_id);
             return false;
         }
@@ -1891,18 +2445,32 @@ impl ClientInner {
 
         // 2. Echo check: my own outstanding EK must come back (H1, M9). Consumed on match.
         let mine = if f.role == 0 { i_ek } else { r_ek };
-        let Some(my_ek) = self.peers.take_ask(&peer_hex, &mine, now) else {
+        let Some(ask) = self.peers.take_ask(&peer_hex, &mine, now) else {
+            // A blind ask we retired while the relay held it, met by the
+            // peer: our epoch follows the peer's before the re-ask, but
+            // only for a frame the peer's keys verify (fix round 2 N-3):
+            // a relay cannot move our counter with a forged one.
+            if self.created_frame_verifies(&f, &bundle, &pinned_ak, &i_ek, &r_ek) {
+                self.adopt_stray_blind_match(&peer_hex, &mine);
+            }
             self.close_circuit_id(&f.circuit_id);
             self.schedule_reask(&peer_hex);
             return false;
         };
+        let AskKeys {
+            ek: my_ek,
+            kem: my_kem,
+            kem_seed,
+            blind,
+        } = ask;
+        let origin = if blind.is_some() {
+            crate::blind::InstallOrigin::Blind
+        } else {
+            crate::blind::InstallOrigin::Identity
+        };
 
-        // 3. Bad bundle signature: transient (M1), re-ask. A v2 bundle must
-        //    also carry SPK == identity agreement key; one that doesn't is
-        //    treated the same way.
-        if keyauth::verify_bundle(&bundle).is_err()
-            || !constant_time_eq(&bundle.signed_pre_key, &bundle.identity_agreement_key)
-        {
+        // 3. Bad bundle signature (v3: ik, ak and kem_pk): transient (M1), re-ask.
+        if keyauth::verify_bundle(&bundle).is_err() {
             self.peers.mark_bad_signature(&peer_hex, now);
             self.close_circuit_id(&f.circuit_id);
             self.emit_peer_key_event(&peer_hex, PeerKeyState::BadSignature as u8, "");
@@ -1910,9 +2478,11 @@ impl ClientInner {
             return false;
         }
 
-        // 4. Pin mismatch (constant time): sticky, no re-ask.
+        // 4. Pin mismatch (constant time): sticky, no re-ask. The signed
+        //    KEM key must equal the pinned one too (§A.6, R11).
         // 5. Agreement key pinned for another identity (M10): refused the same way.
         if !constant_time_eq(&pinned_ak, &bundle.identity_agreement_key)
+            || !self.peers.kem_matches(&peer_hex, &bundle.kem_pk)
             || self
                 .peers
                 .pinned_elsewhere(&peer_hex, &bundle.identity_agreement_key)
@@ -1927,120 +2497,148 @@ impl ClientInner {
             return false;
         }
 
-        // 6. X3DH v2 with the verified keys only.
+        // 5b (R7). The peer's ask ephemerals must carry its signature under
+        // the pinned identity key, before any KEM operation: a relay cannot
+        // substitute its own X25519 or KEM ephemeral for the peer's.
+        let (peer_ek, peer_kem, peer_sig) = if f.role == 0 {
+            (
+                &r_ek,
+                &f.responder_kem_ephemeral_pk,
+                &f.responder_ephemeral_sig,
+            )
+        } else {
+            (
+                &i_ek,
+                &f.initiator_kem_ephemeral_pk,
+                &f.initiator_ephemeral_sig,
+            )
+        };
+        if keyauth::verify_ask_ephemerals(&bundle.identity_key, peer_ek, peer_kem, peer_sig)
+            .is_err()
+        {
+            self.close_circuit_id(&f.circuit_id);
+            self.schedule_reask(&peer_hex);
+            return false;
+        }
+        // M-4: the pair formed; the peer's other outstanding asks (their
+        // X25519 and KEM secrets) are wiped now, not at `ASK_TTL`. A new
+        // pair: an init awaited on an older one can no longer come. Only
+        // after the bundle and the peer's ask signature verify (final
+        // review L3): a forged frame wipes nothing.
+        self.peers.drop_asks(&peer_hex);
+        self.pending_inits.remove(&peer_hex);
+        // §C.1, R14: a blind token is spent by this verified match; both
+        // sides advance their epoch now, whether or not the session-init
+        // comes. Only after the peer's signature checks (fix round 2 N-3):
+        // a tampered frame never moves our counter.
+        self.note_pair_match(&peer_hex, &mine, blind);
+
         let Some(identity) = self.identity.as_ref() else {
             self.close_circuit_id(&f.circuit_id);
             return false;
         };
         let my_ik = identity.public_signing_key().to_bytes();
-        let sk = if f.role == 0 {
-            x3dh_v2_initiator(
+
+        if f.role == 1 {
+            // 6 (responder). The relay must echo our own KEM ephemeral as
+            // the responder's (constant time): a swapped key would leave the
+            // initiator encapsulating to someone else's key. Refused like an
+            // EK that does not echo.
+            // The X25519 half is checked now (L1, K17), although SK is
+            // derived only once session-init brings the KEM ciphertext.
+            let contributory = keyauth::dh_checked(my_ek.secret_key(), &i_ek).is_ok()
+                && keyauth::dh_checked(identity.agreement_secret(), &i_ek).is_ok();
+            if !constant_time_eq(my_kem.public(), r_kem) || !contributory {
+                self.close_circuit_id(&f.circuit_id);
+                self.schedule_reask(&peer_hex);
+                return false;
+            }
+            // No session until session-init arrives (§A.3): the ask's
+            // ephemerals wait for it, wiped when the entry goes.
+            let pending = PendingInit {
+                kem: my_kem,
+                kem_seed,
+                ek_r: my_ek.secret_key().clone(),
+                i_ek,
+                peer_ak: bundle.identity_agreement_key,
+                circuit_id: f.circuit_id,
+                target_circuit_id: f.target_circuit_id,
+                token: Zeroizing::new(f.token.as_slice().try_into().unwrap_or([0; 32])),
+                circuit_epoch: self.transport_epoch,
+                expires_at_unix: crate::unix_now_secs() + crate::peers::ASK_TTL.as_secs(),
+                created_at_unix: crate::unix_now_secs(),
+                origin,
+            };
+            self.pending_inits.insert(peer_hex.clone(), pending);
+            self.peers.clear_bad_signature(&peer_hex);
+            // Best effort: a restart before the init arrives can still open it.
+            let _ = self.persist_peer(&peer_hex);
+            return false;
+        }
+
+        // 6 (initiator). Our own KEM ephemeral has no use once we are the
+        // initiator: wiped now (ruling: §A.3 forward secrecy).
+        drop(my_kem);
+        drop(kem_seed);
+        // Encapsulate to the responder's ask KEM key (FIPS 203 §7.2 check
+        // first); then X3DH v3 with the verified keys only.
+        let encaps = crate::kem::validate_public_key(r_kem)
+            .and_then(|()| crate::kem::encapsulate(r_kem))
+            .ok();
+        let sk = encaps.as_ref().and_then(|(ct, ss)| {
+            x3dh_v3_initiator(
                 identity.agreement_secret(),
                 my_ek.secret_key(),
                 &bundle.identity_agreement_key,
-                &bundle.signed_pre_key,
                 &r_ek,
+                ss,
+                r_kem,
+                ct,
                 &my_ik,
                 &bundle.identity_key,
             )
-        } else {
-            x3dh_v2_responder(
-                identity.agreement_secret(),
-                identity.agreement_secret(),
-                my_ek.secret_key(),
-                &bundle.identity_agreement_key,
-                &i_ek,
-                &bundle.identity_key,
-                &my_ik,
-            )
-        };
-        let Ok(sk) = sk.map(Zeroizing::new) else {
-            // Non-contributory relay EK (L1, K17).
+            .ok()
+        });
+        let (Some((ct, _ss)), Some(sk)) = (encaps, sk) else {
+            // A malformed responder KEM key or a non-contributory relay EK
+            // (L1, K17): a handshake failure.
             self.close_circuit_id(&f.circuit_id);
             self.schedule_reask(&peer_hex);
             return false;
         };
-
-        // 7. Session keyed by the peer's identity; never touch current_recipient (F4).
-        let mut session = ChatSession::new(peer_hex.clone());
-        session.set_identities(my_ik, bundle.identity_key);
-        let init = if f.role == 0 {
-            let ek_secret = Zeroizing::new(my_ek.secret_key().to_bytes());
-            session.initialize_alice(&sk, &ek_secret, bundle.signed_pre_key)
-        } else {
-            let ak_secret = Zeroizing::new(identity.agreement_secret().to_bytes());
-            session.initialize_bob(&sk, &ak_secret, i_ek)
-        };
-        if init.is_err() {
+        let confirm = crate::session_init::init_confirm(&sk, &ct);
+        let ek_secret = Zeroizing::new(my_ek.secret_key().to_bytes());
+        drop(my_ek);
+        let installed = self.install_session(
+            &peer_hex,
+            NewSession {
+                role: 0,
+                sk: &sk,
+                my_ik,
+                peer_ik: bundle.identity_key,
+                peer_ak: bundle.identity_agreement_key,
+                ek: ek_secret,
+                circuit_id: f.circuit_id.clone(),
+                target_circuit_id: f.target_circuit_id,
+                token: f.token,
+                circuit_epoch: self.transport_epoch,
+                init_out: Some(Box::new(InitOut {
+                    ct: Box::new(ct),
+                    confirm,
+                    sent: None,
+                })),
+                answered,
+                origin,
+            },
+        );
+        if !installed {
             self.close_circuit_id(&f.circuit_id);
             return false;
         }
-        session.set_circuit(f.circuit_id, f.target_circuit_id, f.token);
-        session.circuit_epoch = self.transport_epoch;
-        // Messages send_* accepted for the old session (or a retired one)
-        // move to the new session, so they are still sent.
-        session.pending_messages = self.session_manager.take_pending(&peer_hex);
-        session.peer_ak = bundle.identity_agreement_key;
-        // What this session's notice signatures are bound to (D45).
-        session.session_binding = crate::device_key::session_binding(&sk);
-        // A placeholder session (pending sends only, no ratchet) is not a
-        // prior session (F32).
-        let had_prior = self
-            .session_manager
-            .get(&peer_hex)
-            .is_some_and(|s| s.ratchet.is_some())
-            || self.session_manager.retired_count(&peer_hex) > 0;
-        // 8. An existing session becomes the single retired, decrypt-only session.
-        self.session_manager.install(peer_hex.clone(), session);
-        // Exactly one notice per new session (D37), persisted as
-        // `notice_due` with the session; scheduled before the held bodies
-        // are retried, so their failures join it.
-        self.notice_due.insert(peer_hex.clone());
-        // This session's flag: set when we held no session with the peer,
-        // or when the session we held was itself made with none and its
-        // notice never left (the flag still owed). The peer has then heard
-        // of no session of ours since the one it last knew, and it reads
-        // the flag against the session it held when ours was announced
-        // last (`ChatSession::reset_since_unix`), so a carried flag reports
-        // a reset only if there truly was one (Task 11 follow-up).
-        let owed = self
-            .notice_flag_pending
-            .get(&peer_hex)
-            .is_some_and(|f| f & notice::FLAG_NO_PRIOR_SESSION != 0);
-        if !had_prior || owed {
-            self.notice_flag_pending
-                .insert(peer_hex.clone(), notice::FLAG_NO_PRIOR_SESSION);
-        } else {
-            self.notice_flag_pending.remove(&peer_hex);
-        }
-        self.hello_sync_due.remove(&peer_hex);
-        // D28: durable before it is announced. On failure the session stays
-        // in memory and the next successful write carries it; that write
-        // raises the owed `SessionReplaced` (`persist_peer`).
-        // The answered ask leaves the meta record only once the session is
-        // on disk (that write's `after_durable` writes the meta record): a
-        // kill before then must still find the ask (D33).
-        if let Some(mut s) = self.session_manager.get_mut(&peer_hex) {
-            s.replaced_unannounced = s.replaced_established;
-            s.ask_answered_unrecorded = answered;
-        }
-        let persisted = self.persist_peer(&peer_hex).is_ok();
-        self.peers.clear_bad_signature(&peer_hex);
-        self.peers.backoff_mut(&peer_hex).reset();
-        self.pending_reasks.remove(&peer_hex);
-        // Round-2 M3: reached under our new identity; the app learns it from
-        // `on_circuit_established` and persists the smaller set.
-        self.rotation_reached(&peer_hex);
-        // The intro precedes only the first circuit; the app now sends its
-        // text as an ordinary message under the intro id.
-        self.intros.remove(&peer_hex);
-        self.is_e2ee_initiator = f.role == 0;
-        if persisted {
-            if let Some(cb) = &self.callbacks {
-                cb.on_circuit_established(peer_hex.clone(), f.role == 0);
-            }
-        }
-        if f.role == 0 && !self.send_hello_sync(&peer_hex) {
+        // §A.4: the first packet on the circuit is session-init, carrying
+        // the invisible first message (a cover message) when the app has
+        // nothing to send yet.
+        if !self.send_hello_sync(&peer_hex) {
             // Re-sent by the tick once writes succeed (`redrive_owed_sends`).
             self.hello_sync_due.insert(peer_hex.clone());
         }
@@ -2052,9 +2650,389 @@ impl ClientInner {
         true
     }
 
+    /// The checks a `CircuitCreatedV3` must pass before it may move our
+    /// pair epoch (N-3): the peer's bundle signature, its keys equal to the
+    /// pins, and the peer's signature over its ask ephemerals (R7).
+    fn created_frame_verifies(
+        &self,
+        f: &CircuitCreatedV3Frame,
+        bundle: &crate::keyauth::SignedBundle,
+        pinned_ak: &[u8; 32],
+        i_ek: &[u8; 32],
+        r_ek: &[u8; 32],
+    ) -> bool {
+        let peer_hex = hex::encode(bundle.identity_key);
+        let (peer_ek, peer_kem, peer_sig) = if f.role == 0 {
+            (
+                r_ek,
+                &f.responder_kem_ephemeral_pk,
+                &f.responder_ephemeral_sig,
+            )
+        } else {
+            (
+                i_ek,
+                &f.initiator_kem_ephemeral_pk,
+                &f.initiator_ephemeral_sig,
+            )
+        };
+        keyauth::verify_bundle(bundle).is_ok()
+            && constant_time_eq(pinned_ak, &bundle.identity_agreement_key)
+            && self.peers.kem_matches(&peer_hex, &bundle.kem_pk)
+            && keyauth::verify_ask_ephemerals(&bundle.identity_key, peer_ek, peer_kem, peer_sig)
+                .is_ok()
+    }
+
+    /// Steps 7–8 for a verified X3DH v3 secret, on either role: the session
+    /// keyed by the peer's identity replaces the current one (which becomes
+    /// the single retired session), owes its notice, and is written before
+    /// it is announced (D28). False when the ratchet could not be set up.
+    fn install_session(&mut self, peer_hex: &str, n: NewSession<'_>) -> bool {
+        let initiator = n.role == 0;
+        // 7. Session keyed by the peer's identity; never touch current_recipient (F4).
+        let mut session = ChatSession::new(peer_hex.to_string());
+        session.set_identities(n.my_ik, n.peer_ik);
+        let init = if initiator {
+            session.initialize_alice(n.sk, &n.ek, n.peer_ak)
+        } else {
+            let Some(identity) = self.identity.as_ref() else {
+                return false;
+            };
+            let ak_secret = Zeroizing::new(identity.agreement_secret().to_bytes());
+            let i_ek: [u8; 32] = *n.ek;
+            session.initialize_bob(n.sk, &ak_secret, i_ek)
+        };
+        if init.is_err() {
+            return false;
+        }
+        session.set_circuit(n.circuit_id, n.target_circuit_id, n.token);
+        session.circuit_epoch = n.circuit_epoch;
+        session.init_out = n.init_out;
+        // Messages send_* accepted for the old session (or a retired one)
+        // move to the new session, so they are still sent.
+        session.pending_messages = self.session_manager.take_pending(peer_hex);
+        session.peer_ak = n.peer_ak;
+        // What this session's notice signatures are bound to (D45).
+        session.session_binding = crate::device_key::session_binding(n.sk);
+        // §C.1 and R14: an identity install derives PS from this SK, on
+        // either role, and the epoch starts at (today, 0); a blind install
+        // keeps the pair's PS and its epoch (advanced at the match).
+        let blind = n.origin == crate::blind::InstallOrigin::Blind;
+        let kept = blind
+            .then(|| {
+                self.session_manager
+                    .get(peer_hex)
+                    .and_then(|s| s.pair_secret.clone().map(|ps| (ps, s.pair_epoch)))
+            })
+            .flatten();
+        match kept {
+            Some((ps, epoch)) => {
+                session.pair_secret = Some(ps);
+                session.pair_epoch = epoch;
+            }
+            None => {
+                if blind {
+                    // Not expected (a blind ask needs PS): the fresh PS
+                    // desyncs the tokens, which the identity fallback heals.
+                    log::debug!("[RUST] blind install without a pair secret; derived anew");
+                }
+                session.pair_secret = Some(crate::pairing::pair_secret(n.sk));
+                session.pair_epoch = crate::pairing::PairEpoch {
+                    day: crate::pairing::utc_day(self.pair_now_unix()),
+                    counter: 0,
+                };
+            }
+        }
+        session.blinded = blind;
+        // R20: the fallback clock starts again with this verified install
+        // (M-3: only here, never at the bare match); the last fallback's
+        // time carries over, so at most one per interval.
+        session.last_identity_fallback_unix = self
+            .session_manager
+            .get(peer_hex)
+            .and_then(|s| s.last_identity_fallback_unix);
+        self.identity_fallback.remove(peer_hex);
+        if !blind {
+            // M-4: a new pair secret: what was sealed under the old lineage
+            // is never re-sealed (AK4), so its plaintext goes now.
+            self.ack_tracker_drop_plaintexts(peer_hex, session.pair_lineage());
+        }
+        // A placeholder session (pending sends only, no ratchet) is not a
+        // prior session (F32).
+        let had_prior = self
+            .session_manager
+            .get(peer_hex)
+            .is_some_and(|s| s.ratchet.is_some())
+            || self.session_manager.retired_count(peer_hex) > 0;
+        // 8. An existing session becomes the single retired, decrypt-only session.
+        self.session_manager.install(peer_hex.to_string(), session);
+        // R32: our timer change the peer hasn't acknowledged goes again on
+        // the new session (identity or blind install alike).
+        self.queue_timer_state_with(peer_hex, false);
+        // Exactly one notice per new session (D37), persisted as
+        // `notice_due` with the session; scheduled before the held bodies
+        // are retried, so their failures join it.
+        self.notice_due.insert(peer_hex.to_string());
+        // This session's flag: set when we held no session with the peer,
+        // or when the session we held was itself made with none and its
+        // notice never left (the flag still owed). The peer has then heard
+        // of no session of ours since the one it last knew, and it reads
+        // the flag against the session it held when ours was announced
+        // last (`ChatSession::reset_since_unix`), so a carried flag reports
+        // a reset only if there truly was one (Task 11 follow-up).
+        let owed = self
+            .notice_flag_pending
+            .get(peer_hex)
+            .is_some_and(|f| f & notice::FLAG_NO_PRIOR_SESSION != 0);
+        if !had_prior || owed {
+            self.notice_flag_pending
+                .insert(peer_hex.to_string(), notice::FLAG_NO_PRIOR_SESSION);
+        } else {
+            self.notice_flag_pending.remove(peer_hex);
+        }
+        self.hello_sync_due.remove(peer_hex);
+        // D28: durable before it is announced. On failure the session stays
+        // in memory and the next successful write carries it; that write
+        // raises the owed `SessionReplaced` (`persist_peer`).
+        // The answered ask leaves the meta record only once the session is
+        // on disk (that write's `after_durable` writes the meta record): a
+        // kill before then must still find the ask (D33).
+        if let Some(mut s) = self.session_manager.get_mut(peer_hex) {
+            // A blind re-pair replaces the ratchet on every reconnect by
+            // design (§C.3): never a `SessionReplaced` warning.
+            s.replaced_unannounced = s.replaced_established && !blind;
+            s.ask_answered_unrecorded = n.answered;
+        }
+        self.identity_wanted.remove(peer_hex);
+        let persisted = self.persist_peer(peer_hex).is_ok();
+        self.peers.clear_bad_signature(peer_hex);
+        self.peers.backoff_mut(peer_hex).reset();
+        self.pending_reasks.remove(peer_hex);
+        // Round-2 M3: reached under our new identity; the app learns it from
+        // `on_circuit_established` and persists the smaller set.
+        self.rotation_reached(peer_hex);
+        // The intro precedes only the first circuit; the app now sends its
+        // text as an ordinary message under the intro id.
+        self.intros.remove(peer_hex);
+        self.is_e2ee_initiator = initiator;
+        if persisted {
+            if let Some(cb) = &self.callbacks {
+                cb.on_circuit_established(peer_hex.to_string(), initiator);
+            }
+        }
+        true
+    }
+
+    /// A responder is waiting for this peer's session-init (§A.3).
+    pub(crate) fn awaiting_init(&self, peer_hex: &str) -> bool {
+        self.pending_inits.contains_key(peer_hex)
+    }
+
+    /// The peer awaiting session-init on `circuit_id`, with that circuit's token.
+    pub(crate) fn pending_init_by_circuit(
+        &self,
+        circuit_id: &CircuitId,
+    ) -> Option<(String, [u8; 32])> {
+        self.pending_inits
+            .iter()
+            .find(|(_, p)| p.circuit_id == *circuit_id || p.target_circuit_id == *circuit_id)
+            .map(|(peer, p)| (peer.clone(), *p.token))
+    }
+
+    /// Stop waiting for the peer's session-init (its circuit went, or the
+    /// wait ran out): the KEM and X25519 ephemerals are wiped, and an
+    /// askable peer is asked again with the usual backoff (§A.3 failure
+    /// handling). True if one was awaited.
+    pub(crate) fn abandon_pending_init(&mut self, peer_hex: &str, close: bool) -> bool {
+        let Some(p) = self.pending_inits.remove(peer_hex) else {
+            return false;
+        };
+        if close {
+            self.close_circuit_id(&p.circuit_id);
+        }
+        drop(p);
+        let _ = self.persist_peer(peer_hex);
+        if self.require_askable(peer_hex).is_ok() {
+            self.schedule_reask(peer_hex);
+        }
+        true
+    }
+
+    /// Spec §A.3 / §A.4, responder: a session-init from `sender_hex`. With
+    /// an init awaited from the sender, decapsulate, derive SK, check the
+    /// confirmation tag (constant time) and only then install the session
+    /// and process the embedded first message. Anything else is dropped
+    /// silently: a replay or a re-send of an init already used (Review
+    /// Focus 2: no second install, no ratchet reset, no event), or a
+    /// session-init nobody awaits.
+    pub(crate) fn handle_session_init(
+        &mut self,
+        sender_hex: &str,
+        message_id: [u8; 16],
+        body: &[u8],
+        on_pending_circuit: bool,
+    ) {
+        let accepted = matches!(
+            self.peers.state(sender_hex),
+            PeerKeyState::Pinned | PeerKeyState::BadSignature
+        );
+        if !accepted {
+            return; // unaccepted, blocked or mismatched sender (N5)
+        }
+        let already_received = self
+            .received_ids
+            .get(sender_hex)
+            .is_some_and(|q| q.contains(&message_id));
+        if already_received || !self.awaiting_init(sender_hex) {
+            // Its first message was decrypted already (a relay replay or the
+            // initiator's byte-identical re-send), or no init is awaited.
+            // The app already stored that message: re-owe its receipt, as
+            // for any duplicate envelope (spec §18.7).
+            if already_received && self.peers.is_seen(sender_hex, &message_id) {
+                self.queue_receipt(sender_hex, receipts::DELIVERED, &[message_id]);
+                self.flush_receipts(sender_hex);
+            }
+            if !already_received {
+                // Its first message is lost with it (review M-2): listed as
+                // undecryptable, so the sender learns of it (D38 notice).
+                self.record_undecryptable(sender_hex, message_id, false);
+            }
+            log::debug!("[RUST] session-init not awaited; dropped");
+            return;
+        }
+        let Some((sk, first_msg)) = self.open_session_init(sender_hex, body) else {
+            // A handshake failure (wrong length, decapsulation, confirmation):
+            // no session (ruling R9). On the pending circuit itself (its
+            // token verified, the sender its owner) the wait ends at once:
+            // close and re-ask with backoff. From the offline queue (no
+            // circuit, so anyone the relay forwards for) nothing changes:
+            // a genuine init may still come, and the wait's TTL runs.
+            if on_pending_circuit {
+                self.abandon_pending_init(sender_hex, true);
+            }
+            log::debug!("[RUST] session-init refused");
+            return;
+        };
+        let Some(p) = self.pending_inits.remove(sender_hex) else {
+            return;
+        };
+        let (Some(peer_ik), Some(my_ik)) = (key_from_hex(sender_hex), self.our_ik()) else {
+            return;
+        };
+        let origin = p.origin;
+        let installed = self.install_session(
+            sender_hex,
+            NewSession {
+                role: 1,
+                sk: &sk,
+                my_ik,
+                peer_ik,
+                peer_ak: p.peer_ak,
+                ek: Zeroizing::new(p.i_ek),
+                circuit_id: p.circuit_id.clone(),
+                target_circuit_id: p.target_circuit_id.clone(),
+                token: p.token.to_vec(),
+                circuit_epoch: p.circuit_epoch,
+                init_out: None,
+                answered: false,
+                origin: p.origin,
+            },
+        );
+        // The ask's KEM and X25519 ephemerals are wiped here, right after use.
+        drop(p);
+        if !installed {
+            let _ = self.persist_peer(sender_hex);
+            if self.require_askable(sender_hex).is_ok() {
+                self.schedule_reask(sender_hex);
+            }
+            return;
+        }
+        if origin == crate::blind::InstallOrigin::Blind {
+            // R19: what we sent before is re-sealed under this session, and
+            // a responder's ratchet can seal only once the embedded first
+            // message gave it a sending chain: that message first, then the
+            // payloads tracked before it (only those, so nothing tracked
+            // under the new session is sent twice).
+            let earlier = self.tracked_ids_for(sender_hex);
+            self.handle_ratchet(sender_hex, message_id, &first_msg);
+            self.resend_tracked_among(sender_hex, Some(&earlier));
+        } else {
+            // Tracked payloads first (sent before this session, so nothing
+            // tracked under it is sent twice), then the embedded first
+            // message under the new session, then what was held and what
+            // is owed.
+            self.resend_tracked(sender_hex);
+            self.handle_ratchet(sender_hex, message_id, &first_msg);
+        }
+        if !self.has_live_circuit(sender_hex) {
+            // Installed from the offline queue after the circuit's
+            // connection was replaced: resume it.
+            self.schedule_reask(sender_hex);
+        }
+        self.process_pending_encrypted(sender_hex);
+        self.flush_receipts(sender_hex);
+    }
+
+    /// Parse a session-init body (padded `ct || confirm || ratchet_message`)
+    /// with the peer's pending init, and return SK and the embedded ratchet
+    /// message once the confirmation tag verifies. None on any failure.
+    fn open_session_init(
+        &self,
+        sender_hex: &str,
+        body: &[u8],
+    ) -> Option<(Zeroizing<[u8; 32]>, Vec<u8>)> {
+        let p = self.pending_inits.get(sender_hex)?;
+        let identity = self.identity.as_ref()?;
+        let peer_ik = key_from_hex(sender_hex)?;
+        let my_ik = identity.public_signing_key().to_bytes();
+        let unpadded = crate::padding::unpad(body)?;
+        let mut pt = Vec::with_capacity(1 + unpadded.len());
+        pt.push(crate::session_init::SESSION_INIT_TYPE);
+        pt.extend_from_slice(unpadded);
+        let (ct, confirm, msg) = crate::session_init::parse_session_init(&pt).ok()?;
+        let ss = p.kem.decapsulate(ct).ok()?;
+        let sk = crate::crypto::x3dh_v3_responder(
+            identity.agreement_secret(),
+            &p.ek_r,
+            &p.peer_ak,
+            &p.i_ek,
+            &ss,
+            p.kem.public(),
+            ct,
+            &peer_ik,
+            &my_ik,
+        )
+        .ok()?;
+        if !crate::session_init::verify_init_confirm(&sk, ct, confirm) {
+            return None;
+        }
+        Some((sk, msg.to_vec()))
+    }
+
+    /// Drop the waits for session-init that ran out: past
+    /// `expires_at_unix` while published (the wait counts online time only,
+    /// R8), or older than the offline queue in any case. The circuit is
+    /// closed and the pair asked again.
+    pub(crate) fn purge_expired_pending_inits(&mut self, now_unix: u64) {
+        let online = self.is_key_bundle_published;
+        let expired: Vec<String> = self
+            .pending_inits
+            .iter()
+            .filter(|(_, p)| p.too_old(now_unix) || (online && now_unix >= p.expires_at_unix))
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in expired {
+            self.abandon_pending_init(&peer, true);
+        }
+    }
+
     /// An established session whose circuit was created or resumed on the
     /// current transport connection.
     pub(crate) fn has_live_circuit(&self, peer_hex: &str) -> bool {
+        // While a new pair waits for its session-init (§A.3), the old
+        // session's circuit is not the pair's any more.
+        if self.awaiting_init(peer_hex) {
+            return false;
+        }
         self.session_manager
             .get(peer_hex)
             .map(|s| {
@@ -2110,6 +3088,11 @@ impl ClientInner {
         if self.persist_failing(peer_hex) {
             self.persist_peer(peer_hex)?;
         }
+        if self.awaiting_init(peer_hex) {
+            // A new pair is forming (§A.3): nothing is sealed under the old
+            // session for a circuit the relay already replaced.
+            return Err(not_established());
+        }
         let mut session = self
             .session_manager
             .get_mut(peer_hex)
@@ -2119,24 +3102,109 @@ impl ClientInner {
             .clone()
             .ok_or_else(not_established)?;
         let token = session.get_token_key().ok_or_else(not_established)?;
-        let padded = crate::padding::pad(plaintext);
+        // A steady slot (§B.1) pads to exactly 1 KiB; the slot only seals
+        // what fits, and anything else keeps its bucket.
+        // The padded plaintext is wiped once encrypted (R30 M-3).
+        let padded = zeroize::Zeroizing::new(if self.steady_padding {
+            // Never a silent fall-back to a bucket inside the shape (M2):
+            // refused, and the slot sends the item outside it explicitly.
+            match crate::padding::pad_exact(plaintext, crate::steady::STEADY_PLAINTEXT_LEN) {
+                Some(p) => p,
+                None => {
+                    debug_assert!(false, "a steady slot item over 1 KiB");
+                    self.steady_oversize
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(RChatError::Internal {
+                        message: "item does not fit a steady slot".into(),
+                    });
+                }
+            }
+        } else {
+            crate::padding::pad(plaintext)
+        });
         let (ciphertext, header) = session.encrypt_message(&padded)?;
+        // §A.4: the first message sealed under a session we initiated
+        // travels as its session-init. Claimed under this guard, so a
+        // concurrent seal cannot make a second init.
+        let epoch = self.transport_epoch;
+        let init = match session.init_out.as_mut() {
+            Some(i) if i.sent.is_none() => {
+                i.sent = Some(crate::session::SentInit {
+                    id: message_id,
+                    payload: Vec::new(),
+                    epoch,
+                });
+                Some((i.ct.clone(), i.confirm))
+            }
+            _ => None,
+        };
         drop(session); // never persist while holding a session guard (lock order)
-        if matches!(plaintext.first(), Some(0x01 | 0x02)) {
+                       // An init that did not leave is unclaimed: the next seal makes it.
+        let is_init = init.is_some();
+        let set_init_payload = |payload: Option<&Vec<u8>>| {
+            if !is_init {
+                return;
+            }
+            if let Some(mut s) = self.session_manager.get_mut(peer_hex) {
+                if let Some(i) = s.init_out.as_mut() {
+                    if i.sent.as_ref().is_some_and(|x| x.id == message_id) {
+                        match payload {
+                            Some(p) => {
+                                if let Some(x) = i.sent.as_mut() {
+                                    x.payload = p.clone();
+                                }
+                            }
+                            None => i.sent = None,
+                        }
+                    }
+                }
+            }
+        };
+        // Timer changes too (R32): their receipts and loss reports bind to
+        // the peer like a message's, and the core acts on them.
+        if matches!(
+            plaintext.first(),
+            Some(&(0x01 | 0x02 | crate::file_msg::FILE_TYPE | crate::disappearing::TIMER_TYPE))
+        ) {
             self.record_sent(peer_hex, message_id);
         }
         if let Err(e) = self.persist_peer(peer_hex) {
             // Nothing leaves without a durable chain state (D28). The id was
             // never sent: take it back out of sent_ids.
             self.unrecord_sent(peer_hex, &message_id);
+            set_init_payload(None);
             return Err(e);
         }
         let mut body = header.encode();
         body.extend_from_slice(&ciphertext);
-        let payload = sealed::seal(message_id, &peer_ik, &peer_ak, &my_ik, KIND_RATCHET, &body)
-            .map_err(|e| RChatError::EncryptionFailed {
+        let payload = match &init {
+            None => sealed::seal(message_id, &peer_ik, &peer_ak, &my_ik, KIND_RATCHET, &body),
+            Some((ct, confirm)) => {
+                // `0x08 || ct || confirm || ratchet_message`: the type is the
+                // sealed kind, the rest the body, padded to the buckets.
+                let pt = crate::session_init::build_with_confirm(ct, confirm, &body);
+                let padded = crate::padding::pad(&pt[1..]);
+                sealed::seal(
+                    message_id,
+                    &peer_ik,
+                    &peer_ak,
+                    &my_ik,
+                    crate::session_init::SESSION_INIT_TYPE,
+                    &padded,
+                )
+            }
+        }
+        .map_err(|e| {
+            set_init_payload(None);
+            RChatError::EncryptionFailed {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
+        if is_init {
+            set_init_payload(Some(&payload));
+            // Best effort: a restart re-sends these very bytes.
+            let _ = self.persist_peer(peer_hex);
+        }
         Ok(RelayPacket::with_auth(
             target,
             payload,
@@ -2148,14 +3216,31 @@ impl ClientInner {
         ))
     }
 
-    /// Invisible 4-zero-byte message from the initiator so the responder's
-    /// ratchet gets a sending chain. False when it was not sealed (the
+    /// The initiator's invisible first message, so the responder's ratchet
+    /// gets a sending chain: a cover reply (`0x05 0x01`, never answered,
+    /// §A.4), which travels as the session-init when nothing went before
+    /// it, and is then ack-tracked. False when it was not sealed (the
     /// session's write failed, D28): nothing left, so it is owed.
     pub(crate) fn send_hello_sync(&self, peer_hex: &str) -> bool {
         let mut id = [0u8; 16];
         OsRng.fill_bytes(&mut id);
-        match self.seal_ratchet(peer_hex, id, &[0u8; 4]) {
+        match self.seal_ratchet(peer_hex, id, &[COVER_TYPE, COVER_REPLY]) {
             Ok(packet) => {
+                let is_init = self.session_manager.get(peer_hex).is_some_and(|s| {
+                    s.init_out
+                        .as_ref()
+                        .and_then(|i| i.sent.as_ref())
+                        .is_some_and(|x| x.id == id)
+                });
+                if is_init {
+                    self.track_internal(
+                        peer_hex,
+                        &hex::encode(id),
+                        packet.circuit_id.clone(),
+                        packet.payload.clone(),
+                        crate::acks::Internal::SessionInit,
+                    );
+                }
                 if self.send_now(packet.encode_with_frame_type()).is_err() {
                     // Its chain key is spent and the bytes are gone; the
                     // responder still gets a chain from our next message.
@@ -2185,14 +3270,20 @@ impl ClientInner {
     /// anything held from the peer.
     fn forget_peer_session(&mut self, peer_hex: &str) {
         self.close_circuit_with(peer_hex);
+        if let Some(p) = self.pending_inits.remove(peer_hex) {
+            self.close_circuit_id(&p.circuit_id);
+        }
         self.session_manager.forget(peer_hex);
         // Its ask is never re-sent (block, unpin, re-pin), and the meta
         // record stops naming it.
         self.clear_unanswered(peer_hex);
+        self.forget_blind_state(peer_hex);
         self.delete_peer_record(peer_hex);
         self.clear_peer_tracking(peer_hex);
         self.intros.remove(peer_hex);
         self.clear_receipts(peer_hex);
+        // The contact is gone: so is its disappearing timer (§I.2).
+        crate::disappearing::lock_timers(self).remove(peer_hex);
         self.sent_ids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2218,8 +3309,12 @@ impl ClientInner {
     /// made under the new pin (`take_pending`).
     fn drop_session_for_repin(&mut self, peer_hex: &str) {
         self.close_circuit_with(peer_hex);
+        if let Some(p) = self.pending_inits.remove(peer_hex) {
+            self.close_circuit_id(&p.circuit_id);
+        }
         let queued = self.session_manager.take_pending(peer_hex);
         self.session_manager.forget(peer_hex);
+        self.forget_blind_state(peer_hex);
         self.delete_peer_record(peer_hex);
         self.clear_peer_tracking(peer_hex);
         self.drop_held_from(peer_hex);
@@ -2231,11 +3326,23 @@ impl ClientInner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(peer_hex);
+        // R33 M-2: the session under the new pin starts with no shared
+        // timer state; the current one goes again on it (install hook).
+        if let Some(t) = crate::disappearing::lock_timers(self).get_mut(peer_hex) {
+            t.acked = false;
+            t.resends = 0;
+        }
+        let has_timer = crate::disappearing::lock_timers(self).contains_key(peer_hex);
         if !queued.is_empty() {
             self.session_manager
                 .get_or_create(peer_hex.to_string())
                 .pending_messages = queued;
             // The placeholder's queued ids, for a restart (best effort).
+            let _ = self.persist_peer(peer_hex);
+        } else if has_timer {
+            // Round 2 N-3: the record just went; the timer (and that it is
+            // owed again) is written now, so a restart before the new
+            // install keeps it.
             let _ = self.persist_peer(peer_hex);
         }
     }
@@ -2308,10 +3415,18 @@ impl ClientInner {
         Ok(())
     }
 
+    /// Pin (accept) `identity_hex` with its agreement key and, when the
+    /// app has it, its ML-KEM key (hex, 1184 bytes: from their card, an
+    /// accepted request or a rotation, or the app's stored copy of one).
+    /// Both are taken or neither (§A.6, R11): a different agreement key or
+    /// a different KEM key than the pinned ones is `PinConflict`, never a
+    /// silent replacement; a key that is not a valid ML-KEM-768 key is
+    /// `InvalidRecipient`. A peer whose ask waited for a KEM key is asked.
     pub(crate) fn pin_peer(
         &mut self,
         identity_hex: &str,
         agreement_hex: &str,
+        kem_hex: Option<&str>,
     ) -> Result<(), RChatError> {
         let id = self.parse_identity(identity_hex)?;
         if self.peers.is_blocked(&id) {
@@ -2320,16 +3435,56 @@ impl ClientInner {
         let ak = key_from_hex(agreement_hex).ok_or_else(|| RChatError::InvalidRecipient {
             identity: id.clone(),
         })?;
+        let kem = match kem_hex {
+            Some(h) => Some(
+                parse_kem_hex(h).ok_or_else(|| RChatError::InvalidRecipient {
+                    identity: id.clone(),
+                })?,
+            ),
+            None => None,
+        };
         let new_pin = self.peers.pin_for(&id).is_none();
-        self.peers.pin(&id, ak).map_err(|e| match e {
-            PinError::Conflict => RChatError::PinConflict,
-            PinError::AgreementKeyInUse => RChatError::AgreementKeyInUse,
-            PinError::RotationTooSoon => RChatError::RotationTooSoon,
-        })?;
+        self.peers
+            .pin_with_kem(&id, ak, kem.as_deref())
+            .map_err(pin_error)?;
         if new_pin {
             self.peers.set_pin_hour(&id, now_hour());
         }
+        self.ask_if_kem_arrived(&id);
         Ok(())
+    }
+
+    /// Attach an ML-KEM key to an existing pin (R11): `PinConflict` if the
+    /// identity is not pinned or a different key is; never replaces one.
+    /// A peer whose ask waited for a KEM key is asked.
+    pub(crate) fn pin_peer_kem(
+        &mut self,
+        identity_hex: &str,
+        kem_pk: &[u8; KEM_PK_LEN],
+    ) -> Result<(), RChatError> {
+        let id = identity_hex.to_lowercase();
+        self.peers.pin_kem(&id, kem_pk).map_err(pin_error)?;
+        self.ask_if_kem_arrived(&id);
+        Ok(())
+    }
+
+    /// T5 N-1: a peer deferred for want of a KEM key is asked as soon as
+    /// one is pinned (on a connection whose publish was accepted; before
+    /// that, the publish sends it).
+    fn ask_if_kem_arrived(&mut self, id: &str) {
+        if !self.is_key_bundle_published
+            || self.peers.kem_pk_for(id).is_none()
+            || !self.deferred_asks.iter().any(|p| p == id)
+        {
+            return;
+        }
+        self.deferred_asks.retain(|p| p != id);
+        if self.ask(id, AskTrigger::User, Instant::now()).is_err() {
+            log::debug!("[RUST] ask after a KEM key pin could not be sent");
+            if self.require_askable(id).is_ok() && !self.deferred_asks.iter().any(|p| p == id) {
+                self.deferred_asks.push(id.to_string());
+            }
+        }
     }
 
     /// Unpin: close any live circuit (H2), drop the session, forget the pin.
@@ -2348,7 +3503,13 @@ impl ClientInner {
         for id in self.peers.overlay_drops(&newer) {
             self.forget_peer_session(&id);
         }
+        let kem_ids = newer.kem_ids();
         self.peers.overlay(newer);
+        // A KEM key staged while a connect ran asks a peer deferred for
+        // want of one, as a live pin does (fix round 1, minor 6).
+        for id in kem_ids {
+            self.ask_if_kem_arrived(&id);
+        }
     }
 
     /// Block: unpin, close any live circuit and drop everything from the peer.
@@ -2365,11 +3526,18 @@ impl ClientInner {
         Ok(())
     }
 
-    /// Route an opened v2 envelope by kind. A ratchet
-    /// envelope is never knock-sized (2048 bytes; ratchet payloads are 202 +
+    /// Route an opened envelope by kind. A ratchet
+    /// envelope is never knock-sized (5120 bytes; ratchet payloads are 202 +
     /// a padding bucket), so one that is came through the knock path and is
     /// dropped before it can be held (N-1).
-    pub(crate) fn dispatch_opened(&mut self, opened: Opened, payload_len: usize) {
+    /// `on_pending_circuit`: it arrived on the sender's pending circuit, its
+    /// token verified (a failed session-init there ends the wait, R9).
+    pub(crate) fn dispatch_opened(
+        &mut self,
+        opened: Opened,
+        payload_len: usize,
+        on_pending_circuit: bool,
+    ) {
         if opened.kind == KIND_RATCHET && payload_len == sealed::KNOCK_PAYLOAD_LEN {
             log::debug!("[RUST] knock-sized ratchet envelope dropped");
             return;
@@ -2379,7 +3547,15 @@ impl ClientInner {
                 let sender = hex::encode(opened.sender_identity_key);
                 self.handle_ratchet(&sender, opened.message_id, &opened.body);
             }
-            KIND_KNOCK => self.handle_knock(opened),
+            crate::session_init::SESSION_INIT_TYPE => {
+                let sender = hex::encode(opened.sender_identity_key);
+                self.handle_session_init(
+                    &sender,
+                    opened.message_id,
+                    &opened.body,
+                    on_pending_circuit,
+                );
+            }
             _ => log::debug!("[RUST] unknown sealed kind dropped"),
         }
     }
@@ -2550,7 +3726,7 @@ impl ClientInner {
         };
         if !self.session_manager.has_established_session(sender_hex) {
             // A contact sent under a session we don't have (lost, or its
-            // CircuitCreatedV2 went to a retired connection): ask again, for
+            // CircuitCreatedV3 went to a retired connection): ask again, for
             // this body's own sender (F30). `ask` applies the gates: only an
             // askable (pinned) sender is asked, so a sender accepted only
             // through the rotation grace (old identity, unpinned) is not.
@@ -2575,11 +3751,26 @@ impl ClientInner {
             .decrypt_bound(sender_hex, ciphertext, &header)
         {
             Ok(ok) => ok,
+            Err(_) if self.awaiting_init(sender_hex) => {
+                // Possibly under the session whose init is still on its way
+                // (§A.3): held, retried once it is installed.
+                if self.hold_pending(held()) {
+                    self.schedule_reask(sender_hex);
+                }
+                return Ok(());
+            }
             Err(_) => {
                 self.record_undecryptable(&report_as, message_id, lost_resend);
                 return Ok(());
             }
         };
+        if by == DecryptedBy::Current {
+            // The peer's first reply under a session we initiated: it has
+            // our session-init, which is no longer re-sent (§A.4).
+            if let Some(mut s) = self.session_manager.get_mut(sender_hex) {
+                s.init_out = None;
+            }
+        }
         // Plaintext copies are wiped once handled (C-10).
         let padded = Zeroizing::new(padded);
         let Some(plaintext) = crate::padding::unpad(&padded) else {
@@ -2667,6 +3858,8 @@ impl ClientInner {
         };
         self.last_heard
             .insert(sender_hex.to_string(), Instant::now());
+        // R23: the peer is live again; it rejoins the steady draw.
+        self.steady_unheard.remove(sender_hex);
         self.handle_decrypted_message(&report_as, message_id, &plaintext, by, binding);
         // The receipt was queued under the identity it is reported
         // as (the new one in the rotation grace): flush that one
@@ -2681,10 +3874,10 @@ impl ClientInner {
     /// possession). False → the caller continues with the normal flow.
     pub(crate) fn try_peer_rotation(
         &mut self,
-        new_ik: &[u8; 32],
-        new_ak: &[u8; 32],
+        new_bundle: &crate::keyauth::SignedBundle,
         block: &crate::rotation::RotationBlock,
     ) -> bool {
+        let (new_ik, new_ak) = (&new_bundle.identity_key, &new_bundle.identity_agreement_key);
         let new_hex = hex::encode(new_ik);
         if self.peers.pin_for(&new_hex).is_some()
             || self.peers.is_blocked(&new_hex)
@@ -2719,7 +3912,7 @@ impl ClientInner {
                 new_ik,
                 new_ak,
             ) {
-                return self.apply_peer_rotation(&old_hex, new_ik, new_ak, v);
+                return self.apply_peer_rotation(&old_hex, new_bundle, v);
             }
         }
         false
@@ -2728,21 +3921,31 @@ impl ClientInner {
     /// Re-pin `old_hex` → the new keys (rate-limited), keep the old session
     /// decrypt-only for in-flight messages, tell the app and ask the new
     /// identity. Never resends anything (D23, H1).
-    fn apply_peer_rotation(
+    pub(crate) fn apply_peer_rotation(
         &mut self,
         old_hex: &str,
-        new_ik: &[u8; 32],
-        new_ak: &[u8; 32],
+        new_bundle: &crate::keyauth::SignedBundle,
         version: u32,
     ) -> bool {
-        let new_hex = hex::encode(new_ik);
+        let new_hex = hex::encode(new_bundle.identity_key);
         let now = Instant::now();
         if self
             .peers
-            .rotate_pin(old_hex, &new_hex, *new_ak, version, now)
+            .rotate_pin(
+                old_hex,
+                &new_hex,
+                new_bundle.identity_agreement_key,
+                version,
+                now,
+            )
             .is_err()
         {
             return false;
+        }
+        // The new identity's KEM key, from the bundle it signed (§A.5),
+        // before anything asks it. The app learns it from `on_peer_rotated`.
+        if self.peers.kem_pk_for(&new_hex).is_none() {
+            self.peers.set_kem_pk(&new_hex, new_bundle.kem_pk.clone());
         }
         // The old identity is gone: stop using its circuit and drop what
         // was waiting for it; its session stays for in-flight messages.
@@ -2758,6 +3961,16 @@ impl ClientInner {
             }
         }
         self.clear_receipts(old_hex);
+        // The conversation's disappearing timer moves with the contact (§I.2).
+        {
+            let mut timers = crate::disappearing::lock_timers(self);
+            if let Some(t) = timers.remove(old_hex) {
+                timers.entry(new_hex.clone()).or_insert(t);
+            }
+        }
+        // R33 M-2: the new identity's install may not hold it; re-sent
+        // (queued once its session exists, at the install).
+        self.timer_resync(&new_hex);
         // Receipts for messages sent to the old identity bind to the new one.
         {
             let mut sent = self.sent_ids.lock().unwrap_or_else(|e| e.into_inner());
@@ -2779,10 +3992,13 @@ impl ClientInner {
         self.rotated_from
             .insert(old_hex.to_string(), (new_hex.clone(), now));
         if let Some(cb) = &self.callbacks {
+            // The new KEM key goes with the new agreement key (R11): the
+            // app stores both and re-pins them at launch.
             cb.on_peer_rotated(
                 old_hex.to_string(),
                 new_hex.clone(),
-                hex::encode(new_ak),
+                hex::encode(new_bundle.identity_agreement_key),
+                hex::encode(&new_bundle.kem_pk[..]),
                 version,
             );
         }
@@ -2836,6 +4052,10 @@ impl ClientInner {
             let _ = self.persist_peer(&peer);
         }
         self.peers.purge_expired_asks(now);
+        // A session-init that never came: its KEM ephemeral is wiped and
+        // the pair asked again (§A.3).
+        self.purge_expired_pending_inits(now_unix);
+        self.purge_stranded_sends(now_unix);
         let grace = Duration::from_secs(crate::ROTATION_GRACE_SECS);
         let expired: Vec<String> = self
             .rotated_from
@@ -2848,6 +4068,39 @@ impl ClientInner {
             // Unless the old identity was accepted again in the meantime.
             if self.peers.state(&old) == PeerKeyState::None {
                 self.forget_peer_session(&old);
+            }
+        }
+    }
+
+    /// R21: sends parked on a session (a re-pair in flight, a responder
+    /// before its first incoming message) whose pair never formed: past the
+    /// offline queue's 72 h they could no longer reach the peer even then,
+    /// so they leave the queue and are reported (`QueuedSendLost`).
+    fn purge_stranded_sends(&mut self, now_unix: u64) {
+        let cutoff_ms = now_unix
+            .saturating_sub(PENDING_INIT_MAX_AGE_SECS)
+            .saturating_mul(1000);
+        let peers: Vec<String> = self
+            .session_manager
+            .get_all_recipients()
+            .into_iter()
+            .filter(|p| !self.has_live_circuit(p))
+            .collect();
+        for peer in peers {
+            let lost: std::collections::VecDeque<crate::session::PendingMessage> =
+                match self.session_manager.get_mut(&peer) {
+                    Some(mut s) => {
+                        let (old, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut s.pending_messages)
+                            .into_iter()
+                            .partition(|m| m.timestamp_ms != 0 && m.timestamp_ms < cutoff_ms);
+                        s.pending_messages = keep.into();
+                        old.into()
+                    }
+                    None => continue,
+                };
+            if !lost.is_empty() {
+                self.report_queued_sends_lost(&peer, &lost);
+                let _ = self.persist_peer(&peer);
             }
         }
     }

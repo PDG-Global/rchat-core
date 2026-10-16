@@ -31,6 +31,7 @@ extern "C" fn on_message(
     _: u64,
     _: *const c_char,
     _: c_int,
+    _expire_secs: u32,
 ) {
     RECEIVED
         .lock()
@@ -57,7 +58,9 @@ extern "C" fn on_circuit(_: *const c_char, _: c_int) {}
 extern "C" fn on_delivered(_: *const c_char) {}
 extern "C" fn on_reconnect() {}
 extern "C" fn on_key(_: *const c_char, _: c_int, _: *const c_char) {}
+#[allow(clippy::too_many_arguments)]
 extern "C" fn on_request(
+    _: *const c_char,
     _: *const c_char,
     _: *const c_char,
     _: u64,
@@ -68,8 +71,28 @@ extern "C" fn on_request(
 ) {
 }
 extern "C" fn on_receipt(_: *const c_char, _: *const c_char, _: c_int) {}
-extern "C" fn on_rotated(_: *const c_char, _: *const c_char, _: *const c_char, _: u32) {}
+extern "C" fn on_rotated(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u32,
+) {
+}
 extern "C" fn on_status(_: c_int, _: *const c_char, _: *const c_char, _: c_int) {}
+extern "C" fn on_timer(_: *const c_char, _: u32, _: u64, _: c_int) {}
+#[allow(clippy::too_many_arguments)]
+extern "C" fn on_file(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u32,
+    _: *const u8,
+    _: usize,
+    _: u64,
+) {
+}
 
 fn ffi_got(sender: &str, body: &str) -> bool {
     let want = hex::encode(body);
@@ -120,11 +143,15 @@ fn sessions_survive_a_transport_only_disconnect_and_reconnect() {
             Some(on_receipt),
             Some(on_rotated),
             Some(on_status),
+            Some(on_file),
+            Some(on_timer),
         ),
         0
     );
+    // Both sides pin from each other's v3 card: agreement and ML-KEM key.
+    let b_kem = hex::encode(b.keys.kem_public());
     assert_eq!(
-        unsafe { rchat_pin_peer_key(c(&b.hex).as_ptr(), c(&b_ak).as_ptr()) },
+        unsafe { rchat_pin_peer_key(c(&b.hex).as_ptr(), c(&b_ak).as_ptr(), c(&b_kem).as_ptr(),) },
         0
     );
     let config = c(&format!(
@@ -150,13 +177,16 @@ fn sessions_survive_a_transport_only_disconnect_and_reconnect() {
     .unwrap();
     let inbox = Inbox::default();
     bob.set_callbacks(Box::new(inbox.clone()));
-    bob.pin_peer_key(a.hex.clone(), a_ak).unwrap();
+    bob.pin_peer_key(a.hex.clone(), a_ak, Some(hex::encode(a.keys.kem_public())))
+        .unwrap();
     bob.connect().unwrap();
     wait_for("B's publish", || bob.is_key_bundle_published());
     wait_for("A's publish", || mapped_client(&state, &a).is_some());
 
-    assert_eq!(unsafe { rchat_request_circuit(c(&b.hex).as_ptr()) }, 0);
     bob.request_circuit(a.hex.clone()).unwrap();
+    wait_for("A's ask", || {
+        (unsafe { rchat_request_circuit(c(&b.hex).as_ptr()) }) == 0
+    });
     let has_b = || unsafe { rchat_has_session(c(&b.hex).as_ptr()) } == 1;
     wait_for("the session", || has_b() && bob.has_session(a.hex.clone()));
     bob.send_text_message(a.hex.clone(), "before".into())
@@ -179,7 +209,13 @@ fn sessions_survive_a_transport_only_disconnect_and_reconnect() {
 
     // A's sending chain is intact too.
     wait_for("A to resume the circuit", || {
-        let code = unsafe { rchat_send_message(c(&b.hex).as_ptr(), c("after").as_ptr()) };
+        let code = unsafe {
+            rchat_send_message(
+                c(&b.hex).as_ptr(),
+                c("after").as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
         code == 0
     });
     wait_for("B to get A's reply", || {

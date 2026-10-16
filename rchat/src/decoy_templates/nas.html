@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{BRAND}} {{MODEL}} - Sign in</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body class="nas">
+<main class="split">
+<section class="panel">
+<div class="panel-inner">
+<div class="brand">{{LOGO_SVG}}<h1>{{BRAND}}</h1></div>
+<p class="tagline">{{TAGLINE}}</p>
+<dl class="device">
+<div><dt>Model</dt><dd>{{MODEL}}</dd></div>
+<div><dt>Configuration</dt><dd>{{BAYS}} NAS</dd></div>
+<div><dt>System status</dt><dd>Healthy</dd></div>
+<div><dt>Software</dt><dd>{{FIRMWARE}}</dd></div>
+</dl>
+</div>
+</section>
+<section class="form-side">
+<div class="form-box">
+<h2>Sign in</h2>
+<p class="muted">Sign in with an administrator account to manage this device.</p>
+<form id="login-form" onsubmit="return false">
+<div class="field"><label for="username">Username</label><input type="text" id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></div>
+<div class="field"><label for="password">Password</label><input type="password" id="password" name="password" autocomplete="current-password" required></div>
+<button type="submit" id="login-btn" class="btn">Sign in</button>
+<div id="login-error" class="error" role="alert"></div>
+</form>
+<p class="foot">{{MODEL}} &middot; {{FIRMWARE}}</p>
+<p class="foot">{{FOOTER}}</p>
+</div>
+</section>
+</main>
+<script>
+{{LOGIN_JS}}
+</script>
+</body>
+</html>

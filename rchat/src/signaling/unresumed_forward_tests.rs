@@ -179,14 +179,16 @@ fn has_ack(frames: &[UnifiedFrame]) -> bool {
         .any(|f| matches!(f, UnifiedFrame::Control(ControlMessage::MessageAck { .. })))
 }
 
+/// The offline queue's refusal, as the core classifies it (final re-review
+/// N-3: the core tells it from an ask refusal by the shared prefix).
 fn has_queue_full(frames: &[UnifiedFrame]) -> bool {
     frames.iter().any(|f| {
         matches!(
             f,
             UnifiedFrame::Control(ControlMessage::Error {
                 code: ControlErrorCode::RateLimited,
-                ..
-            })
+                message,
+            }) if rchat_core::protocol::is_offline_queue_refusal(message)
         )
     })
 }
@@ -373,4 +375,62 @@ async fn rq7_a_stuck_unresumed_member_never_stalls_the_sender() {
             .is_some_and(|q| q.pending.iter().any(|m| m.payload == vec![0x02; 200]))
     })
     .await;
+}
+
+/// R26: steady-sized entries (exactly `STEADY_SEALED_LEN`) may fill at most
+/// half of a recipient's offline queue. Beyond that they are refused like a
+/// full queue and never acknowledged (the sender keeps them tracked), and
+/// nothing already queued is evicted; other sizes are still admitted up to
+/// the full per-recipient limit.
+#[tokio::test]
+async fn steady_sized_entries_are_capped_at_half_the_offline_queue() {
+    let (addr, state) = start(test_config()).await;
+    let (a, b) = (TestIdentity::from_seed(0xC0), TestIdentity::from_seed(0xC1));
+    let (mut wa, wb, ca, _cb) = pair_up(&state, addr, &a, &b).await;
+    drop(wb);
+    b_gone(&state, &b).await;
+    let steady = || vec![0x02; limits::STEADY_SEALED_LEN];
+    let cap = limits::OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT;
+    for _ in 0..cap - 1 {
+        queue_test_message(&state, &b, steady());
+    }
+    // The last steady-sized entry under the sub-cap is admitted and acked.
+    wa.send(relay_on(ca.target_circuit_id, &ca.token, steady()))
+        .await
+        .unwrap();
+    let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
+    assert!(has_ack(&got), "{got:?}");
+    assert_eq!(queued_len(&state, &b), cap);
+    // One more: refused as a full queue, never acked, nothing evicted.
+    wa.send(relay_on(ca.target_circuit_id, &ca.token, steady()))
+        .await
+        .unwrap();
+    let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
+    assert!(has_queue_full(&got), "{got:?}");
+    assert!(
+        !has_ack(&got),
+        "a refused steady entry is never acknowledged"
+    );
+    assert_eq!(queued_len(&state, &b), cap, "nothing evicted");
+    // Other sizes still fill the queue up to the full limit.
+    for _ in 0..limits::OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT - cap - 1 {
+        queue_test_message(&state, &b, vec![0x02; 200]);
+    }
+    wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 200]))
+        .await
+        .unwrap();
+    let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
+    assert!(has_ack(&got), "another size, up to the full limit: {got:?}");
+    assert_eq!(
+        queued_len(&state, &b),
+        limits::OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT
+    );
+    wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 200]))
+        .await
+        .unwrap();
+    let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
+    assert!(
+        has_queue_full(&got) && !has_ack(&got),
+        "the full limit holds"
+    );
 }

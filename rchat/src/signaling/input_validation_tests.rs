@@ -58,12 +58,19 @@ fn hex32() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }
 
+/// Standard base64 of `n` random bytes (a v3 `kem_pk` is 1184).
+fn kem_b64(n: usize) -> String {
+    use base64::Engine as _;
+    let bytes: Vec<u8> = (0..n).map(|_| rand::random::<u8>()).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 fn bundle(identity: &str) -> KeyBundle {
     KeyBundle {
         identity_key: identity.to_string(),
         identity_agreement_key: hex32(),
-        signed_pre_key: hex32(),
-        signed_pre_key_signature: "ab".repeat(64),
+        kem_pk: kem_b64(1184),
+        bundle_signature: "ab".repeat(64),
         one_time_pre_keys: Vec::new(),
     }
 }
@@ -100,6 +107,8 @@ async fn next_reply(ws: &mut Ws, wait: Duration) -> Reply {
             Ok(Some(Ok(Message::Close(_)))) => return Reply::Closed,
             Ok(Some(Ok(m))) => match UnifiedFrame::decode(&m) {
                 Ok(UnifiedFrame::Keepalive(_)) => continue,
+                // The marker after every publish (R34a).
+                Ok(UnifiedFrame::Control(ControlMessage::QueueHandedOver { .. })) => continue,
                 Ok(UnifiedFrame::Signaling(s)) if s.msg_type == MSG_TYPE_ERROR => {
                     return Reply::SignalingError(serde_json::to_string(&s.payload).unwrap())
                 }
@@ -160,16 +169,30 @@ async fn malformed_key_bundles_are_rejected_without_panic() {
             },
         ),
         (
-            "bad signed pre-key",
+            "kem_pk of 1183 bytes",
             KeyBundle {
-                signed_pre_key: "zz".into(),
+                kem_pk: kem_b64(1183),
+                ..bundle(&hex32())
+            },
+        ),
+        (
+            "kem_pk of 1185 bytes",
+            KeyBundle {
+                kem_pk: kem_b64(1185),
+                ..bundle(&hex32())
+            },
+        ),
+        (
+            "kem_pk not base64",
+            KeyBundle {
+                kem_pk: "zz".into(),
                 ..bundle(&hex32())
             },
         ),
         (
             "bad signature length",
             KeyBundle {
-                signed_pre_key_signature: "ab".repeat(10),
+                bundle_signature: "ab".repeat(10),
                 ..bundle(&hex32())
             },
         ),
@@ -190,7 +213,7 @@ async fn malformed_key_bundles_are_rejected_without_panic() {
         (
             "empty signature",
             KeyBundle {
-                signed_pre_key_signature: String::new(),
+                bundle_signature: String::new(),
                 ..bundle(&hex32())
             },
         ),
@@ -230,39 +253,200 @@ async fn malformed_key_bundles_are_rejected_without_panic() {
     assert_alive(srv.addr).await;
 }
 
+fn publish_json(key_bundle: serde_json::Value) -> Message {
+    UnifiedFrame::signaling(SignalingMessage::new(
+        MSG_TYPE_PUBLISH_KEY_BUNDLE,
+        Payload::new(
+            MSG_TYPE_PUBLISH_KEY_BUNDLE,
+            serde_json::json!({ "key_bundle": key_bundle, "conn_signature": "cd".repeat(64) }),
+        ),
+    ))
+    .encode()
+}
+
+/// Protocol v3 hard cutover (§A.2): a v2-shaped bundle (`signed_pre_key`,
+/// no `kem_pk`) is refused at the boundary, and so is a v3 bundle that also
+/// names a `signed_pre_key`.
+#[tokio::test]
+async fn v2_shaped_bundles_are_refused() {
+    let srv = start(test_config()).await;
+    let id = TestIdentity::random();
+    let ak = hex::encode(id.bundle.identity_agreement_key);
+    let sig = hex::encode(id.bundle.bundle_signature);
+    let v2 = serde_json::json!({
+        "identity_key": id.hex,
+        "identity_agreement_key": ak,
+        "signed_pre_key": ak,
+        "signed_pre_key_signature": sig,
+        "one_time_pre_keys": [],
+    });
+    let mut both = serde_json::to_value(test_support::key_bundle_of(&id)).unwrap();
+    both["signed_pre_key"] = serde_json::Value::String(ak.clone());
+    for (name, kb) in [("v2 bundle", v2), ("v3 bundle with signed_pre_key", both)] {
+        let before = crate::metrics::rejections(crate::metrics::REJECT_KEY_AUTH);
+        let mut ws = connect(srv.addr).await;
+        ws.send(publish_json(kb)).await.unwrap();
+        assert!(
+            matches!(
+                next_reply(&mut ws, Duration::from_secs(5)).await,
+                Reply::SignalingError(_)
+            ),
+            "{name}: expected a signaling error reply"
+        );
+        assert!(
+            matches!(
+                next_reply(&mut ws, Duration::from_secs(5)).await,
+                Reply::Closed
+            ),
+            "{name}: connection left open"
+        );
+        assert!(
+            crate::metrics::rejections(crate::metrics::REJECT_KEY_AUTH) > before,
+            "{name}: not counted as a key-auth rejection"
+        );
+        assert!(srv.state.identity_to_client.is_empty(), "{name}: stored");
+    }
+    assert_alive(srv.addr).await;
+}
+
+/// §A.2: a v3 publish (1184-byte `kem_pk` as base64) is about 1.7 KB, well
+/// under `MAX_SIGNALING_BYTES` (16 KiB, unchanged).
+#[test]
+fn v3_publish_is_about_1_7_kb_and_under_the_signaling_cap() {
+    let id = TestIdentity::random();
+    let msg = test_support::publish_message(&id, &[0x4e; 32], &[0x42; 32]);
+    let len = msg.len();
+    assert!((1_600..=2_400).contains(&len), "publish is {len} bytes");
+    assert!(len < crate::limits::MAX_SIGNALING_BYTES);
+}
+
 #[tokio::test]
 async fn malformed_circuit_asks_are_rejected_and_not_stored() {
     let srv = start(test_config()).await;
     let (mut ws, _id) = published_peer(srv.addr).await;
-    let mut good_knock = vec![0u8; 2048];
-    good_knock[0] = 0x02;
+    // Knock v3 (§A.5): exactly 5120 bytes with version byte 0x03.
+    let mut good_knock = vec![0u8; 5120];
+    good_knock[0] = 0x03;
     let mut v1_knock = good_knock.clone();
     v1_knock[0] = 0x00;
+    let mut v2_prefix_knock = good_knock.clone();
+    v2_prefix_knock[0] = 0x02;
+    let kem = vec![5u8; crate::validate::KEM_PK_BYTES];
+    let ask_sig = |kem: Vec<u8>, sig: Vec<u8>, knock: Vec<u8>| {
+        FrameBuilder::circuit_ask(
+            vec![1; 32],
+            vec![2; 32],
+            kem,
+            sig,
+            knock,
+            Some(CircuitId([0; 16])),
+        )
+        .encode()
+    };
+    let ask = |t: Vec<u8>, ek: Vec<u8>, kem: Vec<u8>, knock: Vec<u8>| {
+        FrameBuilder::circuit_ask(t, ek, kem, vec![0x5e; 64], knock, Some(CircuitId([0; 16])))
+            .encode()
+    };
     let cases: Vec<(&str, Message)> = vec![
         (
             "empty target",
-            FrameBuilder::circuit_ask(vec![], vec![2; 32], good_knock.clone(), None).encode(),
+            ask(vec![], vec![2; 32], kem.clone(), good_knock.clone()),
         ),
         (
             "short target",
-            FrameBuilder::circuit_ask(vec![1; 31], vec![2; 32], good_knock.clone(), None).encode(),
+            ask(vec![1; 31], vec![2; 32], kem.clone(), good_knock.clone()),
         ),
         (
             "huge target",
-            FrameBuilder::circuit_ask(vec![7; 1 << 20], vec![2; 32], good_knock.clone(), None)
-                .encode(),
+            ask(
+                vec![7; 1 << 20],
+                vec![2; 32],
+                kem.clone(),
+                good_knock.clone(),
+            ),
         ),
         (
             "short ephemeral",
-            FrameBuilder::circuit_ask(vec![1; 32], vec![2; 31], good_knock.clone(), None).encode(),
+            ask(vec![1; 32], vec![2; 31], kem.clone(), good_knock.clone()),
         ),
         (
             "knock 2047 bytes",
-            FrameBuilder::circuit_ask(vec![1; 32], vec![2; 32], vec![0x02; 2047], None).encode(),
+            ask(vec![1; 32], vec![2; 32], kem.clone(), vec![0x03; 2047]),
+        ),
+        (
+            "2048-byte v2 knock",
+            ask(vec![1; 32], vec![2; 32], kem.clone(), vec![0x02; 2048]),
+        ),
+        (
+            "4096-byte knock",
+            ask(vec![1; 32], vec![2; 32], kem.clone(), vec![0x03; 4096]),
         ),
         (
             "knock with v1 prefix",
-            FrameBuilder::circuit_ask(vec![1; 32], vec![2; 32], v1_knock, None).encode(),
+            ask(vec![1; 32], vec![2; 32], kem.clone(), v1_knock),
+        ),
+        (
+            "5120-byte knock with the sealed v2 prefix",
+            ask(vec![1; 32], vec![2; 32], kem.clone(), v2_prefix_knock),
+        ),
+        (
+            "empty kem_ephemeral_pk",
+            ask(vec![1; 32], vec![2; 32], Vec::new(), good_knock.clone()),
+        ),
+        (
+            "kem_ephemeral_pk 1183 bytes",
+            ask(vec![1; 32], vec![2; 32], vec![5; 1183], good_knock.clone()),
+        ),
+        (
+            "kem_ephemeral_pk 1185 bytes",
+            ask(vec![1; 32], vec![2; 32], vec![5; 1185], good_knock.clone()),
+        ),
+        // R7: the ask's ephemeral signature must be exactly 64 bytes.
+        (
+            "empty ephemeral_sig",
+            ask_sig(kem.clone(), Vec::new(), good_knock.clone()),
+        ),
+        (
+            "truncated ephemeral_sig (63 bytes)",
+            ask_sig(kem.clone(), vec![9; 63], good_knock.clone()),
+        ),
+        (
+            "ephemeral_sig 65 bytes",
+            ask_sig(kem.clone(), vec![9; 65], good_knock.clone()),
+        ),
+        (
+            "blinded ask with a truncated ephemeral_sig",
+            UnifiedFrame::Control(ControlMessage::CircuitAskBlind {
+                pair_token: vec![1; 32],
+                ephemeral_key: vec![2; 32],
+                kem_ephemeral_pk: kem.clone(),
+                ephemeral_sig: vec![0x5e; 63],
+                pad: vec![0; crate::validate::BLIND_PAD_LEN],
+            })
+            .encode(),
+        ),
+        (
+            "no resume_circuit (shorter than ASK_WIRE_LEN)",
+            FrameBuilder::circuit_ask(
+                vec![1; 32],
+                vec![2; 32],
+                kem.clone(),
+                vec![0x5e; 64],
+                good_knock.clone(),
+                None,
+            )
+            .encode(),
+        ),
+        (
+            "blinded ask with a short pad",
+            UnifiedFrame::Control(ControlMessage::CircuitAskBlind {
+                pair_token: vec![1; 32],
+                ephemeral_key: vec![2; 32],
+                kem_ephemeral_pk: kem.clone(),
+                ephemeral_sig: vec![0x5e; 64],
+                pad: vec![0; crate::validate::BLIND_PAD_LEN - 1],
+            })
+            .encode(),
         ),
         (
             "v1 CreateCircuit",
@@ -277,6 +461,81 @@ async fn malformed_circuit_asks_are_rejected_and_not_stored() {
         }
         assert!(srv.state.pending_asks.is_empty(), "{name}: ask was stored");
     }
+    assert_alive(srv.addr).await;
+}
+
+/// Protocol v3 §C.2: a well-formed `CircuitAskBlind` from a proven
+/// connection is held (blinded pairing, `blind_pairing_tests`): nothing is
+/// sent back, a repeat replaces it, and the connection stays up.
+#[tokio::test]
+async fn a_well_formed_blinded_ask_is_held_silently() {
+    let srv = start(test_config()).await;
+    let (mut ws, _id) = published_peer(srv.addr).await;
+    let blind = UnifiedFrame::Control(ControlMessage::CircuitAskBlind {
+        pair_token: vec![1; 32],
+        ephemeral_key: vec![2; 32],
+        kem_ephemeral_pk: vec![3; crate::validate::KEM_PK_BYTES],
+        ephemeral_sig: vec![0x5e; 64],
+        pad: vec![0; crate::validate::BLIND_PAD_LEN],
+    })
+    .encode();
+    for _ in 0..2 {
+        ws.send(blind.clone()).await.unwrap();
+        assert!(
+            matches!(
+                next_reply(&mut ws, Duration::from_millis(500)).await,
+                Reply::Silent
+            ),
+            "a held blinded ask gets no reply"
+        );
+        assert_eq!(srv.state.pending_asks.len(), 1, "one held ask");
+    }
+    assert_alive(srv.addr).await;
+}
+
+/// Protocol v3 §9a: unified-frame prefix 0x05 is reserved for future media.
+/// The relay refuses it like any unknown prefix and closes the connection,
+/// before and after identification; the relay itself stays up.
+#[tokio::test]
+async fn reserved_media_prefix_0x05_is_refused_and_closed() {
+    use crate::protocol::unified::FRAME_TYPE_RESERVED_MEDIA;
+    let before = crate::metrics::rejections(crate::metrics::REJECT_UNKNOWN_FRAME);
+    let srv = start(test_config()).await;
+    let (mut ws, _id) = published_peer(srv.addr).await;
+    ws.send(Message::Binary(vec![FRAME_TYPE_RESERVED_MEDIA, 1, 2, 3]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            next_reply(&mut ws, Duration::from_secs(5)).await,
+            Reply::Closed
+        ),
+        "0x05 from a published connection must close it"
+    );
+
+    let mut anon = connect(srv.addr).await;
+    anon.send(Message::Binary(vec![FRAME_TYPE_RESERVED_MEDIA]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            next_reply(&mut anon, Duration::from_secs(5)).await,
+            Reply::Closed
+        ),
+        "0x05 before identification must close the connection"
+    );
+
+    // Any other unknown prefix is treated the same way.
+    let (mut ws, _id) = published_peer(srv.addr).await;
+    ws.send(Message::Binary(vec![0x06, 0])).await.unwrap();
+    assert!(matches!(
+        next_reply(&mut ws, Duration::from_secs(5)).await,
+        Reply::Closed
+    ));
+    assert!(
+        crate::metrics::rejections(crate::metrics::REJECT_UNKNOWN_FRAME) >= before + 3,
+        "each unknown-prefix close is counted"
+    );
     assert_alive(srv.addr).await;
 }
 
@@ -382,7 +641,7 @@ async fn random_hostile_input_never_takes_the_server_down() {
                 0 => publish(bundle(&s)),
                 1 => publish(KeyBundle {
                     identity_agreement_key: s.clone(),
-                    signed_pre_key: s.clone(),
+                    kem_pk: s.clone(),
                     ..bundle(&hex32())
                 }),
                 2 => FrameBuilder::create_circuit(bytes.clone(), Some(bytes.clone())).encode(),

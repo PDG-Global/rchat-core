@@ -73,6 +73,30 @@ pub const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of queued offline messages per recipient identity.
 pub const OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT: usize = 1000;
 
+/// Length of a steady-traffic sealed payload (protocol v3 §B): the ratchet
+/// envelope around a plaintext padded to exactly 1 KiB. Kept equal to the
+/// core's constants below.
+pub const STEADY_SEALED_LEN: usize = 1226;
+const _: () = assert!(
+    STEADY_SEALED_LEN
+        == rchat_core::sealed::RATCHET_ENVELOPE_OVERHEAD + rchat_core::steady::STEADY_PLAINTEXT_LEN
+);
+
+/// R26: entries of exactly `STEADY_SEALED_LEN` may fill at most half of a
+/// recipient's offline queue (by count). Beyond it they are refused like a
+/// full queue (no ack, so the sender keeps them tracked); nothing is ever
+/// evicted. Counted per recipient only: no per-sender share or tag, which
+/// would link senders to recipients beyond §5.2's rule.
+pub const OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT: usize =
+    OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT / 2;
+
+/// Whether a payload of `payload_len` bytes fits the steady-size sub-cap of
+/// a queue already holding `steady_sized` entries of that size. Other sizes
+/// always pass (the full-queue limits still apply to them).
+pub fn steady_sized_admits(steady_sized: usize, payload_len: usize) -> bool {
+    payload_len != STEADY_SEALED_LEN || steady_sized < OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT
+}
+
 /// Fixed per-message bookkeeping overhead counted against the offline budget
 /// in addition to the payload and id strings.
 pub const OFFLINE_MESSAGE_OVERHEAD_BYTES: usize = 64;
@@ -128,6 +152,43 @@ impl TokenBucket {
             Duration::ZERO
         } else {
             Duration::from_secs_f64(-self.tokens / self.rate)
+        }
+    }
+}
+
+/// Per-connection bucket for new blind-ask tokens (final re-review N-1
+/// (a)): `burst` at once, then `per_sec` a second. Counts asks, not bytes,
+/// and never goes negative: an ask with no token left is refused.
+#[derive(Debug, Clone)]
+pub struct AskBucket {
+    tokens: f64,
+    burst: f64,
+    per_sec: f64,
+    last: Instant,
+}
+
+impl AskBucket {
+    /// A full bucket.
+    pub fn new_at(burst: u32, per_sec: u32, now: Instant) -> Self {
+        let burst = f64::from(burst.max(1));
+        Self {
+            tokens: burst,
+            burst,
+            per_sec: f64::from(per_sec.max(1)),
+            last: now,
+        }
+    }
+
+    /// Take one token if there is one.
+    pub fn try_take_at(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = self.last.max(now);
+        self.tokens = (self.tokens + elapsed * self.per_sec).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 }
@@ -1169,7 +1230,74 @@ mod tests {
         assert_eq!(shed, 1, "one attacker connection is shed");
     }
 
+    // ---- steady-size sub-cap (R26) ----
+
+    #[test]
+    fn steady_sized_entries_may_fill_half_of_a_recipient_queue() {
+        assert_eq!(
+            OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT,
+            OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT / 2
+        );
+        assert_eq!(STEADY_SEALED_LEN, 1226);
+        let cap = OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT;
+        assert!(steady_sized_admits(cap - 1, STEADY_SEALED_LEN));
+        assert!(!steady_sized_admits(cap, STEADY_SEALED_LEN));
+        assert!(!steady_sized_admits(cap + 7, STEADY_SEALED_LEN));
+        for len in [0, 458, STEADY_SEALED_LEN - 1, STEADY_SEALED_LEN + 1, 4298] {
+            assert!(steady_sized_admits(cap * 2, len), "{len}");
+        }
+    }
+
     // ---- token bucket ----
+
+    #[test]
+    fn ask_bucket_allows_the_burst_then_the_refill_rate() {
+        let t0 = Instant::now();
+        let mut b = AskBucket::new_at(64, 8, t0);
+        assert_eq!((0..100).filter(|_| b.try_take_at(t0)).count(), 64);
+        assert!(!b.try_take_at(t0));
+        // 1 s later: 8 more, no more.
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!((0..100).filter(|_| b.try_take_at(t1)).count(), 8);
+        // Idle for an hour: back to the burst, never past it.
+        let t2 = t1 + Duration::from_secs(3600);
+        assert_eq!((0..1000).filter(|_| b.try_take_at(t2)).count(), 64);
+        // A clock read out of order never refills.
+        assert!(!b.try_take_at(t1));
+    }
+
+    /// Protocol v3 §B.3 (Task 10): a client in steady mode sends one relay
+    /// frame per slot, at most 2 a second (0.5 s slots), each
+    /// 1 + 42 + 202 + 1024 = 1269 bytes. Charged with the per-message
+    /// floor that is ~3 KB/s against the default 1 MiB/s bucket (0.3%), so
+    /// an hour of it, with a 1 MiB message every 10 s on top, is
+    /// never throttled. No default changes.
+    #[test]
+    fn steady_traffic_fits_the_default_rate_limit_with_room_for_real_traffic() {
+        let c = crate::config::ServerConfig::default();
+        let t0 = Instant::now();
+        let mut b = TokenBucket::new_at(c.rate_limit_bps, c.rate_limit_burst_bytes(), t0);
+        let steady_frame = 1 + 42 + 202 + 1024;
+        for slot in 1..=7200u32 {
+            let now = t0 + Duration::from_millis(500) * slot;
+            assert_eq!(
+                b.consume_at(steady_frame + PER_MESSAGE_COST_BYTES, now),
+                Duration::ZERO,
+                "slot {slot}"
+            );
+            if slot % 20 == 0 {
+                assert_eq!(
+                    b.consume_at(c.max_message_bytes / 4 + PER_MESSAGE_COST_BYTES, now),
+                    Duration::ZERO,
+                    "a 1 MiB message beside the shape at slot {slot}"
+                );
+            }
+        }
+        assert!(
+            2 * (steady_frame + PER_MESSAGE_COST_BYTES) as u64 * 100 < c.rate_limit_bps,
+            "steady uses under 1% of the default rate"
+        );
+    }
 
     #[test]
     fn bucket_allows_burst_up_to_capacity() {

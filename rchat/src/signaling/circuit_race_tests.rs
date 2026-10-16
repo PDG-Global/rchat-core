@@ -21,19 +21,27 @@ struct Created {
     peer: PeerBundle,
     initiator_ek: Vec<u8>,
     responder_ek: Vec<u8>,
+    initiator_kem: Vec<u8>,
+    responder_kem: Vec<u8>,
+    initiator_sig: Vec<u8>,
+    responder_sig: Vec<u8>,
 }
 
 fn created(frames: &[UnifiedFrame]) -> Vec<Created> {
     frames
         .iter()
         .filter_map(|f| match f {
-            UnifiedFrame::Control(ControlMessage::CircuitCreatedV2 {
+            UnifiedFrame::Control(ControlMessage::CircuitCreatedV3 {
                 circuit_id,
                 target_circuit_id,
                 role,
                 peer,
                 initiator_ephemeral_key,
                 responder_ephemeral_key,
+                initiator_kem_ephemeral_pk,
+                responder_kem_ephemeral_pk,
+                initiator_ephemeral_sig,
+                responder_ephemeral_sig,
                 ..
             }) => Some(Created {
                 circuit_id: *circuit_id,
@@ -42,6 +50,10 @@ fn created(frames: &[UnifiedFrame]) -> Vec<Created> {
                 peer: peer.clone(),
                 initiator_ek: initiator_ephemeral_key.clone(),
                 responder_ek: responder_ephemeral_key.clone(),
+                initiator_kem: initiator_kem_ephemeral_pk.clone(),
+                responder_kem: responder_kem_ephemeral_pk.clone(),
+                initiator_sig: initiator_ephemeral_sig.clone(),
+                responder_sig: responder_ephemeral_sig.clone(),
             }),
             _ => None,
         })
@@ -150,7 +162,7 @@ async fn a6_match_carries_verified_bundles_and_both_eks() {
     assert_eq!(
         (ca.len(), cb.len()),
         (1, 1),
-        "exactly one CircuitCreatedV2 each"
+        "exactly one CircuitCreatedV3 each"
     );
     let (ca, cb) = (&ca[0], &cb[0]);
     assert_eq!(ca.role, 0, "earlier asker is the initiator");
@@ -160,6 +172,10 @@ async fn a6_match_carries_verified_bundles_and_both_eks() {
     for c in [ca, cb] {
         assert_eq!(c.initiator_ek, vec![0xA1; 32]);
         assert_eq!(c.responder_ek, vec![0xB2; 32]);
+        assert_eq!(c.initiator_kem, kem_for([0xA1; 32]).kem.to_vec());
+        assert_eq!(c.responder_kem, kem_for([0xB2; 32]).kem.to_vec());
+        assert_eq!(c.initiator_sig, sig_for([0xA1; 32]).to_vec());
+        assert_eq!(c.responder_sig, sig_for([0xB2; 32]).to_vec());
     }
     assert_eq!(ca.target_circuit_id, cb.circuit_id);
     assert_eq!(cb.target_circuit_id, ca.circuit_id);
@@ -177,6 +193,77 @@ async fn a6_match_carries_verified_bundles_and_both_eks() {
         .get(&pair_tag(&a.bytes, &b.bytes))
         .map(|p| p.slot_a);
     assert_eq!(pair, Some(id_tag(&a.bytes)), "side a is the earlier asker");
+}
+
+/// Protocol v3 §A.3: two identity asks pair and both sides receive
+/// `CircuitCreatedV3` carrying both asks' ML-KEM ephemerals byte for byte,
+/// in initiator/responder order, and both asks' ephemeral signatures (R7)
+/// likewise. A re-ask replaces the held KEM ephemeral and signature with
+/// its new ones, like the X25519 one.
+#[tokio::test]
+async fn v3_match_forwards_both_kem_ephemerals_unmodified() {
+    let (addr, state) = start(test_config()).await;
+    let (a, b) = (TestIdentity::random(), TestIdentity::random());
+    let mut wa = authed(addr, &a).await;
+    let mut wb = authed(addr, &b).await;
+    let random_kem = || -> Vec<u8> {
+        (0..crate::validate::KEM_PK_BYTES)
+            .map(|_| rand::random::<u8>())
+            .collect()
+    };
+    let (stale_kem, kem_a, kem_b) = (random_kem(), random_kem(), random_kem());
+    let random_sig = || -> Vec<u8> { (0..64).map(|_| rand::random::<u8>()).collect() };
+    let (stale_sig, sig_a, sig_b) = (random_sig(), random_sig(), random_sig());
+    let ask_frame = |target: &TestIdentity, ek: [u8; 32], kem: &[u8], sig: &[u8]| {
+        FrameBuilder::circuit_ask(
+            target.bytes.to_vec(),
+            ek.to_vec(),
+            kem.to_vec(),
+            sig.to_vec(),
+            knock(0x5a),
+            Some(NO_RESUME),
+        )
+        .encode()
+    };
+    wa.send(ask_frame(&b, [0xA0; 32], &stale_kem, &stale_sig))
+        .await
+        .unwrap();
+    let pair = pair_tag(&a.bytes, &b.bytes);
+    eventually("A's ask to be held", || {
+        state.pending_asks.get(&pair).is_some()
+    })
+    .await;
+    // Re-ask: new EK and KEM ephemeral.
+    wa.send(ask_frame(&b, [0xA1; 32], &kem_a, &sig_a))
+        .await
+        .unwrap();
+    eventually("A's re-ask to replace the KEM ephemeral", || {
+        state.pending_asks.get(&pair).is_some_and(|p| {
+            p.kem_ephemeral.kem[..] == kem_a[..] && p.kem_ephemeral.sig[..] == sig_a[..]
+        })
+    })
+    .await;
+    wb.send(ask_frame(&a, [0xB2; 32], &kem_b, &sig_b))
+        .await
+        .unwrap();
+    let ca = created(&frames_until_quiet(&mut wa, QUIET).await);
+    let cb = created(&frames_until_quiet(&mut wb, QUIET).await);
+    assert_eq!((ca.len(), cb.len()), (1, 1));
+    for c in [&ca[0], &cb[0]] {
+        assert_eq!(c.initiator_kem, kem_a, "initiator KEM ephemeral altered");
+        assert_eq!(c.responder_kem, kem_b, "responder KEM ephemeral altered");
+        assert_eq!(
+            c.initiator_sig, sig_a,
+            "initiator ephemeral signature altered"
+        );
+        assert_eq!(
+            c.responder_sig, sig_b,
+            "responder ephemeral signature altered"
+        );
+        assert_eq!(c.initiator_ek, vec![0xA1; 32]);
+        assert_eq!(c.responder_ek, vec![0xB2; 32]);
+    }
+    assert!(state.pending_asks.is_empty(), "the held ask is dropped");
 }
 
 /// Q4 (F17): the lower identity asking first, then the higher, matches.

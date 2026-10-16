@@ -40,14 +40,23 @@ uniffi::setup_scaffolding!();
 mod acks;
 #[cfg(test)]
 mod alloc_probe;
+pub mod blind;
+#[cfg(test)]
+mod blind_flow_tests;
 mod circuits;
 pub mod crypto;
 pub mod device_key;
+pub mod disappearing;
+pub mod drain;
 pub mod ffi;
+pub mod file_msg;
+pub mod invite;
+pub mod kem;
 pub mod keyauth;
 pub mod knock;
 pub mod notice;
 pub mod padding;
+pub mod pairing;
 pub mod peers;
 mod persistence;
 pub mod protocol;
@@ -65,11 +74,16 @@ pub mod sealed;
 #[cfg(test)]
 mod sealed_flow_tests;
 pub mod session;
+pub mod session_init;
 pub mod state_store;
 pub mod status;
+pub mod steady;
 #[cfg(test)]
 mod test_support;
 pub mod tls_boring;
+pub mod tls_resumption;
+#[cfg(test)]
+mod tls_resumption_tests;
 pub mod transport;
 
 use crypto::IdentityKeyPair;
@@ -121,18 +135,20 @@ pub(crate) fn spawn_ticker(runtime: &ClientRuntime, weak: std::sync::Weak<RwLock
             let Some(inner) = weak.upgrade() else { break };
             let mut guard = inner.write().await;
             let now = std::time::Instant::now();
-            guard.fire_due_reasks(now);
-            guard.fire_due_receipts(now);
-            guard.fire_cover(now);
-            guard.purge_stale(now);
-            guard.retry_held();
-            guard.redrive_owed_sends(now);
-            guard.fire_ack_expiry(now);
-            guard.flush_deferred_writes();
+            // A background drain (§H.1) sends nothing: `tick` says so.
+            let sends = guard.tick(now);
+            // Steady slots (§B): their own timer, started only while it
+            // should run; it stops itself otherwise.
+            if !guard.steady_task_running && guard.steady_should_run() {
+                guard.steady_task_running = true;
+                steady::spawn_steady(weak.clone(), guard.steady_task_gen, guard.steady.slot());
+            }
             drop(guard);
             // Without this a responder's early messages waited for an app
             // that calls `process_pending`; one that doesn't lost them.
-            RChatClient::flush_queued_sends(&inner).await;
+            if sends {
+                RChatClient::flush_queued_sends(&inner).await;
+            }
         }
     });
 }
@@ -152,12 +168,22 @@ pub(crate) fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// A plaintext the app is handed: text (`0x01`), or binary (`0x02`) with a
-/// known magic. Shared by delivery and `delivered_unstored` (D36).
+/// A plaintext the app is handed: text (`0x01`), binary (`0x02`) with a
+/// known magic, or a well-formed file (`0x07`, `file_msg::decode_file`
+/// would accept it). Shared by delivery and `delivered_unstored` (D36).
 pub(crate) fn is_deliverable(plaintext: &[u8]) -> bool {
+    // `expire_secs` (4 bytes) follows the type byte (§I.2) and must be one
+    // of the timer choices (R33 M-1): anything else is dropped.
+    let timer_ok = disappearing::split_expire(plaintext)
+        .is_some_and(|(expire, _)| disappearing::valid_timer(expire));
     match plaintext.first() {
-        Some(0x01) => true,
-        Some(0x02) => protocol::is_known_binary(&plaintext[1..]),
+        Some(0x01) => timer_ok,
+        Some(0x02) => {
+            timer_ok
+                && disappearing::split_expire(plaintext)
+                    .is_some_and(|(_, body)| protocol::is_known_binary(body))
+        }
+        Some(&file_msg::FILE_TYPE) => timer_ok && file_msg::is_valid(plaintext),
         _ => false,
     }
 }
@@ -224,16 +250,23 @@ const QUERY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Helper function to execute async code from any context
 /// This function spawns the future on the runtime and waits for it using a channel
-fn block_on_async<F, T>(runtime: Arc<ClientRuntime>, future: F) -> Result<T, RChatError>
+fn block_on_async<M, F, T>(runtime: Arc<ClientRuntime>, make: M) -> Result<T, RChatError>
 where
-    F: std::future::Future<Output = Result<T, RChatError>> + Send + 'static,
+    M: FnOnce() -> F + Send + 'static,
+    F: std::future::Future<Output = Result<T, RChatError>>,
     T: Send + 'static,
 {
-    // Use spawn_blocking to run the block_on from a dedicated thread
-    // This avoids the "Cannot start a runtime from within a runtime" error
+    // Run the block_on from a dedicated thread: this avoids the "Cannot
+    // start a runtime from within a runtime" error.
+    //
+    // The future is built there, by `make`, never here (R31): a future
+    // built on the caller's thread was moved, uninitialised slots and all,
+    // into the heap box `thread::spawn` makes, and those slots held
+    // whatever the caller's stack last held (plaintext a send had just
+    // encoded), freed unwiped. The box now holds only `make`'s captures.
     let handle = runtime.handle().clone();
 
-    std::thread::spawn(move || handle.block_on(future))
+    std::thread::spawn(move || handle.block_on(make()))
         .join()
         .map_err(|e| RChatError::Internal {
             message: format!("Thread panicked: {:?}", e),
@@ -267,6 +300,10 @@ pub enum RChatError {
 
     #[error("Internal error: {message}")]
     Internal { message: String },
+
+    /// A caller-supplied argument outside its documented range (FFI code 9).
+    #[error("Invalid parameter: {message}")]
+    InvalidParameter { message: String },
 
     #[error("No keys are pinned for {identity}")]
     NoPinnedKeys { identity: String },
@@ -323,6 +360,23 @@ pub enum RChatError {
     /// pinned. The app falls back to its manual Resend row.
     #[error("Automatic resend refused")]
     ResendRefused { identity: String },
+
+    /// No ML-KEM key is pinned for the contact (R1, §A.5): no request or
+    /// circuit ask can be sent until their v3 card's key is pinned. There
+    /// is never an X25519-only knock.
+    #[error("Their contact card's ML-KEM key is missing; scan their code again")]
+    NoKemKey { identity: String },
+
+    /// A file over `file_msg::MAX_FILE_PLAINTEXT` (protocol v3 §E.2):
+    /// refused before anything is sent.
+    #[error("File too large: at most {max} bytes in all")]
+    FileTooLarge { max: u64 },
+
+    /// A background drain (protocol v3 §H.1) was asked for while the
+    /// client is connected: a connected client receives the queue itself,
+    /// and the drain never takes its connection over (FFI code 29).
+    #[error("A connected client is running; no background drain")]
+    ForegroundConnected,
 }
 
 /// Configuration for the RChat client. `Debug` never prints the identity
@@ -430,6 +484,26 @@ pub struct ReceivedMessage {
     pub content: Vec<u8>,
     pub timestamp_ms: u64,
     pub is_text: bool,
+    /// The sender's disappearing timer for this message (0 = never,
+    /// protocol v3 §I.2). The app honours it, never its own setting.
+    pub expire_secs: u32,
+}
+
+/// A received file message (`0x07`, protocol v3 §E.2). `name` is already
+/// cleaned (`file_msg::sanitise_name`); `mime` is advisory only, never a
+/// reason to open anything; `expire_secs` is the sender's disappearing
+/// timer for this message (0 = never, §I.2). The core wipes `bytes` once
+/// the callback returns (or at once when no app is attached).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ReceivedFile {
+    pub id: String,
+    pub sender_identity: String,
+    pub name: String,
+    pub mime: String,
+    pub expire_secs: u32,
+    pub bytes: Vec<u8>,
+    pub timestamp_ms: u64,
 }
 
 /// A knock from someone not yet accepted (spec §6.3). Intro fields are
@@ -439,6 +513,11 @@ pub struct ReceivedMessage {
 pub struct MessageRequest {
     pub identity_hex: String,
     pub agreement_hex: String,
+    /// The requester's ML-KEM-768 key (2368 hex), from the bundle its
+    /// identity signed in the knock (§A.5). The app stores it with the
+    /// request and passes it to the pin on accept, so it survives a
+    /// restart (R11).
+    pub kem_hex: String,
     pub issued_hour: u64,
     pub intro_message_id_hex: String,
     pub intro_text: String,
@@ -456,6 +535,18 @@ pub trait RChatCallbacks: Send + Sync {
     /// Called when a message is received
     fn on_message_received(&self, message: ReceivedMessage);
 
+    /// Called when a file message (`0x07`) is received. A file never
+    /// reaches `on_message_received`. Its delivered receipt is queued when
+    /// the app calls `mark_message_seen`, as for any message (D36).
+    fn on_file_received(&self, _file: ReceivedFile) {}
+
+    /// A contact's disappearing timer changed (protocol v3 §I.2): `secs` is
+    /// one of `disappearing::TIMER_CHOICES_SECS` (0 = off), `changed_at_ms`
+    /// when it was changed, `by_me` whether this device changed it (the app
+    /// shows "You set…" or the contact's name). Only a change that won
+    /// (`disappearing::timer_wins`) is reported.
+    fn on_timer_changed(&self, _peer_hex: String, _secs: u32, _changed_at_ms: u64, _by_me: bool) {}
+
     /// Called when a message is confirmed delivered
     fn on_message_delivered(&self, message_id: String);
 
@@ -467,8 +558,10 @@ pub trait RChatCallbacks: Send + Sync {
     fn on_circuit_established(&self, recipient_identity: String, is_initiator: bool);
 
     /// Key events for a peer: code 2 = keys don't match the pin (sticky),
-    /// 3 = bundle signature failed (transient). `agreement_hex` is the
-    /// offered agreement key for code 2, empty otherwise.
+    /// 3 = bundle signature failed (transient), 5 = the pinned contact's
+    /// ML-KEM key was learned from a bundle their identity signed (store it
+    /// with the pin, R11). `agreement_hex` is the offered agreement key for
+    /// code 2, the ML-KEM key (2368 hex) for code 5, empty otherwise.
     fn on_peer_key_event(&self, _identity_hex: String, _code: u8, _agreement_hex: String) {}
 
     /// Someone not yet accepted knocked. Nothing has been sent back.
@@ -482,11 +575,14 @@ pub trait RChatCallbacks: Send + Sync {
     /// silently (spec §4.8). The app moves the contact to the new identity,
     /// clears its safety-number "compared" mark (D20) and offers a one-tap
     /// Resend for unconfirmed messages (never automatic: D23, H1).
+    /// `new_kem_hex` is the new identity's ML-KEM key (from the bundle it
+    /// signed), which the app stores and re-pins with the agreement key (R11).
     fn on_peer_rotated(
         &self,
         _old_identity_hex: String,
         _new_identity_hex: String,
         _new_agreement_hex: String,
+        _new_kem_hex: String,
         _new_version: u32,
     ) {
     }
@@ -516,8 +612,18 @@ pub struct RChatClient {
     /// The latest `set_cover_traffic` value, applied under the client lock
     /// by whichever apply runs next (so the last call wins).
     cover_wanted: Arc<std::sync::Mutex<(bool, bool)>>,
+    /// The latest `set_steady_traffic` value (enabled, slot ms, foreground),
+    /// applied the same way.
+    steady_wanted: Arc<std::sync::Mutex<(bool, u32, bool)>>,
     /// The inner `connected_mirror`, read without the client lock.
     connected_mirror: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `retire` (and so by every uninstall): `connect` refuses from
+    /// then on, so a client the app no longer holds never connects or
+    /// publishes again (R34 round 2 N-1).
+    retired: Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: a pause in `connect` before it takes the client lock.
+    #[cfg(test)]
+    pre_lock_delay_for_test: Arc<std::sync::Mutex<std::time::Duration>>,
 }
 
 struct ClientInner {
@@ -572,6 +678,38 @@ struct ClientInner {
     cover_replies_charged: std::collections::HashMap<String, VecDeque<std::time::Instant>>,
     /// Tests: force the 0.8 coin for the second cover reply.
     cover_reply_coin_override: Option<bool>,
+    /// Each contact's disappearing timer (protocol v3 §I.2), persisted in
+    /// its peer record. Absent means off, never changed.
+    pub(crate) timers: std::sync::Mutex<std::collections::HashMap<String, disappearing::PeerTimer>>,
+    /// Recent `0x09` ids per peer (memory only): their receipts and status
+    /// events are the core's (ruling R32).
+    pub(crate) timer_ids: std::sync::Mutex<std::collections::HashMap<String, VecDeque<[u8; 16]>>>,
+    /// Peers whose timer change was reported lost, re-sent at the next flush.
+    pub(crate) timer_requeue: std::sync::Mutex<Vec<String>>,
+    /// Steady traffic (protocol v3 §B) is on; off by default.
+    steady_enabled: bool,
+    /// The app is in the foreground (steady slots only then).
+    steady_foreground: bool,
+    /// The slot length, one of `steady::STEADY_SLOT_CHOICES_MS`.
+    steady_slot_ms: u32,
+    /// Chooses each slot's destination (§B.1).
+    steady: steady::SteadyScheduler,
+    /// Bumped by every setting change that ends the running slot task.
+    steady_task_gen: u64,
+    /// A slot task for `steady_task_gen` is running.
+    steady_task_running: bool,
+    /// Set only while a slot seals: pad to exactly `STEADY_PLAINTEXT_LEN`.
+    steady_padding: bool,
+    /// Set by `seal_ratchet` when a slot item did not fit 1 KiB (never
+    /// expected: every slot item is bounded); the slot then sends it
+    /// outside the shape explicitly.
+    steady_oversize: std::sync::atomic::AtomicBool,
+    /// Per peer: slots sent since anything from that peer last decrypted
+    /// (R23). At `steady::STEADY_UNHEARD_LIMIT` the peer leaves the draw.
+    steady_unheard: std::collections::HashMap<String, u32>,
+    /// Peers whose next slot goes to a waiting message before receipts
+    /// (M1: receipts and messages alternate).
+    steady_message_turn: std::collections::HashSet<String>,
     /// Ids of messages we sent to each peer (bounded), so a receipt naming
     /// an id never sent to that peer is ignored.
     sent_ids: std::sync::Mutex<std::collections::HashMap<String, VecDeque<state_store::SentIdV1>>>,
@@ -600,6 +738,11 @@ struct ClientInner {
     hello_outstanding: bool,
     /// Canonical origin and outcome of the relay gate on this connection.
     relay_pin_info: Option<(String, relay_pin::PinOutcome)>,
+    /// TLS 1.3 tickets for the pinned relay (spec §D.1): memory only, kept
+    /// across auto-reconnects and `disconnect_transport_only`, bound to the
+    /// relay's host, port and pin, and dropped on `disconnect()`, a pin
+    /// change, a refused relay and an identity wipe or change.
+    tls_tickets: tls_resumption::ResumptionStore,
     /// Tests only: let non-signaling frames through before the gate.
     bypass_frame_gate: bool,
     /// Non-signaling frames dropped before the relay gate and publish passed.
@@ -657,6 +800,16 @@ struct ClientInner {
     /// Initiators whose hello sync could not leave (the session's write
     /// failed): re-sent by the tick, so the responder gets its sending chain.
     hello_sync_due: std::collections::HashSet<String>,
+    /// Responders (role 1) waiting for the initiator's session-init (§A.3):
+    /// no session is installed until it arrives. Persisted with the peer
+    /// record, so a restart can still open the init.
+    pending_inits: std::collections::HashMap<String, circuits::PendingInit>,
+    /// Peers whose tracked re-sends wait for our session-init to leave
+    /// first (§A.4, review M-3); the tick re-sends them.
+    resend_after_init: std::collections::HashSet<String>,
+    /// Waits for a session-init dropped at restore as too old (peer, its
+    /// circuit): closed and re-asked once every staged record is applied.
+    abandoned_at_restore: Vec<(String, protocol::CircuitId)>,
     /// Held bodies are being retried right after a new install: a failure
     /// there is reported as `DecryptFailed` detail 2.
     retrying_held: bool,
@@ -705,6 +858,65 @@ struct ClientInner {
     /// Signs our session notices with this install's device key (D45);
     /// set by the app (`set_device_signer`). None: notices go unsigned.
     device_signer: Option<Arc<dyn device_key::DeviceSigner>>,
+    /// The outstanding blind ask per peer (§C.2, Task 9). Memory only: the
+    /// relay drops held asks with their connection.
+    blind_asks: std::collections::HashMap<String, Vec<blind::BlindAsk>>,
+    /// `PairTokenBusy` advances per peer on this connection (R16 cap).
+    blind_busy: std::collections::HashMap<String, u32>,
+    /// Peers whose blind asks pause until the next reconnect: busy past
+    /// the cap (R20). Never the identity path.
+    blind_paused: std::collections::HashSet<String>,
+    /// The neighbouring day's token already retried per peer (one retry,
+    /// §C.1).
+    blind_neighbour_tried: std::collections::HashMap<String, pairing::PairEpoch>,
+    /// Blind asks we retired while the relay may still hold them, by public
+    /// EK, for one TTL (no secret): a stray match on one syncs our epoch.
+    spent_blind_asks: std::collections::HashMap<[u8; 32], blind::SpentAsk>,
+    /// The timed identity fallback ask in flight per peer (R20): sent at,
+    /// on transport epoch. Memory only (the relay drops it with the
+    /// connection).
+    identity_fallback: std::collections::HashMap<String, (std::time::Instant, u64)>,
+    /// Knock digests seen per pinned contact, with their unix time (M-2):
+    /// a replayed knock never turns the path again. Memory only, like
+    /// knocks; bounded per contact and by `KNOCK_SEEN_SECS`.
+    seen_knocks: std::collections::HashMap<String, VecDeque<([u8; 32], u64)>>,
+    /// Issue hour and digest of the last knock acted on per pinned contact
+    /// (N-2): an older knock, or that very knock, is ignored. Persisted in
+    /// the peer record.
+    knock_acted: std::collections::HashMap<String, (u64, [u8; 32])>,
+    /// Peers whose knock (a pinned contact's) shows they are on the
+    /// identity path: our next ask to them is an identity ask, until the
+    /// next session install, until that identity ask runs out unmatched
+    /// (held `ASK_TTL` on one connection, like the timed fallback), or the
+    /// next transport reconnect (final review H-1): then back to blind.
+    /// A knock declaring that the contact holds no session with us
+    /// (`no_prior_session`, R35) keeps it there: a blind ask can never meet
+    /// a peer with no pair secret. While we still hold one, blind asks run
+    /// beside the identity ask (final re-review N-1). Memory only.
+    identity_wanted: std::collections::HashMap<String, blind::IdentityWanted>,
+    /// Paces the asks a connection sends (final review, RateLimited).
+    pub(crate) ask_pacer: blind::AskPacer,
+    /// Asks sent on this connection, newest last, to blame a `RateLimited`
+    /// answer on. Public EKs only; memory only.
+    recent_asks: VecDeque<blind::RecentAsk>,
+    /// `RateLimited` ask refusals in a row (reset after a quiet `ASK_TTL`)
+    /// and the last one's time: the backoff before the refused ask goes
+    /// again.
+    ask_refusals: (u32, Option<std::time::Instant>),
+    /// Tests: the unix time the pair epoch is computed from.
+    pair_clock_override: Option<u64>,
+    /// End-to-end tests only (`test-hooks`, `test_set_pair_clock_offset`):
+    /// seconds added to the wall clock for the pair epoch and the 24 h
+    /// fallback clock. Always 0 in an app build.
+    pub(crate) pair_clock_offset_secs: i64,
+    /// End-to-end tests only (`test-hooks`, `test_set_blind_ask_ttl`): how
+    /// long a blind or identity-fallback ask is held before it times out,
+    /// instead of `peers::ASK_TTL`. Always None in an app build.
+    pub(crate) blind_ask_ttl_override: Option<std::time::Duration>,
+    /// A background drain (protocol v3 §H.1) is running on this client:
+    /// only signaling leaves (`send_now`), and nothing asks, resumes,
+    /// closes, sends receipts or cover/steady traffic. Memory only.
+    pub(crate) drain: Option<drain::DrainState>,
 }
 
 /// Transport events, handled one at a time in arrival order.
@@ -719,6 +931,10 @@ impl ClientInner {
             !persistence::PERSIST_LOCK_HELD.with(|h| h.get()),
             "status event raised under the persist lock"
         );
+        // A timer change's loss is the core's to repair (ruling R32).
+        if self.take_timer_status(&ev) {
+            return;
+        }
         log::debug!("[RUST] status event kind {}", ev.code());
         #[cfg(test)]
         test_support::capture_event(&format!("{ev:?}"));
@@ -759,6 +975,21 @@ impl ClientInner {
             cover_replies_due: Vec::new(),
             cover_replies_charged: std::collections::HashMap::new(),
             cover_reply_coin_override: None,
+            timers: Default::default(),
+            timer_ids: Default::default(),
+            timer_requeue: Default::default(),
+            steady_enabled: false,
+            steady_foreground: false,
+            steady_slot_ms: steady::STEADY_DEFAULT_SLOT_MS,
+            steady: steady::SteadyScheduler::new(std::time::Duration::from_millis(u64::from(
+                steady::STEADY_DEFAULT_SLOT_MS,
+            ))),
+            steady_task_gen: 0,
+            steady_task_running: false,
+            steady_padding: false,
+            steady_oversize: std::sync::atomic::AtomicBool::new(false),
+            steady_unheard: std::collections::HashMap::new(),
+            steady_message_turn: std::collections::HashSet::new(),
             sent_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             auth_challenge: None,
             publish_requested: false,
@@ -770,6 +1001,7 @@ impl ClientInner {
             connection_generation: 0,
             hello_outstanding: false,
             relay_pin_info: None,
+            tls_tickets: tls_resumption::ResumptionStore::new(),
             bypass_frame_gate: false,
             frames_dropped_before_gate: 0,
             rotation_block: None,
@@ -790,6 +1022,9 @@ impl ClientInner {
             notice_send_stalled: std::collections::HashMap::new(),
             last_redrive_probe: None,
             hello_sync_due: std::collections::HashSet::new(),
+            pending_inits: std::collections::HashMap::new(),
+            resend_after_init: std::collections::HashSet::new(),
+            abandoned_at_restore: Vec::new(),
             retrying_held: false,
             auto_resends: std::collections::HashMap::new(),
             unanswered_asks: std::collections::HashMap::new(),
@@ -811,6 +1046,22 @@ impl ClientInner {
             refuse_sends_for_test: std::sync::atomic::AtomicU32::new(0),
             ack_last_tick: None,
             device_signer: None,
+            blind_asks: std::collections::HashMap::new(),
+            blind_busy: std::collections::HashMap::new(),
+            blind_paused: std::collections::HashSet::new(),
+            blind_neighbour_tried: std::collections::HashMap::new(),
+            spent_blind_asks: std::collections::HashMap::new(),
+            identity_fallback: std::collections::HashMap::new(),
+            seen_knocks: std::collections::HashMap::new(),
+            knock_acted: std::collections::HashMap::new(),
+            identity_wanted: std::collections::HashMap::new(),
+            ask_pacer: blind::AskPacer::default(),
+            recent_asks: VecDeque::new(),
+            ask_refusals: (0, None),
+            pair_clock_override: None,
+            pair_clock_offset_secs: 0,
+            blind_ask_ttl_override: None,
+            drain: None,
         };
         inner.apply_rotation_config(config);
         inner
@@ -875,6 +1126,12 @@ impl ClientInner {
 
     /// Queue one frame without waiting (bounded queue: Full is an error).
     pub(crate) fn send_now(&self, frame: Vec<u8>) -> Result<(), RChatError> {
+        // A background drain (§H.1) sends its hello and publish, nothing
+        // else: no ask, close, relay packet, receipt or cover. Refused like
+        // an absent transport, so callers keep what they meant to send.
+        if self.in_drain() && frame.first() != Some(&protocol::FRAME_TYPE_SIGNALING) {
+            return Err(RChatError::NotConnected);
+        }
         #[cfg(test)]
         if self
             .refuse_sends_for_test
@@ -923,6 +1180,10 @@ impl ClientInner {
 
     /// The relay acknowledged one of our messages: to the callback.
     pub(crate) fn report_delivered(&mut self, message_id: String) {
+        // A timer change's relay ack is the core's, never the app's.
+        if self.is_any_timer_id(&message_id) {
+            return;
+        }
         if let Some(cb) = &self.callbacks {
             cb.on_message_delivered(message_id);
         }
@@ -1043,6 +1304,9 @@ impl ClientInner {
         );
         self.config.relay_pin = Some(outcome.pin.clone());
         self.config.relay_pin_version = Some(outcome.version);
+        // Tickets are kept for this relay under the pin it just proved: a
+        // different pin (first use, rotation) drops the ones held.
+        self.bind_tls_tickets();
         // Without a canonical origin there is nothing an app could key the
         // pin on, so none is reported (the gate itself has passed).
         self.relay_pin_info = relay_pin::canonical_origin(&self.config.server_url)
@@ -1065,7 +1329,9 @@ impl ClientInner {
                     return;
                 }
                 self.hello_outstanding = false;
-                let Some(challenge) = auth_challenge.filter(|_| selected_version == 2) else {
+                let Some(challenge) = auth_challenge
+                    .filter(|_| selected_version == crate::protocol::PROTOCOL_VERSION)
+                else {
                     self.fail_protocol(RChatError::ServerTooNew);
                     return;
                 };
@@ -1113,8 +1379,24 @@ impl ClientInner {
         }
     }
 
+    /// Bind the ticket store to the configured relay and its current pin
+    /// (a change drops every ticket); no relay host: drop them.
+    pub(crate) fn bind_tls_tickets(&self) {
+        match tls_resumption::RelayKey::for_url(
+            &self.config.server_url,
+            self.config.relay_pin.as_deref(),
+        ) {
+            Some(key) => self.tls_tickets.bind(key),
+            None => self.tls_tickets.clear(),
+        }
+    }
+
     /// Unrecoverable protocol failure: report once, stop, no retry loop.
     fn fail_protocol(&mut self, err: RChatError) {
+        // A background drain on this connection ends with the error.
+        self.drain_note_failure(&err);
+        // Nothing from a refused relay (or session) is offered again.
+        self.tls_tickets.clear();
         self.report_error(&err);
         self.retire_connection();
         self.publish_requested = false;
@@ -1155,13 +1437,38 @@ impl ClientInner {
         self.transport_epoch += 1;
         // Asks in flight may have been answered to the old connection.
         self.requeue_unanswered_asks();
+        // The relay dropped our held blind asks with that connection: they
+        // are asked again after the publish, never counted as timeouts,
+        // and the busy cap counts per connection (R16).
+        self.blind_asks.clear();
+        self.blind_busy.clear();
+        self.blind_paused.clear();
+        self.spent_blind_asks.clear();
+        // A fallback identity ask went with the connection: back to blind
+        // (the next one waits out `IDENTITY_FALLBACK_INTERVAL_SECS`).
+        self.identity_fallback.clear();
+        // So did a knock-driven identity ask (final review H-1): back to
+        // blind, unless the knock said the contact holds no session with us
+        // (it cannot ask blind; its identity ask is answered again, with
+        // blind asks beside it while we hold a PS, N-1).
+        self.identity_wanted.retain(|_, w| {
+            w.asked = None;
+            w.no_prior_session
+        });
+        // A new connection: a full ask burst, and nothing to blame a
+        // refusal on yet.
+        self.ask_pacer.reset();
+        self.recent_asks.clear();
+        self.ask_refusals = (0, None);
         self.set_connected(false);
         self.is_key_bundle_published = false;
         self.auth_challenge = None;
         self.publish_in_flight = false;
         self.publish_requested = true;
         self.notify_reconnect = true;
-        match self.send_signaling_now(&SignalingMessage::hello(vec![2])) {
+        match self.send_signaling_now(&SignalingMessage::hello(vec![
+            crate::protocol::PROTOCOL_VERSION,
+        ])) {
             Ok(()) => self.hello_outstanding = true,
             Err(e) => {
                 self.hello_outstanding = false;
@@ -1177,7 +1484,18 @@ impl ClientInner {
     /// others). Its rotation pair (old or new identity in the grace) still
     /// passes. Queued delivery has no circuit and goes through
     /// `handle_sealed_payload`.
-    pub(crate) fn handle_sealed_payload_on_circuit(&mut self, payload: &[u8], owner: &str) {
+    pub(crate) fn handle_sealed_payload_on_circuit(
+        &mut self,
+        payload: &[u8],
+        owner: &str,
+        on_pending_circuit: bool,
+    ) {
+        if payload.first() == Some(&crate::sealed::KNOCK_VERSION) {
+            // A knock is never a circuit peer's ratchet traffic: its own
+            // envelope and checks (§A.5, R10).
+            self.handle_knock(payload);
+            return;
+        }
         let Some(identity) = self.identity.as_ref() else {
             return;
         };
@@ -1186,7 +1504,9 @@ impl ClientInner {
             log::debug!("[RUST] sealed payload did not open");
             return;
         };
-        if opened.kind == crate::sealed::KIND_RATCHET {
+        if opened.kind == crate::sealed::KIND_RATCHET
+            || opened.kind == crate::session_init::SESSION_INIT_TYPE
+        {
             let sender = hex::encode(opened.sender_identity_key);
             let rotation_pair = self
                 .rotated_from
@@ -1201,16 +1521,20 @@ impl ClientInner {
                 return;
             }
         }
-        self.dispatch_opened(opened, payload.len());
+        self.dispatch_opened(opened, payload.len(), on_pending_circuit);
     }
 
     pub(crate) fn handle_sealed_payload(&mut self, payload: &[u8]) {
+        if payload.first() == Some(&crate::sealed::KNOCK_VERSION) {
+            self.handle_knock(payload);
+            return;
+        }
         let Some(identity) = self.identity.as_ref() else {
             return;
         };
         let my_ik = identity.public_signing_key().to_bytes();
         match crate::sealed::open(&my_ik, identity.agreement_secret(), payload) {
-            Ok(opened) => self.dispatch_opened(opened, payload.len()),
+            Ok(opened) => self.dispatch_opened(opened, payload.len(), false),
             Err(_) => log::debug!("[RUST] sealed payload did not open"),
         }
     }
@@ -1244,7 +1568,7 @@ impl ClientInner {
             self.events_while_connecting_for_test += 1;
         }
         match event {
-            CoreEvent::Frame(frame) => RChatClient::handle_frame(self, frame),
+            CoreEvent::Frame(frame) => RChatClient::handle_frame(self, *frame),
             CoreEvent::Binary(data) => RChatClient::handle_binary(self, data),
             CoreEvent::Disconnected => self.handle_transport_disconnected(),
             CoreEvent::Reconnected => self.handle_transport_reconnected(),
@@ -1260,7 +1584,9 @@ impl ClientInner {
     }
 
     /// A decrypted ratchet plaintext from an accepted peer. Format:
-    /// `00 00 00 00` invisible hello sync; `01 || text`; `02 || binary`;
+    /// `00 00 00 00` legacy invisible hello (v3 sends a cover reply,
+    /// `05 01`, instead); `01 || text`; `02 || binary`; `0A`-`0F` reserved
+    /// for call signalling and dropped like any unknown type (§9a);
     /// `06 ||` session notice (accepted only under the current session, `by`;
     /// its signature checked against that session's `binding`).
     /// `message_id` is the sealed envelope's id (§4.5): delivered as
@@ -1311,6 +1637,14 @@ impl ClientInner {
                     }
                     // End-to-end proof: never reported undelivered (D37).
                     marked |= self.mark_sent_delivered(sender, &id);
+                    // A timer change's receipt acknowledges it (R32); the
+                    // app never hears of it.
+                    if kind == receipts::DELIVERED && self.timer_receipt(sender, &id) {
+                        continue;
+                    }
+                    if self.is_timer_id(sender, &id) {
+                        continue;
+                    }
                     if let Some(cb) = &self.callbacks {
                         cb.on_message_receipt(sender.to_string(), hex::encode(id), kind);
                     }
@@ -1321,32 +1655,87 @@ impl ClientInner {
             }
             return;
         }
+        if plaintext.first() == Some(&disappearing::TIMER_TYPE) {
+            // A timer change (§I.2): applied when it wins, never a message.
+            // A malformed one, an unknown value, one from a retired session
+            // or one timed more than a day ahead of our clock is dropped
+            // unreceipted (R33 I-1, M-8).
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let Ok((secs, changed_at_ms)) = disappearing::decode_timer(plaintext) {
+                if !self.timer_change_acceptable(changed_at_ms, by, now_ms) {
+                    log::debug!("[RUST] timer change refused (retired session or far future)");
+                    return;
+                }
+                self.apply_peer_timer(sender, secs, changed_at_ms);
+                // Acknowledged end to end (R32), applied or not: a
+                // duplicate or a losing change is still received.
+                self.queue_receipt(sender, receipts::DELIVERED, &[message_id]);
+                self.flush_receipts(sender);
+            }
+            return;
+        }
         if !is_deliverable(plaintext) {
             log::debug!("[RUST] unknown plaintext type dropped");
             return;
         }
-        let (content, is_text) = (&plaintext[1..], plaintext[0] == 0x01);
+        let is_text = plaintext[0] == 0x01;
         if self.peers.is_seen(sender, &message_id) {
             // Already stored by the app (an intro or a resend): delivered
             // now (D36). The chain advanced anyway.
             self.queue_receipt(sender, receipts::DELIVERED, &[message_id]);
             return;
         }
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if plaintext[0] == file_msg::FILE_TYPE {
+            // A file goes to its own callback only, never as a message
+            // (§E.2); its receipt follows `mark_message_seen` like any
+            // message's. `is_deliverable` already checked it decodes.
+            let Ok(f) = file_msg::decode_file(plaintext) else {
+                return;
+            };
+            let file = ReceivedFile {
+                id: hex::encode(message_id),
+                sender_identity: sender.to_string(),
+                name: f.name,
+                mime: f.mime,
+                expire_secs: f.expire_secs,
+                bytes: f.bytes,
+                timestamp_ms,
+            };
+            self.drain_note_delivered(sender, message_id);
+            match &self.callbacks {
+                Some(cb) => cb.on_file_received(file),
+                None => {
+                    let mut file = file;
+                    zeroize::Zeroize::zeroize(&mut file.bytes);
+                }
+            }
+            return;
+        }
         // "Delivered" means the app stored it (D36): the receipt is queued
         // when the app calls `mark_message_seen` (`mark_seen_and_receipt`),
         // also for media it then refuses as outside its limits (L5).
+        // `is_deliverable` checked the timer is there.
+        let Some((expire_secs, content)) = disappearing::split_expire(plaintext) else {
+            return;
+        };
         let msg = ReceivedMessage {
             id: hex::encode(message_id),
             sender_identity: sender.to_string(),
             content: content.to_vec(),
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp_ms,
             is_text,
+            expire_secs,
         };
         // To the callback. Without one (no app attached) the plaintext is
         // wiped, never kept: there is no polling queue (C-3).
+        self.drain_note_delivered(sender, message_id);
         match &self.callbacks {
             Some(cb) => cb.on_message_received(msg),
             None => {
@@ -1354,6 +1743,105 @@ impl ClientInner {
                 zeroize::Zeroize::zeroize(&mut msg.content);
             }
         }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl RChatClient {
+    /// Integration tests only (`test-hooks` feature): trust this PEM
+    /// certificate instead of the platform roots for later TLS connections.
+    pub fn set_test_trust_pem(&self, pem: &[u8]) {
+        let pem = pem.to_vec();
+        self.query((), move |i| i.tls_tickets.set_test_trust_pem(&pem));
+    }
+
+    /// Run `f` on the client under its write lock (test hooks only).
+    fn with_inner_for_test<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut ClientInner) -> T + Send + 'static,
+    ) -> Result<T, RChatError> {
+        let inner = self.inner.clone();
+        block_on_async(self.runtime.clone(), move || async move {
+            let mut guard = inner.write().await;
+            Ok(f(&mut guard))
+        })
+    }
+
+    /// End-to-end tests only (`test-hooks`): shift the clock the pair epoch
+    /// (day, counter) and the 24 h identity-fallback clock read by
+    /// `secs` (protocol v3 §C.1, §C.4). Nothing else reads it: knocks,
+    /// receipts and timers keep the real clock.
+    pub fn test_set_pair_clock_offset(&self, secs: i64) -> Result<(), RChatError> {
+        self.with_inner_for_test(move |i| i.pair_clock_offset_secs = secs)
+    }
+
+    /// End-to-end tests only (`test-hooks`): blind asks (and the identity
+    /// fallback ask) time out after `ttl` instead of `peers::ASK_TTL`.
+    pub fn test_set_blind_ask_ttl(&self, ttl: std::time::Duration) -> Result<(), RChatError> {
+        self.with_inner_for_test(move |i| i.blind_ask_ttl_override = Some(ttl))
+    }
+
+    /// End-to-end tests only (`test-hooks`): the stored pair epoch with
+    /// `peer_hex` as (day, counter), if a session holds one.
+    pub fn test_pair_epoch(&self, peer_hex: String) -> Option<(u32, u32)> {
+        let peer = peer_hex.to_lowercase();
+        self.with_inner_for_test(move |i| {
+            i.session_manager
+                .get(&peer)
+                .map(|s| (s.pair_epoch.day, s.pair_epoch.counter))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// End-to-end tests only (`test-hooks`): move the stored pair counter
+    /// with `peer_hex` on by `by` (a counter desync, §C.1), persisted.
+    pub fn test_bump_pair_counter(&self, peer_hex: String, by: u32) -> Result<(), RChatError> {
+        let peer = peer_hex.to_lowercase();
+        self.with_inner_for_test(move |i| {
+            let moved = i.session_manager.get_mut(&peer).is_some_and(|mut s| {
+                s.pair_epoch.counter = s.pair_epoch.counter.saturating_add(by);
+                true
+            });
+            if !moved {
+                return Err(RChatError::SessionNotEstablished { identity: peer });
+            }
+            i.persist_peer(&peer)
+        })?
+    }
+
+    /// End-to-end tests only (`test-hooks`): replace the pair secret with
+    /// `peer_hex` by a random one (a pair-secret mismatch: no blind ask can
+    /// ever match), persisted.
+    pub fn test_replace_pair_secret(&self, peer_hex: String) -> Result<(), RChatError> {
+        let peer = peer_hex.to_lowercase();
+        self.with_inner_for_test(move |i| {
+            let replaced = i.session_manager.get_mut(&peer).is_some_and(|mut s| {
+                if s.pair_secret.is_none() {
+                    return false;
+                }
+                let mut ps = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ps);
+                s.pair_secret = Some(zeroize::Zeroizing::new(ps));
+                true
+            });
+            if !replaced {
+                return Err(RChatError::SessionNotEstablished { identity: peer });
+            }
+            i.persist_peer(&peer)
+        })?
+    }
+}
+
+// Kept out of the exported block below: uniffi's export macro generates
+// scaffolding for every method in it regardless of `cfg`, so a cfg-gated
+// method there breaks `--features uniffi` builds.
+#[cfg(any(test, feature = "test-hooks"))]
+impl RChatClient {
+    /// Tests only: the IANA id of the TLS key exchange group the latest
+    /// relay connection negotiated (0x11EC: X25519MLKEM768; 0x001D: X25519).
+    pub fn tls_key_exchange_group(&self) -> Option<u16> {
+        self.query(None, |i| i.tls_tickets.last_group())
     }
 }
 
@@ -1380,7 +1868,11 @@ impl RChatClient {
             inner: Arc::new(RwLock::new(inner)),
             callback_hub: CallbackHub::new(),
             cover_wanted: Arc::default(),
+            steady_wanted: Arc::default(),
             connected_mirror,
+            retired: Arc::default(),
+            #[cfg(test)]
+            pre_lock_delay_for_test: Arc::default(),
         }))
     }
 
@@ -1395,7 +1887,7 @@ impl RChatClient {
             .map(|h| message_id_from_hex(h))
             .collect::<Result<Vec<[u8; 16]>, RChatError>>()?;
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let peer = sender_hex.to_lowercase();
             let mut guard = inner.write().await;
             // A transient bad signature keeps the receipt queued, as
@@ -1423,7 +1915,7 @@ impl RChatClient {
             return;
         }
         let inner = self.inner.clone();
-        let installed = block_on_async(self.runtime.clone(), async move {
+        let installed = block_on_async(self.runtime.clone(), move || async move {
             let mut guard = tokio::time::timeout(LOCK_WAIT, inner.write())
                 .await
                 .map_err(|_| RChatError::Internal {
@@ -1439,14 +1931,37 @@ impl RChatClient {
 
     /// Connect to the server
     pub fn connect(&self) -> Result<(), RChatError> {
+        // A retired client never connects again (N-1).
+        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RChatError::ConnectionFailed {
+                message: "client retired".to_string(),
+            });
+        }
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
         let callback_hub = self.callback_hub.clone();
+        #[cfg(test)]
+        let pre_lock_delay = *self
+            .pre_lock_delay_for_test
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
-        block_on_async(runtime.clone(), async move {
+        block_on_async(runtime.clone(), move || async move {
+            #[cfg(test)]
+            tokio::time::sleep(pre_lock_delay).await;
             let mut guard = inner.write().await;
 
             log::info!("[RUST] connect() called");
+
+            // A background drain's attempt that was given up (cancel or
+            // deadline) before this connect took the lock: refused, never a
+            // normal connection in its place (round 2 N-1).
+            if guard.drain.as_ref().is_some_and(|d| d.aborted) {
+                guard.drain = None;
+                return Err(RChatError::ConnectionFailed {
+                    message: "background drain attempt given up".to_string(),
+                });
+            }
 
             // A live (or still auto-reconnecting) client must be disconnected
             // first; otherwise two clients would feed the same state.
@@ -1493,22 +2008,34 @@ impl RChatClient {
             guard.restore_staged_state();
 
             // Create transport config
+            // A background drain's connect (§H.1, R34 I-2): one attempt,
+            // bounded by the drain's budget, and no auto-reconnect.
+            let drain_connect = guard.drain.as_ref().map(|d| d.connect_secs);
             let transport_config = TransportConfig {
                 server_url: guard.config.server_url.clone(),
-                connection_timeout_secs: guard.config.connection_timeout_secs as u64,
-                reconnect_max_attempts: guard
-                    .config
-                    .reconnect_max_attempts
-                    .min(MAX_RECONNECT_ATTEMPTS),
+                connection_timeout_secs: drain_connect
+                    .unwrap_or(guard.config.connection_timeout_secs)
+                    .min(guard.config.connection_timeout_secs.max(1))
+                    as u64,
+                reconnect_max_attempts: if drain_connect.is_some() {
+                    1
+                } else {
+                    guard
+                        .config
+                        .reconnect_max_attempts
+                        .min(MAX_RECONNECT_ATTEMPTS)
+                },
                 reconnect_base_delay_secs: 1,
                 keepalive_interval_secs: guard.config.keepalive_interval_secs as u64,
                 keepalive_timeout_secs: 10,
                 delivery_confirmation_timeout_secs: 30,
                 tls_fingerprint: guard.config.tls_fingerprint,
-                auto_reconnect: true,
+                auto_reconnect: drain_connect.is_none(),
                 reconnect_max_attempts_after_connect: 0,
                 dev_origin: guard.config.dev_origin.clone(),
+                resumption: Some(guard.tls_tickets.clone()),
             };
+            guard.bind_tls_tickets();
 
             // Create WebSocket client
             let ws_client = WebSocketClient::new(transport_config);
@@ -1561,6 +2088,10 @@ impl RChatClient {
             let mut guard = inner.write().await;
             guard.connecting = false;
             if guard.connection_generation != generation {
+                // A given-up drain attempt ends here (round 2 N-1).
+                if guard.drain.as_ref().is_some_and(|d| d.aborted) {
+                    guard.drain = None;
+                }
                 drop(guard);
                 drop(installed_tx);
                 ws_client.disconnect().await;
@@ -1583,7 +2114,9 @@ impl RChatClient {
                     guard.publish_in_flight = false;
                     guard.is_key_bundle_published = false;
                     // Connected is reported when the hello_response arrives.
-                    let hello = crate::protocol::SignalingMessage::hello(vec![2]);
+                    let hello = crate::protocol::SignalingMessage::hello(vec![
+                        crate::protocol::PROTOCOL_VERSION,
+                    ]);
                     if let Err(e) = guard.send_signaling_now(&hello) {
                         // Without a hello the connection is useless: drop it
                         // (after releasing the lock).
@@ -1620,7 +2153,7 @@ impl RChatClient {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
 
-        block_on_async(runtime, async move {
+        block_on_async(runtime, move || async move {
             let mut guard = inner.write().await;
 
             // Coalesced best-effort writes go before the sessions are wiped.
@@ -1633,6 +2166,8 @@ impl RChatClient {
             // Shut down after releasing the lock (below); retired first, so
             // nothing it still reports is handled.
             let ws = guard.websocket.take();
+            // Tickets never outlive a disconnect (spec §D.1).
+            guard.tls_tickets.clear();
             guard.set_connected(false);
             guard.is_key_bundle_published = false;
             guard.retire_connection();
@@ -1666,7 +2201,7 @@ impl RChatClient {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
 
-        block_on_async(runtime, async move {
+        block_on_async(runtime, move || async move {
             let mut guard = inner.write().await;
 
             // Clear only transport-level state; preserve identity, sessions, and recipient
@@ -1701,23 +2236,30 @@ impl RChatClient {
     ) -> Result<(), RChatError> {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
-        block_on_async(runtime, async move {
+        block_on_async(runtime, move || async move {
             let mut guard = inner.write().await;
             guard.apply_set_recipient(&recipient_identity, agreement_key.as_deref())
         })
     }
 
-    /// Pin (accept) a peer's agreement key. Fails with `PinConflict` if a
-    /// different key is pinned, `AgreementKeyInUse` if the key is pinned for
-    /// another identity, `PeerBlocked` if the identity is blocked.
+    /// Pin (accept) a peer's agreement key and, when known, its ML-KEM
+    /// key (`kem_hex`, 2368 hex: card, request, rotation or the app's
+    /// stored copy). Fails with `PinConflict` if a different agreement key
+    /// or KEM key is pinned (never replaced: unpin first), `AgreementKeyInUse`
+    /// if the key is pinned for another identity, `PeerBlocked` if the
+    /// identity is blocked, `InvalidRecipient` for a malformed KEM key.
     pub fn pin_peer_key(
         &self,
         identity_hex: String,
         agreement_hex: String,
+        kem_hex: Option<String>,
     ) -> Result<(), RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
-            inner.write().await.pin_peer(&identity_hex, &agreement_hex)
+        block_on_async(self.runtime.clone(), move || async move {
+            inner
+                .write()
+                .await
+                .pin_peer(&identity_hex, &agreement_hex, kem_hex.as_deref())
         })
     }
 
@@ -1726,7 +2268,7 @@ impl RChatClient {
     /// `PeerNotAccepted`, `PeerBlocked` or `PeerKeyRejected`.
     pub fn request_circuit(&self, identity_hex: String) -> Result<(), RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let id = identity_hex.to_lowercase();
             inner
                 .write()
@@ -1738,7 +2280,7 @@ impl RChatClient {
     /// Forget a peer's pin; closes any live circuit with it.
     pub fn unpin_peer_key(&self, identity_hex: String) -> Result<(), RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.unpin_peer(&identity_hex)
         })
     }
@@ -1746,7 +2288,7 @@ impl RChatClient {
     /// Block or unblock. Blocking unpins and closes any live circuit.
     pub fn set_peer_blocked(&self, identity_hex: String, blocked: bool) -> Result<(), RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.block_peer(&identity_hex, blocked)
         })
     }
@@ -1761,7 +2303,7 @@ impl RChatClient {
     /// The 60-digit safety number with `peer_hex`, from the pinned keys.
     pub fn safety_number(&self, peer_hex: String) -> Result<String, RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let guard = inner.read().await;
             let id = guard.identity.as_ref().ok_or(RChatError::NotConnected)?;
             let (ik, ak) = (
@@ -1782,7 +2324,7 @@ impl RChatClient {
         scanned: String,
     ) -> Result<safety_number::ScanComparison, RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let guard = inner.read().await;
             let id = guard.identity.as_ref().ok_or(RChatError::NotConnected)?;
             let (ik, ak) = (
@@ -1803,7 +2345,7 @@ impl RChatClient {
         digits: String,
     ) -> Result<(), RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let mut guard = inner.write().await;
             let id = guard.identity.as_ref().ok_or(RChatError::NotConnected)?;
             let (ik, ak) = (
@@ -1822,52 +2364,119 @@ impl RChatClient {
     /// (`PeerKeyRejected`), couldn't be checked (`PeerKeyUnverified`), who is
     /// blocked or not accepted; otherwise waits up to `send_wait_ms` for a
     /// live circuit.
+    /// The message carries the contact's current disappearing timer
+    /// (§I.2), read under the lock that seals it.
     pub fn send_text_message(&self, recipient: String, text: String) -> Result<String, RChatError> {
-        let mut id = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
-        self.send_payload(recipient, text.into_bytes(), MessageType::Text, id)
+        self.send_text(recipient, text, None).map(|s| s.id)
     }
 
     /// Send a text message under a caller-chosen 32-hex message id (the
-    /// intro id, so the recipient can de-duplicate the ratchet copy).
+    /// intro id, so the recipient can de-duplicate the ratchet copy). A
+    /// first send: the contact's current timer. A retry of a message
+    /// already sent goes through `retry_text_message_using_id`.
     pub fn send_text_message_using_id(
         &self,
         recipient: String,
         text: String,
         message_id_hex: String,
     ) -> Result<String, RChatError> {
+        self.send_text(recipient, text, Some(message_id_hex))
+            .map(|s| s.id)
+    }
+
+    /// A first text send, under a fresh id or the caller's (the intro id).
+    /// It carries the contact's current timer; `Sent` says which value
+    /// (ruling R32: the app labels its own copy from it, never a later read).
+    pub fn send_text(
+        &self,
+        recipient: String,
+        text: String,
+        message_id_hex: Option<String>,
+    ) -> Result<Sent, RChatError> {
+        // Wiped on every path, a refused id included (R30 M-3).
+        let text = zeroize::Zeroizing::new(text);
+        let id = new_or_given_id(message_id_hex.as_deref())?;
+        let body = disappearing::with_expire(0, text.as_bytes());
+        self.send_payload(recipient, body, MessageType::Text, id)
+    }
+
+    /// The app's same-id retry or manual resend of a text it already sent
+    /// (spec §18.8, D23/D38 fallback): `expire_secs` is the message's
+    /// original timer (§I.2, ruling R32), one of the choices
+    /// (`InvalidParameter` otherwise). Not the checked automatic resend
+    /// (`resend_text_message_using_id`).
+    pub fn retry_text_message_using_id(
+        &self,
+        recipient: String,
+        text: String,
+        expire_secs: u32,
+        message_id_hex: String,
+    ) -> Result<String, RChatError> {
+        let text = zeroize::Zeroizing::new(text);
         let id = message_id_from_hex(&message_id_hex)?;
-        self.send_payload(recipient, text.into_bytes(), MessageType::Text, id)
+        check_timer(expire_secs)?;
+        let body = disappearing::with_expire(expire_secs, text.as_bytes());
+        self.send_payload_checked(recipient, body, MessageType::Text, id, false, false)
+            .map(|s| s.id)
     }
 
     /// The automatic resend of `ResendEligible` (spec §18.6 D38): the stored
     /// text under its own id, refused (`ResendRefused`) unless the current
     /// session is the one that made the id eligible, the peer is still
     /// plainly pinned and the D38 guards on the sent entry still hold.
+    /// `expire_secs` is the message's timer when it was first sent (§I.2),
+    /// one of `disappearing::TIMER_CHOICES_SECS` (`InvalidParameter`
+    /// otherwise): a resend never takes the current timer.
     pub fn resend_text_message_using_id(
         &self,
         recipient: String,
         text: String,
+        expire_secs: u32,
         message_id_hex: String,
     ) -> Result<String, RChatError> {
+        // Wiped on every path, a refused id or timer included.
+        let text = zeroize::Zeroizing::new(text);
         let id = message_id_from_hex(&message_id_hex)?;
-        self.send_payload_checked(recipient, text.into_bytes(), MessageType::Text, id, true)
+        check_timer(expire_secs)?;
+        let body = disappearing::with_expire(expire_secs, text.as_bytes());
+        self.send_payload_checked(recipient, body, MessageType::Text, id, true, false)
+            .map(|s| s.id)
     }
 
-    /// `resend_text_message_using_id` for a binary (media) message.
+    /// `resend_text_message_using_id` for a binary (media) message, with
+    /// its original `expire_secs`.
     pub fn resend_binary_message_using_id(
         &self,
         recipient: String,
         data: Vec<u8>,
+        expire_secs: u32,
         message_id_hex: String,
     ) -> Result<String, RChatError> {
-        if !crate::protocol::is_known_binary(&data) {
-            return Err(RChatError::Internal {
-                message: "unknown binary payload".into(),
-            });
-        }
+        // Wiped on every path, a refused body, id or timer included.
+        let data = zeroize::Zeroizing::new(data);
+        check_known_binary(&data)?;
         let id = message_id_from_hex(&message_id_hex)?;
-        self.send_payload_checked(recipient, data, MessageType::Binary, id, true)
+        check_timer(expire_secs)?;
+        let body = disappearing::with_expire(expire_secs, &data);
+        self.send_payload_checked(recipient, body, MessageType::Binary, id, true, false)
+            .map(|s| s.id)
+    }
+
+    /// `retry_text_message_using_id` for a binary (media) message.
+    pub fn retry_binary_message_using_id(
+        &self,
+        recipient: String,
+        data: Vec<u8>,
+        expire_secs: u32,
+        message_id_hex: String,
+    ) -> Result<String, RChatError> {
+        let data = zeroize::Zeroizing::new(data);
+        check_known_binary(&data)?;
+        let id = message_id_from_hex(&message_id_hex)?;
+        check_timer(expire_secs)?;
+        let body = disappearing::with_expire(expire_secs, &data);
+        self.send_payload_checked(recipient, body, MessageType::Binary, id, false, false)
+            .map(|s| s.id)
     }
 
     /// Queue a first message for an accepted peer with no session yet; it
@@ -1876,7 +2485,7 @@ impl RChatClient {
     /// The intro is deniable but not forward-secret (static-static DH).
     pub fn set_intro(&self, identity_hex: String, text: String) -> Result<String, RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let id = identity_hex.to_lowercase();
             inner
                 .write()
@@ -1896,7 +2505,7 @@ impl RChatClient {
     ) -> Result<String, RChatError> {
         let preset = message_id_from_hex(&message_id_hex)?;
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let id = identity_hex.to_lowercase();
             inner.write().await.set_intro_with_id(
                 &id,
@@ -1925,7 +2534,7 @@ impl RChatClient {
             });
         }
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             inner
                 .write()
                 .await
@@ -1941,14 +2550,185 @@ impl RChatClient {
         recipient: String,
         data: Vec<u8>,
     ) -> Result<String, RChatError> {
-        if !crate::protocol::is_known_binary(&data) {
-            return Err(RChatError::Internal {
-                message: "unknown binary payload".into(),
-            });
+        self.send_binary(recipient, data, None).map(|s| s.id)
+    }
+
+    /// A first binary send, under a fresh id or the caller's, as `send_text`.
+    pub fn send_binary(
+        &self,
+        recipient: String,
+        data: Vec<u8>,
+        message_id_hex: Option<String>,
+    ) -> Result<Sent, RChatError> {
+        // Wiped on every path, a refused body or id included.
+        let data = zeroize::Zeroizing::new(data);
+        check_known_binary(&data)?;
+        let id = new_or_given_id(message_id_hex.as_deref())?;
+        let body = disappearing::with_expire(0, &data);
+        self.send_payload(recipient, body, MessageType::Binary, id)
+    }
+
+    /// Send a file message (`0x07`, protocol v3 §E.2) and return its 32-hex
+    /// message id, as `send_binary_message` does. The name is cleaned
+    /// (`file_msg::sanitise_name`) before it leaves; `mime` is advisory and
+    /// must be printable ASCII of at most 255 bytes (`InvalidParameter`);
+    /// the whole plaintext must fit `file_msg::MAX_FILE_PLAINTEXT`
+    /// (`FileTooLarge`). Both are checked before anything else.
+    /// The message carries the contact's current disappearing timer (§I.2),
+    /// read under the lock that seals it. Files travel outside the steady
+    /// shape unless the whole plaintext fits a slot, and are ack-tracked
+    /// like any message.
+    pub fn send_file_message(
+        &self,
+        recipient: String,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+    ) -> Result<String, RChatError> {
+        self.send_file(recipient, name, mime, data, None)
+            .map(|s| s.id)
+    }
+
+    /// `send_file_message` under a caller-chosen 32-hex id: a first send
+    /// with an id the app picked (the contact's current timer). A Retry of
+    /// a file already sent goes through `retry_file_message_using_id`.
+    /// Checked in this order: the id (`Internal`), then the MIME
+    /// (`InvalidParameter`) and the size (`FileTooLarge`). `data` is wiped
+    /// on every path, a refused id included.
+    pub fn send_file_message_using_id(
+        &self,
+        recipient: String,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        message_id_hex: String,
+    ) -> Result<String, RChatError> {
+        self.send_file(recipient, name, mime, data, Some(message_id_hex))
+            .map(|s| s.id)
+    }
+
+    /// A first file send, under a fresh id or the caller's, as `send_text`.
+    pub fn send_file(
+        &self,
+        recipient: String,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        message_id_hex: Option<String>,
+    ) -> Result<Sent, RChatError> {
+        let data = zeroize::Zeroizing::new(data);
+        let id = new_or_given_id(message_id_hex.as_deref())?;
+        let body = file_body(&name, &mime, &data, 0)?;
+        self.send_payload(recipient, body, MessageType::File, id)
+    }
+
+    /// The app's same-id Retry or manual resend of a file it already sent
+    /// (spec §18.8): the original name, MIME and bytes (the core keeps no
+    /// file bytes after an ack or eviction) and its original `expire_secs`
+    /// (§I.2, R32). Checked in the order `send_file_message_using_id`
+    /// checks, then the timer (`InvalidParameter`).
+    pub fn retry_file_message_using_id(
+        &self,
+        recipient: String,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        expire_secs: u32,
+        message_id_hex: String,
+    ) -> Result<String, RChatError> {
+        let data = zeroize::Zeroizing::new(data);
+        let id = message_id_from_hex(&message_id_hex)?;
+        let body = file_body(&name, &mime, &data, expire_secs)?;
+        check_timer(expire_secs)?;
+        self.send_payload_checked(recipient, body, MessageType::File, id, false, false)
+            .map(|s| s.id)
+    }
+
+    /// The automatic resend of a `ResendEligible` file (spec §18.6 D38,
+    /// final review H-1): as `retry_file_message_using_id`, but refused
+    /// (`ResendRefused`) unless the current session is the one that made
+    /// the id eligible, as `resend_binary_message_using_id`.
+    pub fn resend_file_message_using_id(
+        &self,
+        recipient: String,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        expire_secs: u32,
+        message_id_hex: String,
+    ) -> Result<String, RChatError> {
+        let data = zeroize::Zeroizing::new(data);
+        let id = message_id_from_hex(&message_id_hex)?;
+        let body = file_body(&name, &mime, &data, expire_secs)?;
+        check_timer(expire_secs)?;
+        self.send_payload_checked(recipient, body, MessageType::File, id, true, false)
+            .map(|s| s.id)
+    }
+
+    /// Change the disappearing timer for `peer_hex` (protocol v3 §I.2):
+    /// `secs` must be one of `disappearing::TIMER_CHOICES_SECS`
+    /// (`InvalidParameter` otherwise, nothing sent), and the peer one we may
+    /// send to (pinned, not blocked). The change applies here at once
+    /// (persisted with the peer record, reported through `on_timer_changed`
+    /// with `by_me`) and goes to the contact as a `0x09` plaintext inside
+    /// the session, padded and ack-tracked like a message: now when the
+    /// session can send, otherwise when it can. The core owns its delivery
+    /// (ruling R32): until the contact's delivered receipt comes back it is
+    /// re-sent when reported lost and after each new session install. Its
+    /// time is now, or just after the current change if that one is later
+    /// (a peer's clock ahead of ours), so the change wins on both phones.
+    /// Returns what is in force afterwards (R33 I-1): the app shows that,
+    /// never the requested value. A change that turns the timer on drops
+    /// the intro queued for the contact (final review M-1: an intro carries
+    /// no timer) and names it in `intro_dropped`.
+    pub fn set_disappearing_timer(
+        &self,
+        peer_hex: String,
+        secs: u32,
+    ) -> Result<disappearing::TimerOutcome, RChatError> {
+        check_timer(secs)?;
+        let peer = peer_hex.to_lowercase();
+        if peers::key_from_hex(&peer).is_none() {
+            return Err(RChatError::InvalidRecipient { identity: peer });
         }
-        let mut id = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
-        self.send_payload(recipient, data, MessageType::Binary, id)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let inner = self.inner.clone();
+        block_on_async(self.runtime.clone(), move || async move {
+            let outcome = inner.write().await.change_timer(&peer, secs, now_ms)?;
+            // Sent now when the session can send; otherwise it waits on
+            // the session and goes with the next flush or install.
+            Self::flush_queued_sends(&inner).await;
+            Ok(outcome)
+        })
+    }
+
+    /// The disappearing timer for `peer_hex` (0 = off), as new sends carry it.
+    pub fn disappearing_timer(&self, peer_hex: String) -> Result<u32, RChatError> {
+        let peer = peer_hex.to_lowercase();
+        if peers::key_from_hex(&peer).is_none() {
+            return Err(RChatError::InvalidRecipient { identity: peer });
+        }
+        self.query(
+            Err(RChatError::Internal {
+                message: "client busy".into(),
+            }),
+            move |i| Ok(i.timer_secs(&peer)),
+        )
+    }
+
+    /// A message expired on this device (§I.2): the core drops any copy of
+    /// its plaintext it still holds (the ack tracker's kept copy, a copy
+    /// queued for a session). Nothing is sent and nothing reaches the relay.
+    pub fn forget_message(&self, message_id_hex: String) -> Result<(), RChatError> {
+        message_id_from_hex(&message_id_hex)?;
+        let inner = self.inner.clone();
+        block_on_async(self.runtime.clone(), move || async move {
+            inner.write().await.forget_message(&message_id_hex);
+            Ok(())
+        })
     }
 
     /// Get the client's identity public key (for sharing with contacts)
@@ -2006,6 +2786,8 @@ impl RChatClient {
             .set_our_identity(identity.public_signing_key().to_bytes());
         inner.identity = Some(identity);
         inner.signed_bundle = None;
+        // A ticket would link the old identity's connections to the new one's.
+        inner.tls_tickets.clear();
         Ok(())
     }
 
@@ -2035,7 +2817,7 @@ impl RChatClient {
     /// JSON: {"new_version","links","new_identity","new_agreement"} — no seed.
     pub fn prepare_rotation(&self) -> Result<String, RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let mut guard = inner.write().await;
             if guard
                 .config
@@ -2112,7 +2894,7 @@ impl RChatClient {
             message: format!("rotation links invalid: {e}"),
         })?;
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let mut guard = inner.write().await;
             let me = guard
                 .identity
@@ -2136,7 +2918,7 @@ impl RChatClient {
         version: u32,
     ) -> Result<(), RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let id = identity_hex.to_lowercase();
             let mut guard = inner.write().await;
             if guard.peers.pin_for(&id).is_none() {
@@ -2145,6 +2927,17 @@ impl RChatClient {
             guard.peers.set_pin_version(&id, version);
             Ok(())
         })
+    }
+
+    /// Diagnostics: whether the latest TLS connection to the relay resumed
+    /// a session from a ticket (spec §D.1).
+    pub fn tls_session_resumed(&self) -> bool {
+        self.query(false, |i| i.tls_tickets.last_resumed())
+    }
+
+    /// Diagnostics: TLS tickets held for the relay (at most 2, memory only).
+    pub fn tls_ticket_count(&self) -> u32 {
+        self.query(0, |i| i.tls_tickets.len() as u32)
     }
 
     /// The relay identity accepted on the current connection, as JSON
@@ -2218,6 +3011,39 @@ impl RChatClient {
         }
     }
 
+    /// Steady traffic (protocol v3 §B): one same-size packet every slot
+    /// while enabled, in the foreground and connected with an open
+    /// circuit. Off by default; while it is on and in the foreground it
+    /// replaces the random cover requests of `set_cover_traffic`.
+    /// `slot_ms` must be one of `steady::STEADY_SLOT_CHOICES_MS`
+    /// (otherwise `InvalidParameter`). Never waits for the client lock (as
+    /// `set_cover_traffic`); the last call wins.
+    pub fn set_steady_traffic(
+        &self,
+        enabled: bool,
+        slot_ms: u32,
+        foreground: bool,
+    ) -> Result<(), RChatError> {
+        if !steady::valid_slot_ms(slot_ms) {
+            return Err(RChatError::InvalidParameter {
+                message: "steady slot must be 500, 1000 or 2000 ms".into(),
+            });
+        }
+        *self.steady_wanted.lock().unwrap_or_else(|e| e.into_inner()) =
+            (enabled, slot_ms, foreground);
+        let wanted = self.steady_wanted.clone();
+        if let Ok(mut guard) = self.inner.try_write() {
+            Self::apply_steady_wanted(&mut guard, &wanted);
+            return Ok(());
+        }
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            let mut guard = inner.write().await;
+            Self::apply_steady_wanted(&mut guard, &wanted);
+        });
+        Ok(())
+    }
+
     /// "Extra traffic protection" (spec §5.7): send cover packets while
     /// enabled and in the foreground. Off by default. Replies to a peer's
     /// cover requests are sent either way.
@@ -2243,14 +3069,18 @@ impl RChatClient {
     pub fn process_pending(&self) -> Result<(), RChatError> {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
-        block_on_async(runtime, async move {
+        block_on_async(runtime, move || async move {
             {
                 let mut guard = inner.write().await;
                 let now = std::time::Instant::now();
+                guard.flush_deferred_writes();
+                if guard.in_drain() {
+                    // A background drain sends nothing (§H.1).
+                    return Ok(());
+                }
                 guard.fire_due_reasks(now);
                 guard.fire_due_receipts(now);
                 guard.fire_cover(now);
-                guard.flush_deferred_writes();
             }
             Self::flush_queued_sends(&inner).await;
             Ok(())
@@ -2263,7 +3093,7 @@ impl RChatClient {
     pub fn publish_key_bundle(&self) -> Result<(), RChatError> {
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
-        block_on_async(runtime, async move {
+        block_on_async(runtime, move || async move {
             let mut guard = inner.write().await;
             guard.request_publish()
         })
@@ -2281,6 +3111,64 @@ pub(crate) fn sn_error(e: peers::SafetyNumberError, peer: &str) -> RChatError {
             identity: peer.to_string(),
         },
         peers::SafetyNumberError::BadDigits => RChatError::InvalidSafetyNumber,
+    }
+}
+
+/// A file send's body (`file_msg::encode_file_body`, errors mapped for the
+/// app). The caller holds `data` in `Zeroizing`; the body is wiped by
+/// `send_payload_checked`.
+fn file_body(name: &str, mime: &str, data: &[u8], expire_secs: u32) -> Result<Vec<u8>, RChatError> {
+    file_msg::encode_file_body(name, mime, data, expire_secs).map_err(|e| match e {
+        file_msg::FileError::TooLarge => RChatError::FileTooLarge {
+            max: file_msg::MAX_FILE_PLAINTEXT as u64,
+        },
+        _ => RChatError::InvalidParameter {
+            message: "MIME type must be printable ASCII, at most 255 bytes".into(),
+        },
+    })
+}
+
+/// What a send handed to the core: its 32-hex id and the disappearing
+/// timer it carries (§I.2). For a first send that is the contact's timer
+/// as the core held it when it checked the send (ruling R32).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct Sent {
+    pub id: String,
+    pub expire_secs: u32,
+}
+
+/// The caller's 32-hex id, or a fresh random one.
+fn new_or_given_id(hex_id: Option<&str>) -> Result<[u8; 16], RChatError> {
+    match hex_id {
+        Some(h) => message_id_from_hex(h),
+        None => {
+            let mut id = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+            Ok(id)
+        }
+    }
+}
+
+/// A binary body must start with a known magic (`protocol::is_known_binary`).
+fn check_known_binary(data: &[u8]) -> Result<(), RChatError> {
+    if crate::protocol::is_known_binary(data) {
+        Ok(())
+    } else {
+        Err(RChatError::Internal {
+            message: "unknown binary payload".into(),
+        })
+    }
+}
+
+/// One of `disappearing::TIMER_CHOICES_SECS`, or `InvalidParameter`.
+fn check_timer(secs: u32) -> Result<(), RChatError> {
+    if disappearing::valid_timer(secs) {
+        Ok(())
+    } else {
+        Err(RChatError::InvalidParameter {
+            message: "timer must be off, 5 minutes, 1 hour, 1 day, 1 week or 4 weeks".into(),
+        })
     }
 }
 
@@ -2332,6 +3220,12 @@ fn identity_from_seed_hex(seed_hex: &str) -> Result<IdentityKeyPair, RChatError>
 }
 
 impl RChatClient {
+    /// Apply the latest wanted steady setting (under the client lock).
+    fn apply_steady_wanted(guard: &mut ClientInner, wanted: &std::sync::Mutex<(bool, u32, bool)>) {
+        let (enabled, slot_ms, foreground) = *wanted.lock().unwrap_or_else(|e| e.into_inner());
+        guard.apply_steady(enabled, slot_ms, foreground);
+    }
+
     /// Apply the latest wanted cover setting (under the client lock).
     fn apply_cover(guard: &mut ClientInner, wanted: &std::sync::Mutex<(bool, bool)>) {
         let (enabled, foreground) = *wanted.lock().unwrap_or_else(|e| e.into_inner());
@@ -2342,22 +3236,17 @@ impl RChatClient {
         }
     }
 
-    /// `send_binary_message` under a caller-chosen 32-hex id: the app's
-    /// same-id resend of media (spec §18.6 D38). Takes the same
-    /// `send_payload` path, so the id is recorded as sent when it is sealed.
+    /// `send_binary_message` under a caller-chosen 32-hex id: a first send
+    /// with an id the app picked (the contact's current timer). A resend of
+    /// media already sent goes through `retry_binary_message_using_id`.
     pub fn send_binary_message_using_id(
         &self,
         recipient: String,
         data: Vec<u8>,
         message_id_hex: String,
     ) -> Result<String, RChatError> {
-        if !crate::protocol::is_known_binary(&data) {
-            return Err(RChatError::Internal {
-                message: "unknown binary payload".into(),
-            });
-        }
-        let id = message_id_from_hex(&message_id_hex)?;
-        self.send_payload(recipient, data, MessageType::Binary, id)
+        self.send_binary(recipient, data, Some(message_id_hex))
+            .map(|s| s.id)
     }
 
     /// Sign our session notices with this install's device key (D45). The
@@ -2365,7 +3254,7 @@ impl RChatClient {
     /// client lock held: it must not call back into rchat.
     pub fn set_device_signer(&self, s: Arc<dyn device_key::DeviceSigner>) {
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.device_signer = Some(s);
             Ok(())
         });
@@ -2380,7 +3269,7 @@ impl RChatClient {
         hardware: bool,
     ) -> Result<[u8; 64], RChatError> {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let g = inner.read().await;
             let identity = g.identity.as_ref().ok_or(RChatError::NotConnected)?;
             keyauth::sign_device_key(identity, &dk_pub, hardware).map_err(|e| {
@@ -2414,7 +3303,7 @@ impl RChatClient {
             }
         })?;
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             let mut g = inner.write().await;
             if g.peers.pin_for(&id).is_none() {
                 return Err(RChatError::PinConflict);
@@ -2422,6 +3311,59 @@ impl RChatClient {
             g.peers
                 .pin_device_key(&id, device_key::DevicePin { dk_pub, hardware });
             Ok(())
+        })
+    }
+
+    /// Pin `identity_hex`'s ML-KEM-768 public key (1184 bytes) onto its
+    /// existing pin (R1). The identity must be pinned first, and a
+    /// different KEM key must not be (`PinConflict` either way: never
+    /// replaced, R11); a key that is not a valid ML-KEM-768 key is refused
+    /// (`InvalidRecipient`). A peer whose ask waited for it is asked.
+    pub fn pin_peer_kem_key(
+        &self,
+        identity_hex: String,
+        kem_pk: Vec<u8>,
+    ) -> Result<(), RChatError> {
+        let id = identity_hex.to_lowercase();
+        let bad = || RChatError::InvalidRecipient {
+            identity: identity_hex.clone(),
+        };
+        peers::key_from_hex(&id).ok_or_else(bad)?;
+        kem::validate_public_key(&kem_pk).map_err(|_| bad())?;
+        let mut boxed = Box::new([0u8; kem::KEM_PK_LEN]);
+        boxed.copy_from_slice(&kem_pk);
+        let inner = self.inner.clone();
+        block_on_async(self.runtime.clone(), move || async move {
+            inner.write().await.pin_peer_kem(&id, &boxed)
+        })
+    }
+
+    /// Our card's bundle signature (64 bytes, R13): our identity's
+    /// signature over the v3 bundle transcript `ik ‖ ak ‖ kem_pk`.
+    pub fn get_bundle_signature(&self) -> Result<[u8; 64], RChatError> {
+        let busy = Err(RChatError::Internal {
+            message: "Failed to acquire read lock".to_string(),
+        });
+        self.query(busy, |i| {
+            let id = i.identity.as_ref().ok_or(RChatError::NotConnected)?;
+            keyauth::sign_bundle(id)
+                .map(|b| b.bundle_signature)
+                .map_err(|e| RChatError::Internal {
+                    message: e.to_string(),
+                })
+        })
+    }
+
+    /// Our identity's ML-KEM-768 public key (1184 bytes), for our card.
+    pub fn get_kem_public_key(&self) -> Result<Vec<u8>, RChatError> {
+        let busy = Err(RChatError::Internal {
+            message: "Failed to acquire read lock".to_string(),
+        });
+        self.query(busy, |i| {
+            i.identity
+                .as_ref()
+                .map(|id| id.kem_public().to_vec())
+                .ok_or(RChatError::NotConnected)
         })
     }
 
@@ -2444,7 +3386,7 @@ impl RChatClient {
             return f(&guard);
         }
         let inner = self.inner.clone();
-        let answer = block_on_async(self.runtime.clone(), async move {
+        let answer = block_on_async(self.runtime.clone(), move || async move {
             match tokio::time::timeout(QUERY_WAIT, inner.read()).await {
                 Ok(guard) => Ok(f(&guard)),
                 Err(_) => Err(RChatError::Internal {
@@ -2462,7 +3404,7 @@ impl RChatClient {
     /// connect). Waits for the lock, so the staged book is never lost.
     pub fn import_peer_book(&self, book: PeerBook) {
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.peers = book;
             Ok(())
         });
@@ -2476,7 +3418,7 @@ impl RChatClient {
     pub fn set_state_store(&self, state_key: &[u8; 32], sink: Arc<dyn state_store::StateSink>) {
         let key = zeroize::Zeroizing::new(*state_key);
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             let mut g = inner.write().await;
             // Staged records and written counters are kept across a re-set,
             // so a later write never goes below a counter already written.
@@ -2504,7 +3446,7 @@ impl RChatClient {
     /// through a writer that now serves another account, or a wiped store.
     pub fn detach_state_store(&self) {
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.state = None;
             Ok(())
         });
@@ -2515,7 +3457,7 @@ impl RChatClient {
     /// for a duplicate key the higher counter wins (D26).
     pub fn import_state_records(&self, records: Vec<(String, Vec<u8>)>) {
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             let mut g = inner.write().await;
             if let Some(s) = g.state.as_mut() {
                 for (k, v) in records {
@@ -2536,7 +3478,7 @@ impl RChatClient {
     /// our own rotation).
     pub fn clear_state(&self) {
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.clear_state_now();
             Ok(())
         });
@@ -2548,7 +3490,7 @@ impl RChatClient {
     /// lock, so none are lost.
     pub fn overlay_peer_book(&self, newer: PeerBook) {
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.apply_staged_peers(newer);
             Ok(())
         });
@@ -2559,11 +3501,13 @@ impl RChatClient {
     /// timers fire) reaches the app, then the transport and its
     /// auto-reconnect are stopped and pending transport events are retired.
     pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         // Silenced first, without the client lock: queued calls are skipped
         // and a call in flight finishes before this returns (N-7).
         self.callback_hub.silence();
         let inner = self.inner.clone();
-        let _ = block_on_async(self.runtime.clone(), async move {
+        let _ = block_on_async(self.runtime.clone(), move || async move {
             inner.write().await.callbacks = None;
             Ok(())
         });
@@ -2589,7 +3533,7 @@ impl RChatClient {
     /// the staged book). Leaves an empty book behind.
     pub fn export_peer_book(&self) -> PeerBook {
         let inner = self.inner.clone();
-        block_on_async(self.runtime.clone(), async move {
+        block_on_async(self.runtime.clone(), move || async move {
             Ok(std::mem::take(&mut inner.write().await.peers))
         })
         .unwrap_or_default()
@@ -2601,7 +3545,7 @@ impl RChatClient {
     /// buffer (round-2 L4).
     pub fn take_rotation_seed(&self, out: &mut [u8; 64]) -> bool {
         let inner = self.inner.clone();
-        let seed = block_on_async(self.runtime.clone(), async move {
+        let seed = block_on_async(self.runtime.clone(), move || async move {
             Ok(inner.write().await.pending_rotation_seed.take())
         });
         match seed {
@@ -2613,19 +3557,24 @@ impl RChatClient {
         }
     }
 
+    /// A first send: the body's 4-byte `expire_secs` placeholder is filled
+    /// with the contact's current timer under the lock that checks the
+    /// peer (§I.2); `Sent` says which value it carried.
     fn send_payload(
         &self,
         recipient: String,
         content: Vec<u8>,
         msg_type: MessageType,
         message_id: [u8; 16],
-    ) -> Result<String, RChatError> {
-        self.send_payload_checked(recipient, content, msg_type, message_id, false)
+    ) -> Result<Sent, RChatError> {
+        self.send_payload_checked(recipient, content, msg_type, message_id, false, true)
     }
 
     /// `send_payload`; with `auto_resend`, the H-1 check
     /// (`check_auto_resend`) runs first and again under the lock that seals,
-    /// and nothing is queued for a later session.
+    /// and nothing is queued for a later session. With `stamp` false the
+    /// body keeps the `expire_secs` it was built with: a retry or resend of
+    /// an existing message id carries its original timer (ruling R32).
     fn send_payload_checked(
         &self,
         recipient: String,
@@ -2633,19 +3582,43 @@ impl RChatClient {
         msg_type: MessageType,
         message_id: [u8; 16],
         auto_resend: bool,
-    ) -> Result<String, RChatError> {
+        stamp: bool,
+    ) -> Result<Sent, RChatError> {
+        // The plaintext body is wiped wherever this copy ends (R30 M-3);
+        // a queued copy is wiped by `PendingMessage`'s drop.
+        let mut content = zeroize::Zeroizing::new(content);
         let inner = self.inner.clone();
         let runtime = self.runtime.clone();
         let recipient = recipient.to_lowercase();
-        block_on_async(runtime, async move {
+        // A first send of a message carries the contact's current timer
+        // (§I.2): its body starts with a 4-byte placeholder, filled in here
+        // under the lock. A retry or resend keeps the original value it was
+        // given (R32); a timer change is not a message.
+        let is_message = msg_type != MessageType::Timer;
+        let stamp_timer = stamp && is_message;
+        block_on_async(runtime, move || async move {
             let wait_ms = {
                 let g = inner.read().await;
                 g.check_sendable(&recipient)?;
                 if auto_resend {
                     g.check_auto_resend(&recipient, &message_id)?;
                 }
+                if stamp_timer {
+                    let Some(slot) = content.get_mut(..disappearing::EXPIRE_LEN) else {
+                        return Err(RChatError::Internal {
+                            message: "message body without a timer".into(),
+                        });
+                    };
+                    slot.copy_from_slice(&g.timer_secs(&recipient).to_be_bytes());
+                }
                 g.send_wait_ms
             };
+            // The timer this message carries, as the caller learns it.
+            let expire_secs = match content.get(..disappearing::EXPIRE_LEN) {
+                Some(e) if is_message => u32::from_be_bytes([e[0], e[1], e[2], e[3]]),
+                _ => 0,
+            };
+            let sent = |id: String| Sent { id, expire_secs };
             let mut waited = 0u64;
             loop {
                 {
@@ -2654,7 +3627,10 @@ impl RChatClient {
                         return Err(RChatError::NotConnected);
                     }
                     g.check_sendable(&recipient)?;
-                    if g.has_live_circuit(&recipient) {
+                    if g.has_live_circuit(&recipient)
+                        || g.awaiting_init(&recipient)
+                        || g.blind_repair_in_flight(&recipient)
+                    {
                         break;
                     }
                 }
@@ -2672,9 +3648,20 @@ impl RChatClient {
                 // chain yet, so queue on the session (sent by `flush_queued_sends`
                 // from the timer once the first incoming message gives it one).
                 let g = inner.read().await;
-                let session = g.session_manager.get_mut(&recipient);
+                // A responder waiting for session-init has no session yet
+                // (§A.3): the message waits on a placeholder (or the old
+                // session) and moves to the new session at install.
+                let awaiting = g.awaiting_init(&recipient);
+                // R21: re-pairing blind on this connection: parked on the
+                // session's queue, moved to the new session at its install.
+                let repairing = g.blind_repair_in_flight(&recipient);
+                let session = if awaiting {
+                    Some(g.session_manager.get_or_create(recipient.clone()))
+                } else {
+                    g.session_manager.get_mut(&recipient)
+                };
                 if let Some(mut s) = session {
-                    if !s.can_send() {
+                    if awaiting || repairing || !s.can_send() {
                         if auto_resend {
                             // Never parked for whatever session is current
                             // when it would be flushed.
@@ -2685,7 +3672,7 @@ impl RChatClient {
                         s.pending_messages
                             .push_back(crate::session::PendingMessage {
                                 id: MessageId(hex::encode(message_id)),
-                                content,
+                                content: std::mem::take(&mut *content),
                                 msg_type,
                                 timestamp_ms: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -2693,7 +3680,29 @@ impl RChatClient {
                                     .as_millis()
                                     as u64,
                             });
-                        return Ok(hex::encode(message_id));
+                        return Ok(sent(hex::encode(message_id)));
+                    }
+                    // Steady traffic (§B.1): a message that fits a slot
+                    // waits for one; so does anything behind a waiting
+                    // one, keeping the order. A larger one with nothing
+                    // ahead goes now, outside the shape. Automatic resends
+                    // are never parked (H-1).
+                    if !auto_resend
+                        && g.steady_holds(&recipient)
+                        && (steady::fits(1 + content.len()) || !s.pending_messages.is_empty())
+                    {
+                        s.pending_messages
+                            .push_back(crate::session::PendingMessage {
+                                id: MessageId(hex::encode(message_id)),
+                                content: std::mem::take(&mut *content),
+                                msg_type,
+                                timestamp_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as u64,
+                            });
+                        return Ok(sent(hex::encode(message_id)));
                     }
                 }
             }
@@ -2708,10 +3717,13 @@ impl RChatClient {
                 auto_resend,
             )
             .await
+            .map(sent)
         })
     }
 
     fn handle_frame(guard: &mut ClientInner, frame: Frame) {
+        // A background drain's quiet window starts again (§H.1).
+        guard.drain_note_activity(std::time::Instant::now());
         // Round-2 L5: only signaling until the relay gate and publish passed.
         if !matches!(frame, Frame::Signaling(_)) && !guard.frame_gate_open() {
             guard.frames_dropped_before_gate += 1;
@@ -2721,7 +3733,7 @@ impl RChatClient {
         log::trace!("[RUST] handle_frame called");
 
         match frame {
-            Frame::Control(ControlMessage::CircuitCreatedV2 {
+            Frame::Control(ControlMessage::CircuitCreatedV3 {
                 circuit_id,
                 token,
                 target_circuit_id,
@@ -2729,7 +3741,11 @@ impl RChatClient {
                 peer,
                 initiator_ephemeral_key,
                 responder_ephemeral_key,
-            }) => guard.handle_circuit_created_v2(circuits::CircuitCreatedV2Frame {
+                initiator_kem_ephemeral_pk,
+                responder_kem_ephemeral_pk,
+                initiator_ephemeral_sig,
+                responder_ephemeral_sig,
+            }) => guard.handle_circuit_created_v3(circuits::CircuitCreatedV3Frame {
                 circuit_id,
                 token,
                 target_circuit_id,
@@ -2737,6 +3753,10 @@ impl RChatClient {
                 peer,
                 initiator_ephemeral_key,
                 responder_ephemeral_key,
+                initiator_kem_ephemeral_pk,
+                responder_kem_ephemeral_pk,
+                initiator_ephemeral_sig,
+                responder_ephemeral_sig,
             }),
             Frame::Control(ControlMessage::MessageAck { message_id, .. }) => {
                 // The first ack for a tracked id is reported once (C-5); the
@@ -2758,6 +3778,11 @@ impl RChatClient {
             Frame::Control(ControlMessage::QueuedMessage { payload }) => {
                 guard.handle_sealed_payload(&payload);
             }
+            // R34a: the queue taken at our publish is handed over. Only a
+            // background drain acts on it (it may end); otherwise nothing.
+            Frame::Control(ControlMessage::QueueHandedOver { .. }) => {
+                guard.drain_note_handed_over(std::time::Instant::now());
+            }
             Frame::Control(ControlMessage::CircuitClosed { circuit_id, .. }) => {
                 guard.handle_circuit_closed(circuit_id)
             }
@@ -2765,6 +3790,18 @@ impl RChatClient {
                 code: protocol::ControlErrorCode::CircuitNotFound,
                 message,
             }) => guard.handle_circuit_not_found(&message),
+            // Final review: an ask refused over a relay cap. The offline
+            // queue's refusal of a relay packet (its text starts with the
+            // shared `OFFLINE_QUEUE_FULL_PREFIX`, N-3) is not about an ask.
+            Frame::Control(ControlMessage::Error {
+                code: protocol::ControlErrorCode::RateLimited,
+                message,
+            }) if !protocol::is_offline_queue_refusal(&message) => {
+                guard.handle_ask_rate_limited(std::time::Instant::now())
+            }
+            Frame::Control(ControlMessage::PairTokenBusy { ephemeral_key }) => {
+                guard.handle_pair_token_busy(&ephemeral_key, std::time::Instant::now())
+            }
             Frame::Control(ControlMessage::CircuitExists {
                 circuit_id,
                 token,
@@ -2781,6 +3818,7 @@ impl RChatClient {
     }
 
     fn handle_binary(guard: &mut ClientInner, data: Vec<u8>) {
+        guard.drain_note_activity(std::time::Instant::now());
         // Round-2 L5: relay packets wait for the relay gate and publish too.
         if !guard.frame_gate_open() {
             guard.frames_dropped_before_gate += 1;
@@ -2803,15 +3841,22 @@ impl RChatClient {
         // circuit id to one we don't know skips this check; authenticity
         // rests on the sealed envelope and the ratchet's AEAD.
         let circuit_id = CircuitId(packet.circuit_id.0);
-        let owner = guard
-            .session_manager
-            .find_by_circuit_id(&circuit_id)
-            .or_else(|| guard.session_manager.find_by_target_circuit_id(&circuit_id));
-        if let Some(owner) = &owner {
-            let token = guard
+        // A pair waiting for its session-init owns its circuit (§A.3).
+        let pending = guard.pending_init_by_circuit(&circuit_id);
+        let owner = pending.as_ref().map(|(p, _)| p.clone()).or_else(|| {
+            guard
                 .session_manager
-                .get(&owner)
-                .and_then(|s| s.get_token_key());
+                .find_by_circuit_id(&circuit_id)
+                .or_else(|| guard.session_manager.find_by_target_circuit_id(&circuit_id))
+        });
+        if let Some(owner) = &owner {
+            let token = match &pending {
+                Some((_, token)) => Some(*token),
+                None => guard
+                    .session_manager
+                    .get(&owner)
+                    .and_then(|s| s.get_token_key()),
+            };
             if let Some(token) = token {
                 if !packet.verify_auth_tag(&token) {
                     log::debug!("[RUST] Relay auth tag mismatch; packet dropped");
@@ -2820,7 +3865,11 @@ impl RChatClient {
             }
         }
         match owner {
-            Some(owner) => guard.handle_sealed_payload_on_circuit(&packet.payload, &owner),
+            Some(owner) => {
+                // Reached only with the pending circuit's token verified.
+                let on_pending = pending.is_some();
+                guard.handle_sealed_payload_on_circuit(&packet.payload, &owner, on_pending)
+            }
             None => guard.handle_sealed_payload(&packet.payload),
         }
     }
@@ -2836,6 +3885,8 @@ impl RChatClient {
             if !guard.is_connected {
                 return;
             }
+            // Timer changes reported lost go back on their sessions (R32).
+            guard.process_timer_requeues();
             guard
                 .session_manager
                 .get_all_recipients()
@@ -2849,6 +3900,20 @@ impl RChatClient {
                     let mut s = guard.session_manager.get_mut(&r)?;
                     if !s.can_send() || s.pending_messages.is_empty() {
                         return None;
+                    }
+                    if guard.steady_holds(&r) {
+                        // Steady (§B.1): what fits waits for a slot; only
+                        // the larger messages at the head go now, outside
+                        // the shape, so the order is kept.
+                        let mut large = VecDeque::new();
+                        while s
+                            .pending_messages
+                            .front()
+                            .is_some_and(|m| !steady::fits(1 + m.content.len()))
+                        {
+                            large.extend(s.pending_messages.pop_front());
+                        }
+                        return (!large.is_empty()).then(|| (r.clone(), large));
                     }
                     let pending = s.take_pending_messages();
                     Some((r.clone(), pending))
@@ -2921,13 +3986,14 @@ impl RChatClient {
             // installed in between.
             guard.check_auto_resend(&recipient, &message_id)?;
         }
-        let type_byte = match msg_type {
-            MessageType::Text | MessageType::E2EEHandshake => 0x01,
-            MessageType::Binary | MessageType::Voice => 0x02,
-        };
-        let mut plaintext = Vec::with_capacity(1 + content.len());
-        plaintext.push(type_byte);
-        plaintext.extend_from_slice(content);
+        // Final review L5: a background drain sends no message (§H.1). Its
+        // frame goes straight to the outgoing channel, past `send_now`'s
+        // gate, so it is refused here, before a message number is burnt.
+        if guard.in_drain() {
+            return Err(RChatError::NotConnected);
+        }
+        // Wiped when it goes (R30 M-3); the tracker keeps its own copy.
+        let plaintext = zeroize::Zeroizing::new(steady::message_plaintext(msg_type, content));
         // Checked before sealing so a missing socket does not burn a message number.
         let tx = guard
             .websocket
@@ -2941,7 +4007,7 @@ impl RChatClient {
         // queue space (up to OUTGOING_SEND_TIMEOUT on a slow network) runs
         // without the client lock, so no other call waits behind it.
         let (circuit, payload) = (packet.circuit_id.clone(), packet.payload.clone());
-        guard.track_sent(&recipient, &id_hex, circuit, payload);
+        guard.track_sent(&recipient, &id_hex, circuit, payload, &plaintext);
         drop(guard);
         let frame = packet.encode_with_frame_type();
         let sent = match tx {
@@ -3105,6 +4171,20 @@ pub(crate) async fn wait_for_callback_room(hub: &CallbackHub) {
     }
 }
 
+/// A received file queued on the hub: if its job is dropped undelivered
+/// (no callback thread, or the callbacks were silenced), the bytes are
+/// wiped, never just freed. Kept off `ReceivedFile` itself, a
+/// `uniffi::Record` whose fields must stay movable.
+struct QueuedFile(Option<ReceivedFile>);
+
+impl Drop for QueuedFile {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.as_mut() {
+            zeroize::Zeroize::zeroize(&mut f.bytes);
+        }
+    }
+}
+
 /// What `ClientInner::callbacks` holds once the app registered callbacks:
 /// every call is queued on the hub.
 struct HubCallbacks(Arc<CallbackHub>);
@@ -3117,8 +4197,20 @@ impl RChatCallbacks for HubCallbacks {
     fn on_message_received(&self, message: ReceivedMessage) {
         self.0.post(move |cb| cb.on_message_received(message));
     }
+    fn on_file_received(&self, file: ReceivedFile) {
+        let mut queued = QueuedFile(Some(file));
+        self.0.post(move |cb| {
+            if let Some(f) = queued.0.take() {
+                cb.on_file_received(f);
+            }
+        });
+    }
     fn on_message_delivered(&self, message_id: String) {
         self.0.post(move |cb| cb.on_message_delivered(message_id));
+    }
+    fn on_timer_changed(&self, peer_hex: String, secs: u32, changed_at_ms: u64, by_me: bool) {
+        self.0
+            .post(move |cb| cb.on_timer_changed(peer_hex, secs, changed_at_ms, by_me));
     }
     fn on_error(&self, error: String) {
         self.0.post(move |cb| cb.on_error(error));
@@ -3138,9 +4230,9 @@ impl RChatCallbacks for HubCallbacks {
         self.0
             .post(move |cb| cb.on_message_receipt(sender_hex, message_id_hex, kind));
     }
-    fn on_peer_rotated(&self, old: String, new: String, ak: String, version: u32) {
+    fn on_peer_rotated(&self, old: String, new: String, ak: String, kem: String, version: u32) {
         self.0
-            .post(move |cb| cb.on_peer_rotated(old, new, ak, version));
+            .post(move |cb| cb.on_peer_rotated(old, new, ak, kem, version));
     }
     fn on_status_event(&self, event: status::StatusEvent) {
         self.0.post(move |cb| cb.on_status_event(event));
@@ -3160,6 +4252,52 @@ mod tests {
 
     const PEER: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
     const PEER_AK: &str = "0100000000000000000000000000000000000000000000000000000000000001";
+
+    /// R31 round 2: `block_on_async` must build the future on its worker
+    /// thread. The caller's stack is painted with a needle; a future built
+    /// here (big, and live across awaits, so most of it is uninitialised
+    /// slots) would copy that paint into `thread::spawn`'s heap box, freed
+    /// unwiped. Independent of any send's stack layout, debug and release.
+    #[test]
+    fn block_on_async_moves_no_caller_stack_into_the_heap() {
+        #[inline(never)]
+        fn paint(n: [u8; 32]) {
+            let a = [n; 1024];
+            std::hint::black_box(&a);
+        }
+        let rt = Arc::new(ClientRuntime::new().unwrap());
+        for _ in 0..8 {
+            let n: [u8; 32] = rand::random();
+            let hits = crate::alloc_probe::freed_containing_any_thread(n, || {
+                paint(n);
+                let r = block_on_async(rt.clone(), move || async move {
+                    tokio::task::yield_now().await;
+                    let big = [7u8; 4096];
+                    tokio::task::yield_now().await;
+                    Ok(std::hint::black_box(big)[0])
+                });
+                assert_eq!(r.unwrap(), 7);
+            });
+            assert_eq!(hits, 0, "caller stack reached the heap box");
+        }
+    }
+
+    /// R31 round 2, a compile-time guard: the future holds an `Rc` (not
+    /// `Send`) across an await. That compiles only because the future is
+    /// built and polled on the worker thread and never crosses threads;
+    /// a `block_on_async` that built it here and moved it into
+    /// `thread::spawn` would need `F: Send`, and this test would stop
+    /// compiling.
+    #[test]
+    fn block_on_async_futures_need_not_be_send() {
+        let rt = Arc::new(ClientRuntime::new().unwrap());
+        let r = block_on_async(rt, || async {
+            let rc = std::rc::Rc::new(5u8);
+            tokio::task::yield_now().await;
+            Ok(*rc)
+        });
+        assert_eq!(r.unwrap(), 5);
+    }
 
     /// A callback whose `on_error` waits on a gate, recording what it saw.
     struct Gated {
@@ -3427,7 +4565,7 @@ mod tests {
         fn on_circuit_established(&self, _: String, _: bool) {}
         fn on_error(&self, _: String) {
             let client = self.client.get().unwrap();
-            let r = client.pin_peer_key(PEER.into(), PEER_AK.into());
+            let r = client.pin_peer_key(PEER.into(), PEER_AK.into(), None);
             let _ = self.done.lock().unwrap().send(r);
         }
     }
@@ -3554,6 +4692,86 @@ mod tests {
         );
     }
 
+    /// Task 13: the hub (what the app's registered callbacks sit behind)
+    /// forwards a received file to `on_file_received`, never as a message.
+    #[test]
+    fn the_hub_forwards_files() {
+        #[derive(Default)]
+        struct Files(std::sync::Mutex<Vec<String>>);
+        impl RChatCallbacks for Files {
+            fn on_connection_status_changed(&self, _: ConnectionStatus) {}
+            fn on_message_received(&self, _: ReceivedMessage) {
+                self.0.lock().unwrap().push("message".into());
+            }
+            fn on_file_received(&self, f: ReceivedFile) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("file {} {}", f.name, f.bytes.len()));
+            }
+            fn on_message_delivered(&self, _: String) {}
+            fn on_error(&self, _: String) {}
+            fn on_circuit_established(&self, _: String, _: bool) {}
+        }
+        let hub = CallbackHub::new();
+        let files = Arc::new(Files::default());
+        hub.set_target(files.clone());
+        HubCallbacks(hub.clone()).on_file_received(ReceivedFile {
+            id: "ab".repeat(16),
+            sender_identity: PEER.into(),
+            name: "x.bin".into(),
+            mime: String::new(),
+            expire_secs: 0,
+            bytes: vec![1, 2, 3],
+            timestamp_ms: 1,
+        });
+        hub.flush(Duration::from_secs(2));
+        assert_eq!(*files.0.lock().unwrap(), vec!["file x.bin 3".to_string()]);
+    }
+
+    /// Fix round 2 N-1: a file whose hub job is dropped undelivered is
+    /// wiped: with no callback thread (dropped in `post`), and after the
+    /// callbacks were silenced (dropped on the callback thread).
+    #[test]
+    fn dropped_hub_jobs_wipe_files() {
+        struct Quiet;
+        impl RChatCallbacks for Quiet {
+            fn on_connection_status_changed(&self, _: ConnectionStatus) {}
+            fn on_message_received(&self, _: ReceivedMessage) {}
+            fn on_message_delivered(&self, _: String) {}
+            fn on_error(&self, _: String) {}
+            fn on_circuit_established(&self, _: String, _: bool) {}
+        }
+        fn file(needle: [u8; 32]) -> ReceivedFile {
+            ReceivedFile {
+                id: "ab".repeat(16),
+                sender_identity: PEER.into(),
+                name: "x".into(),
+                mime: String::new(),
+                expire_secs: 0,
+                bytes: needle.to_vec(),
+                timestamp_ms: 1,
+            }
+        }
+        // No target ever set: no callback thread, the job is dropped.
+        let needle: [u8; 32] = rand::random();
+        let idle = CallbackHub::new();
+        let hits = crate::alloc_probe::freed_containing(needle, || {
+            HubCallbacks(idle.clone()).on_file_received(file(needle));
+        });
+        assert_eq!(hits, 0, "dropped in post");
+        // Silenced: the job reaches the thread and is dropped there.
+        let needle: [u8; 32] = rand::random();
+        let hub = CallbackHub::new();
+        hub.set_target(Arc::new(Quiet));
+        hub.silence();
+        let hits = crate::alloc_probe::freed_containing_any_thread(needle, || {
+            HubCallbacks(hub.clone()).on_file_received(file(needle));
+            hub.flush(Duration::from_secs(2));
+        });
+        assert_eq!(hits, 0, "dropped on the callback thread");
+    }
+
     #[test]
     fn send_binary_using_id_checks_the_body_and_the_id() {
         let client = RChatClient::new(ClientConfig::default()).unwrap();
@@ -3568,7 +4786,9 @@ mod tests {
         ));
         // Pinned, so `check_sendable` passes: the refusal comes from
         // `send_payload`'s connection check, proving the call got there.
-        client.pin_peer_key(PEER.into(), PEER_AK.into()).unwrap();
+        client
+            .pin_peer_key(PEER.into(), PEER_AK.into(), None)
+            .unwrap();
         assert!(matches!(
             client.send_binary_message_using_id(PEER.into(), b"IMG1x".to_vec(), id),
             Err(RChatError::NotConnected)
@@ -3605,6 +4825,7 @@ mod tests {
             .pin_peer_key(
                 their_hex.clone(),
                 hex::encode(them.public_agreement_key().to_bytes()),
+                None,
             )
             .unwrap();
         let mut bad = their_dks;
@@ -3735,7 +4956,9 @@ mod tests {
         let connecting = std::thread::spawn(move || c.connect());
         std::thread::sleep(Duration::from_millis(400)); // now in the handshake
         let t = std::time::Instant::now();
-        client.pin_peer_key(PEER.into(), PEER_AK.into()).unwrap();
+        client
+            .pin_peer_key(PEER.into(), PEER_AK.into(), None)
+            .unwrap();
         client.set_cover_traffic(true, true);
         let _ = client.peer_key_state_checked(PEER.into());
         assert!(

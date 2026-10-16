@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{BRAND}} - Sign in to your mailbox</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body class="webmail">
+<main class="center">
+<div class="card">
+<div class="brand">{{LOGO_SVG}}<h1>{{BRAND}}</h1></div>
+<h2>Sign in to your mailbox</h2>
+<p class="muted">{{TAGLINE}}</p>
+<form id="login-form" onsubmit="return false" autocomplete="on">
+<div class="field"><label for="username">Email address</label><input type="text" id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></div>
+<div class="field"><label for="password">Password</label><input type="password" id="password" name="password" autocomplete="current-password" required></div>
+<button type="submit" id="login-btn" class="btn">Sign in</button>
+<div id="login-error" class="error" role="alert"></div>
+</form>
+<div class="row"><a href="#">Forgot your password?</a><a href="#">Help</a></div>
+</div>
+<p class="foot">{{FOOTER}}</p>
+</main>
+<script>
+{{LOGIN_JS}}
+</script>
+</body>
+</html>

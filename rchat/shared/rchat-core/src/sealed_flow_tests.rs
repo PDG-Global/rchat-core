@@ -3,7 +3,7 @@
 
 use crate::crypto::{EphemeralKeyPair, IdentityKeyPair};
 use crate::protocol::{CircuitId, ControlMessage, Frame, PacketFlags, RelayPacket};
-use crate::sealed::{self, KIND_KNOCK, KIND_RATCHET};
+use crate::sealed::{self, KIND_RATCHET};
 use crate::test_support::*;
 use crate::{RChatClient, MAX_PENDING_BYTES, MAX_PENDING_ENCRYPTED, MAX_PENDING_ENTRY_BYTES};
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,9 @@ fn errors(log: &Arc<Mutex<Vec<Ev>>>) -> usize {
 #[test]
 fn s3_stale_circuit_and_queued_messages_decrypt_by_sender_identity() {
     let mut p = establish(0xA1, 0xB2);
-    let packet = p.a.seal_ratchet(&p.pb.hex, [1; 16], b"\x01hi").unwrap();
+    let packet =
+        p.a.seal_ratchet(&p.pb.hex, [1; 16], b"\x01\0\0\0\0hi")
+            .unwrap();
     let stale = RelayPacket::with_auth(
         CircuitId([0x99; 16]),
         packet.payload.clone(),
@@ -48,7 +50,9 @@ fn s3_stale_circuit_and_queued_messages_decrypt_by_sender_identity() {
     RChatClient::handle_relay_packet(&mut p.b, stale);
     assert_eq!(messages(&p.b_log), vec![(p.pa.hex.clone(), b"hi".to_vec())]);
 
-    let packet = p.a.seal_ratchet(&p.pb.hex, [2; 16], b"\x01again").unwrap();
+    let packet =
+        p.a.seal_ratchet(&p.pb.hex, [2; 16], b"\x01\0\0\0\0again")
+            .unwrap();
     RChatClient::handle_frame(
         &mut p.b,
         Frame::Control(ControlMessage::QueuedMessage {
@@ -61,7 +65,9 @@ fn s3_stale_circuit_and_queued_messages_decrypt_by_sender_identity() {
 #[test]
 fn relay_packet_with_a_bad_tag_on_a_known_circuit_is_dropped() {
     let mut p = establish(0xA1, 0xB2);
-    let packet = p.a.seal_ratchet(&p.pb.hex, [3; 16], b"\x01x").unwrap();
+    let packet =
+        p.a.seal_ratchet(&p.pb.hex, [3; 16], b"\x01\0\0\0\0x")
+            .unwrap();
     assert_eq!(packet.circuit_id, C2, "B's own circuit: B knows its token");
     let mut forged = packet.clone();
     forged.auth_tag = [0u8; 16];
@@ -100,7 +106,9 @@ fn s2_spoofed_sender_is_neither_delivered_nor_attributed() {
         statuses(&p.a_log).is_empty(),
         "A ignores an id it never sent"
     );
-    let real = p.a.seal_ratchet(&p.pb.hex, [4; 16], b"\x01real").unwrap();
+    let real =
+        p.a.seal_ratchet(&p.pb.hex, [4; 16], b"\x01\0\0\0\0real")
+            .unwrap();
     p.b.handle_sealed_payload(&real.payload);
     assert_eq!(
         messages(&p.b_log),
@@ -243,7 +251,7 @@ fn claimed_senders_cannot_flush_a_quiet_contacts_held_bodies() {
     assert_eq!(quiet_held, 5, "the quiet contact's held bodies survive");
 }
 
-/// N-1: a ratchet envelope in a knock-sized (2048-byte) payload never came
+/// N-1: a ratchet envelope in a knock-sized (5120-byte) payload never came
 /// from a ratchet send: dropped, not held.
 #[test]
 fn knock_sized_ratchet_envelopes_are_not_held() {
@@ -352,7 +360,9 @@ fn oversize_pending_entry_is_refused() {
 fn held_messages_are_delivered_once_the_session_exists() {
     let mut p = establish(0xA1, 0xB2);
     let saved = p.b.session_manager.remove(&p.pa.hex).unwrap();
-    let packet = p.a.seal_ratchet(&p.pb.hex, [5; 16], b"\x01early").unwrap();
+    let packet =
+        p.a.seal_ratchet(&p.pb.hex, [5; 16], b"\x01\0\0\0\0early")
+            .unwrap();
     p.b.handle_sealed_payload(&packet.payload);
     assert_eq!(p.b.pending_encrypted_messages.len(), 1);
     assert!(messages(&p.b_log).is_empty());
@@ -371,7 +381,8 @@ fn held_messages_are_delivered_once_the_session_exists() {
 fn padded_one_mebibyte_body_is_held_until_the_session_exists() {
     let mut p = establish(0xA1, 0xB2);
     let saved = p.b.session_manager.remove(&p.pa.hex).unwrap();
-    let mut pt = b"\x02IMG1".to_vec(); // binary bodies start with a known magic
+    // `expire_secs` follows the type byte; binary bodies start with a known magic.
+    let mut pt = b"\x02\0\0\0\0IMG1".to_vec();
     pt.resize((1 << 20) - 1, 0x5A); // pads to exactly 1 MiB
     assert_eq!(crate::padding::bucket(pt.len()), 1 << 20);
     let packet = p.a.seal_ratchet(&p.pb.hex, [6; 16], &pt).unwrap();
@@ -382,7 +393,7 @@ fn padded_one_mebibyte_body_is_held_until_the_session_exists() {
     p.b.process_pending_encrypted(&p.pa.hex);
     assert_eq!(
         messages(&p.b_log),
-        vec![(p.pa.hex.clone(), pt[1..].to_vec())]
+        vec![(p.pa.hex.clone(), pt[5..].to_vec())]
     );
 }
 
@@ -394,26 +405,35 @@ fn hello_sync_is_sealed_hidden_and_starts_the_responders_sending_chain() {
     let (mut b, _b_rx) = published(0xB2);
     let (pa, pb) = (peer(0xA1), peer(0xB2));
     let b_log = install_event_log(&mut b);
-    a.peers
-        .pin(&pb.hex, pb.bundle.identity_agreement_key)
-        .unwrap();
-    b.peers
-        .pin(&pa.hex, pa.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
     let (ek_a, ek_b) = (EphemeralKeyPair::generate(), EphemeralKeyPair::generate());
     let (i_ek, r_ek) = (ek_a.public_key().to_bytes(), ek_b.public_key().to_bytes());
     a.peers.push_ask(&pb.hex, ek_a, Instant::now());
     b.peers.push_ask(&pa.hex, ek_b, Instant::now());
-    feed(&mut b, created_v2(1, &pa.bundle, i_ek, r_ek));
-    assert!(!b.session_manager.get(&pa.hex).unwrap().can_send());
-    feed(&mut a, created_v2(0, &pb.bundle, i_ek, r_ek));
+    feed(&mut b, created_v3(1, &pa.bundle, i_ek, r_ek));
+    // v3 (§A.3): the responder has no session until session-init.
+    assert!(b.session_manager.get(&pa.hex).is_none());
+    assert!(b.awaiting_init(&pa.hex));
+    feed(&mut a, created_v3(0, &pb.bundle, i_ek, r_ek));
     let relays = sent_relays(&mut a_rx);
     assert_eq!(relays.len(), 1, "one hello");
     let packet = relays.into_iter().next().unwrap();
     assert_eq!(packet.circuit_id, C2);
     assert!(packet.verify_auth_tag(&TOKEN));
     assert_eq!(packet.payload[0], sealed::SEALED_VERSION);
+    // The hello travels as the session-init (§A.4), in the 4 KiB bucket.
+    let b_id = b.identity.clone().unwrap();
+    let opened = sealed::open(
+        &b_id.public_signing_key().to_bytes(),
+        b_id.agreement_secret(),
+        &packet.payload,
+    )
+    .unwrap();
+    assert_eq!(opened.kind, crate::session_init::SESSION_INIT_TYPE);
+    assert_eq!(opened.body.len(), 4096);
     feed(&mut b, Frame::Relay(packet));
+    assert!(!b.awaiting_init(&pa.hex));
     assert!(messages(&b_log).is_empty(), "hello is invisible");
     assert!(b.session_manager.get(&pa.hex).unwrap().can_send());
 }
@@ -423,12 +443,15 @@ fn malformed_knock_is_dropped_without_a_request() {
     let (mut b, mut rx) = inner_with_identity(2);
     let log = install_event_log(&mut b);
     let b_id = b.identity.clone().unwrap();
-    let payload = sealed::seal(
+    let (ct, ss) = crate::kem::encapsulate(&b_id.kem_public()[..]).unwrap();
+    let payload = sealed::seal_knock_with(
+        &x25519_dalek::StaticSecret::from([0x45; 32]),
+        [4; 24],
         [4; 16],
-        &b_id.public_signing_key().to_bytes(),
         &b_id.public_agreement_key().to_bytes(),
+        &ct,
+        &ss,
         &[9u8; 32],
-        KIND_KNOCK,
         &[0u8; sealed::KNOCK_INNER_LEN - 33],
     )
     .unwrap();

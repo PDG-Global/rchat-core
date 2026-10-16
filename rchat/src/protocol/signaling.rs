@@ -230,8 +230,10 @@ pub struct ServerInfo {
     pub capabilities: Vec<String>,
 }
 
-/// Key bundle for X3DH
+/// Signed key bundle v3 (protocol v3 §A.2). Unknown fields are refused, so a
+/// v2-shaped bundle (with `signed_pre_key`) never parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyBundle {
     /// Ed25519 identity key (hex string for JSON compatibility)
     /// Used for signatures and identity verification
@@ -241,11 +243,12 @@ pub struct KeyBundle {
     /// This is the long-term X25519 key for X3DH key agreement
     pub identity_agreement_key: String,
 
-    /// X25519 signed pre-key (hex string for JSON compatibility)
-    pub signed_pre_key: String,
+    /// ML-KEM-768 public key, standard base64 of exactly 1184 bytes.
+    pub kem_pk: String,
 
-    /// Signature of signed_pre_key by identity_key (hex string for JSON compatibility)
-    pub signed_pre_key_signature: String,
+    /// Ed25519 signature by identity_key over the v3 bundle transcript
+    /// (`"rchat/bundle/v3\0" || ik || ak || kem_pk`), 128 lowercase hex.
+    pub bundle_signature: String,
 
     /// One-time X25519 pre-keys (hex strings for JSON compatibility)
     pub one_time_pre_keys: Vec<String>,

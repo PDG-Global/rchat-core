@@ -1160,14 +1160,14 @@ mod tests {
     ) {
         loop {
             match next_control(ws, Duration::from_secs(3)).await {
-                Some(crate::protocol::unified::ControlMessage::CircuitCreatedV2 {
+                Some(crate::protocol::unified::ControlMessage::CircuitCreatedV3 {
                     circuit_id,
                     token,
                     target_circuit_id,
                     ..
                 }) => return (circuit_id, token, target_circuit_id),
                 Some(_) => continue,
-                None => panic!("no CircuitCreatedV2"),
+                None => panic!("no CircuitCreatedV3"),
             }
         }
     }

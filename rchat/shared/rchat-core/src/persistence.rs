@@ -55,7 +55,7 @@ impl StateStore {
 /// A staged record, opened and checked against its key.
 enum OpenedRecord {
     Meta(MetaRecordV1),
-    Peer(Box<PeerRecordV1>),
+    Peer(Box<PeerRecordV2>),
 }
 
 /// Push with a FIFO cap; returns the entry evicted to make room.
@@ -120,7 +120,7 @@ fn restored_session(
     hex: &str,
     our_ik: [u8; 32],
     peer_ik: [u8; 32],
-    s: &SessionSnapshotV1,
+    s: &SessionSnapshotV2,
     id: Option<&x25519_dalek::StaticSecret>,
 ) -> Option<ChatSession> {
     let mut session = ChatSession::new(hex.to_string());
@@ -141,6 +141,24 @@ fn restored_session(
         .map(|(id, reason, eligible)| (*id, (*reason, *eligible)))
         .collect();
     session.session_binding = s.session_binding;
+    session.pair_secret = s.pair_secret.as_ref().map(|p| zeroize::Zeroizing::new(p.0));
+    session.pair_epoch = s.pair_epoch;
+    session.blinded = s.blinded;
+    session.blind_since_unix = s.blind_since_unix;
+    session.last_identity_fallback_unix = s.last_identity_fallback_unix;
+    session.init_out = match &s.init_out {
+        Some(i) => Some(Box::new(crate::session::InitOut {
+            ct: Box::new(i.ct.as_slice().try_into().ok()?),
+            confirm: i.confirm,
+            sent: i.sent_id.map(|id| crate::session::SentInit {
+                id,
+                payload: i.sent_payload.clone(),
+                // Before this run: re-sent at the first opportunity.
+                epoch: 0,
+            }),
+        })),
+        None => None,
+    };
     if let Some(c) = &s.circuit {
         session.set_circuit(
             crate::protocol::CircuitId(c.circuit_id),
@@ -166,10 +184,10 @@ impl ClientInner {
     }
 
     /// The peer's record as it would be written now (None: nothing to keep).
-    pub(crate) fn peer_record(&self, peer_hex: &str) -> Option<PeerRecordV1> {
+    pub(crate) fn peer_record(&self, peer_hex: &str) -> Option<PeerRecordV2> {
         let peer_ik = crate::peers::key_from_hex(peer_hex)?;
         let session = self.session_manager.get(peer_hex).and_then(|s| {
-            Some(SessionSnapshotV1 {
+            Some(SessionSnapshotV2 {
                 ratchet: s.ratchet_snapshot()?,
                 is_established: s.is_established,
                 is_initiator: s.is_initiator,
@@ -193,6 +211,24 @@ impl ClientInner {
                     .map(|(id, (reason, eligible))| (*id, *reason, *eligible))
                     .collect(),
                 session_binding: s.session_binding,
+                init_out: s.init_out.as_ref().map(|i| {
+                    // A claimed init whose bytes are not built yet is not sent.
+                    let sent = i.sent.as_ref().filter(|x| !x.payload.is_empty());
+                    InitOutV1 {
+                        ct: i.ct.to_vec(),
+                        confirm: i.confirm,
+                        sent_id: sent.map(|x| x.id),
+                        sent_payload: sent.map(|x| x.payload.clone()).unwrap_or_default(),
+                    }
+                }),
+                pair_secret: s
+                    .pair_secret
+                    .as_ref()
+                    .map(|p| crate::state_store::Secret32(**p)),
+                pair_epoch: s.pair_epoch,
+                blinded: s.blinded,
+                blind_since_unix: s.blind_since_unix,
+                last_identity_fallback_unix: s.last_identity_fallback_unix,
             })
         });
         let retired = self.session_manager.retired_parts(peer_hex).map(
@@ -203,7 +239,7 @@ impl ClientInner {
                 peer_ak,
             },
         );
-        let rec = PeerRecordV1 {
+        let rec = PeerRecordV2 {
             peer_ik,
             session,
             retired,
@@ -227,6 +263,31 @@ impl ClientInner {
                 .get(peer_hex)
                 .map(|q| q.iter().copied().collect())
                 .unwrap_or_default(),
+            last_knock: self.knock_acted.get(peer_hex).copied(),
+            steady_unheard: self.steady_unheard.get(peer_hex).copied().unwrap_or(0),
+            timer: crate::disappearing::lock_timers(self)
+                .get(peer_hex)
+                .map(|t| crate::state_store::TimerV1 {
+                    secs: t.secs,
+                    changed_at_ms: t.changed_at_ms,
+                    by_me: t.by_me,
+                    acked: t.acked,
+                    out_id: t.out_id,
+                }),
+            pending_init: self.pending_inits.get(peer_hex).map(|p| PendingInitV1 {
+                kem_seed: p.kem_seed.to_vec(),
+                ek_r: *p.ek_r.as_bytes(),
+                i_ek: p.i_ek,
+                peer_ak: p.peer_ak,
+                circuit: CircuitV1 {
+                    circuit_id: p.circuit_id.0,
+                    target_circuit_id: p.target_circuit_id.0,
+                    token: *p.token,
+                },
+                expires_at_unix: p.expires_at_unix,
+                created_at_unix: p.created_at_unix,
+                blind: p.origin == crate::blind::InstallOrigin::Blind,
+            }),
         };
         let empty = rec.session.is_none()
             && rec.retired.is_none()
@@ -241,7 +302,11 @@ impl ClientInner {
             && rec.pending_send_ids.is_empty()
             && rec.undecryptable_ids.is_empty()
             && !rec.notice_due
-            && rec.auto_resends_unix.is_empty();
+            && rec.auto_resends_unix.is_empty()
+            && rec.pending_init.is_none()
+            && rec.last_knock.is_none()
+            && rec.steady_unheard == 0
+            && rec.timer.is_none();
         (!empty).then_some(rec)
     }
 
@@ -516,6 +581,8 @@ impl ClientInner {
     /// Forget every session and staged record in memory (Reset Identity,
     /// our own rotation). The app deletes the stored records itself.
     pub(crate) fn clear_state_now(&mut self) {
+        // Reset Identity / our own rotation: no ticket outlives the identity.
+        self.tls_tickets.clear();
         if let Some(store) = self.state.as_mut() {
             store.staged.clear();
             store
@@ -525,6 +592,8 @@ impl ClientInner {
                 .clear();
         }
         self.session_manager.forget_all();
+        self.pending_inits.clear();
+        self.resend_after_init.clear();
         // Everything kept for the identity's contacts goes with it.
         self.sent_ids
             .lock()
@@ -600,6 +669,16 @@ impl ClientInner {
                 self.delete_record(&key, peer.as_deref());
             }
         }
+        // Waits too old to answer (R8), dropped while the records were
+        // applied: closed and re-asked now that meta and every peer record
+        // are in memory, so the writes below carry all of it (review N-1).
+        for (peer, circuit) in std::mem::take(&mut self.abandoned_at_restore) {
+            self.close_circuit_id(&circuit);
+            let _ = self.persist_peer(&peer);
+            if self.require_askable(&peer).is_ok() {
+                self.schedule_reask(&peer);
+            }
+        }
     }
 
     /// Open one staged record and check it against its key: the meta key
@@ -619,7 +698,7 @@ impl ClientInner {
                 OpenedRecord::Meta(bincode::deserialize(&body).map_err(|_| RestoreError::Parse)?)
             }
             KIND_PEER if key != META_KEY => {
-                let rec: PeerRecordV1 =
+                let rec: PeerRecordV2 =
                     bincode::deserialize(&body).map_err(|_| RestoreError::Parse)?;
                 if store.keys.record_key_for(&rec.peer_ik) != key {
                     return Err(RestoreError::Parse);
@@ -637,7 +716,7 @@ impl ClientInner {
     /// Apply one peer record. True once handled, including the delete of a
     /// record nobody should keep (peer no longer pinned, blocked, or its
     /// session made under another pin, C-1); false: the record is unusable.
-    fn apply_peer(&mut self, rec: PeerRecordV1, id: Option<&x25519_dalek::StaticSecret>) -> bool {
+    fn apply_peer(&mut self, rec: PeerRecordV2, id: Option<&x25519_dalek::StaticSecret>) -> bool {
         let hex = hex::encode(rec.peer_ik);
         let Some(pinned_ak) = self.peers.pin_for(&hex) else {
             self.delete_peer_record(&hex);
@@ -645,7 +724,11 @@ impl ClientInner {
         };
         let other_pin = |ak: &[u8; 32]| !constant_time_eq::constant_time_eq(ak, &pinned_ak);
         let other_pin = rec.session.as_ref().is_some_and(|s| other_pin(&s.peer_ak))
-            || rec.retired.as_ref().is_some_and(|r| other_pin(&r.peer_ak));
+            || rec.retired.as_ref().is_some_and(|r| other_pin(&r.peer_ak))
+            || rec
+                .pending_init
+                .as_ref()
+                .is_some_and(|p| other_pin(&p.peer_ak));
         if self.peers.is_blocked(&hex) || other_pin {
             self.delete_peer_record(&hex);
             return true;
@@ -683,6 +766,69 @@ impl ClientInner {
         };
         self.session_manager
             .install_restored(hex.clone(), current, retired);
+        // Review N-2: a session whose session-init was never sealed owes the
+        // hello that carries it (`hello_sync_due` is not persisted), or the
+        // M-3 hold would keep tracked re-sends back until the app sends.
+        let init_unsent = self.session_manager.get(&hex).is_some_and(|s| {
+            s.init_out
+                .as_ref()
+                .is_some_and(|i| !matches!(&i.sent, Some(x) if !x.payload.is_empty()))
+        });
+        if init_unsent {
+            self.hello_sync_due.insert(hex.clone());
+        }
+        // A session-init still awaited (§A.3); one in memory is newer than
+        // the record. The wait counts online time only (R8): it is pushed
+        // back to now + ASK_TTL, unless it is older than the offline queue,
+        // when it is dropped like any expired wait (closed, re-asked).
+        if let Some(p) = &rec.pending_init {
+            if p.kem_seed.len() != crate::kem::KEM_SEED_LEN {
+                return false;
+            }
+            let mut seed = zeroize::Zeroizing::new([0u8; crate::kem::KEM_SEED_LEN]);
+            seed.copy_from_slice(&p.kem_seed);
+            if !self.pending_inits.contains_key(&hex) {
+                let mut ek_bytes = p.ek_r;
+                let ek_r = crate::crypto::X25519SecretKey::from(ek_bytes);
+                zeroize::Zeroize::zeroize(&mut ek_bytes);
+                self.pending_inits.insert(
+                    hex.clone(),
+                    crate::circuits::PendingInit {
+                        kem: crate::kem::KemKeyPair::from_seed(&seed),
+                        kem_seed: seed,
+                        ek_r,
+                        i_ek: p.i_ek,
+                        peer_ak: p.peer_ak,
+                        circuit_id: crate::protocol::CircuitId(p.circuit.circuit_id),
+                        target_circuit_id: crate::protocol::CircuitId(p.circuit.target_circuit_id),
+                        token: zeroize::Zeroizing::new(p.circuit.token),
+                        // Before this run: resumed after the first publish.
+                        circuit_epoch: 0,
+                        expires_at_unix: p.expires_at_unix,
+                        created_at_unix: p.created_at_unix.min(crate::unix_now_secs()),
+                        origin: if p.blind {
+                            crate::blind::InstallOrigin::Blind
+                        } else {
+                            crate::blind::InstallOrigin::Identity
+                        },
+                    },
+                );
+                let now = crate::unix_now_secs();
+                let too_old = self.pending_inits.get(&hex).is_some_and(|w| w.too_old(now));
+                if too_old {
+                    // Dropped in memory only (review N-1): the close and the
+                    // re-ask wait until every staged record is applied, so no
+                    // write here carries a half-merged peer record or a meta
+                    // record from before the staged one.
+                    if let Some(w) = self.pending_inits.remove(&hex) {
+                        self.abandoned_at_restore
+                            .push((hex.clone(), w.circuit_id.clone()));
+                    }
+                } else if let Some(w) = self.pending_inits.get_mut(&hex) {
+                    w.refresh(now);
+                }
+            }
+        }
 
         // Merged with what is in memory, which is never older than the
         // record: a second restore (after `disconnect`/`connect`) adds nothing twice.
@@ -724,6 +870,36 @@ impl ClientInner {
                 if !q.contains(&id) {
                     q.push(id);
                 }
+            }
+        }
+        // R26: restored exactly. Only a peer that was already out of the
+        // draw starts out of it; no peer is paused because of the restart.
+        if rec.steady_unheard > 0 {
+            let e = self.steady_unheard.entry(hex.clone()).or_insert(0);
+            *e = (*e).max(rec.steady_unheard);
+        }
+        // §I.2: a timer never set again since the record was written is
+        // restored as it was (a value outside the choices is ignored).
+        if let Some(t) = rec.timer {
+            let mut timers = crate::disappearing::lock_timers(self);
+            if crate::disappearing::valid_timer(t.secs) && !timers.contains_key(&hex) {
+                timers.insert(
+                    hex.clone(),
+                    crate::disappearing::PeerTimer {
+                        secs: t.secs,
+                        changed_at_ms: t.changed_at_ms,
+                        by_me: t.by_me,
+                        acked: t.acked,
+                        out_id: t.out_id,
+                        resends: 0,
+                    },
+                );
+            }
+        }
+        if let Some(k) = rec.last_knock {
+            let e = self.knock_acted.entry(hex.clone()).or_insert(k);
+            if k.0 > e.0 {
+                *e = k;
             }
         }
         if !rec.auto_resends_unix.is_empty() && !self.auto_resends.contains_key(&hex) {

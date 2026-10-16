@@ -18,7 +18,8 @@ use rchat_core::device_key::DeviceSigner;
 use rchat_core::state_store::{is_valid_record_key, StateSink};
 use rchat_core::status::StatusEvent;
 use rchat_core::{
-    ClientConfig, ConnectionStatus, MessageRequest, RChatCallbacks, RChatClient, ReceivedMessage,
+    ClientConfig, ConnectionStatus, MessageRequest, RChatCallbacks, RChatClient, ReceivedFile,
+    ReceivedMessage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,12 +40,15 @@ pub struct CardDk {
 
 /// A contact card, the same JSON the iOS app shows as a QR code: v1
 /// `{"n","ik","ak"}`, or v2 `{"v":2,"n","ik","ak","dk","dkh","dks"}`.
+/// `kem` (base64 of the 1184-byte ML-KEM-768 key, protocol v3 §A.6) is
+/// carried ahead of card v3 (Task 6): knocks need it (R1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
     pub name: String,
     pub ik: String,
     pub ak: String,
     pub dk: Option<CardDk>,
+    pub kem: Option<String>,
 }
 
 /// The card's JSON, field for field.
@@ -61,6 +65,8 @@ struct CardJson {
     dkh: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dks: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kem: Option<String>,
 }
 
 fn is_hex(k: &str, len: usize) -> bool {
@@ -92,11 +98,22 @@ impl Card {
             (1 | 2, ..) => return Err("a v2 card needs dk, dkh and dks; v1 has none".to_string()),
             (v, ..) => return Err(format!("unknown card version {v}")),
         };
+        if let Some(k) = &c.kem {
+            use base64::Engine as _;
+            let len = base64::engine::general_purpose::STANDARD
+                .decode(k)
+                .map_err(|_| "kem must be base64".to_string())?
+                .len();
+            if len != 1184 {
+                return Err(format!("kem must be 1184 bytes (got {len})"));
+            }
+        }
         Ok(Card {
             name: c.n,
             ik: c.ik.to_lowercase(),
             ak: c.ak.to_lowercase(),
             dk,
+            kem: c.kem,
         })
     }
 
@@ -110,6 +127,7 @@ impl Card {
             dkh: d.as_ref().map(|d| d.dkh),
             dk: d.as_ref().map(|d| d.dk.clone()),
             dks: d.map(|d| d.dks),
+            kem: self.kem.clone(),
         };
         serde_json::to_string(&json).expect("a card always serialises")
     }
@@ -177,6 +195,62 @@ impl DeviceSigner for SoftSigner {
     }
 }
 
+/// A received file (`0x07`): what the core reported, its bytes checked
+/// against `file_bytes` and then dropped.
+#[derive(Debug, Clone)]
+pub struct FileRec {
+    pub id: String,
+    pub sender: String,
+    pub name: String,
+    pub mime: String,
+    pub expire_secs: u32,
+    pub len: usize,
+    /// The bytes are exactly `file_bytes(len)`.
+    pub content_ok: bool,
+}
+
+/// A disappearing-timer change the core reported (protocol v3 §I.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimerRec {
+    pub peer: String,
+    pub secs: u32,
+    pub changed_at_ms: u64,
+    pub by_me: bool,
+}
+
+/// The test files' bytes: `len` bytes of a BLAKE3 stream, so the receiver
+/// checks a file it never saw against its length alone.
+pub fn file_bytes(len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut h = blake3::Hasher::new_derive_key("rchat-e2e-file");
+    h.update(&(len as u64).to_le_bytes());
+    h.finalize_xof().fill(&mut out);
+    out
+}
+
+/// `%XX` escapes (UTF-8 bytes) decoded, for names with bidi or zero-width
+/// characters on a command line. Invalid UTF-8 is replaced, as the core's
+/// own name cleaning decodes lossily.
+pub fn pct_decode(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| format!("bad %-escape in {s:?}"))?;
+            out.push(hex);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// Everything the core reported through its callbacks.
 #[derive(Debug, Default)]
 pub struct Recorded {
@@ -201,6 +275,20 @@ pub struct Recorded {
     /// (peer identity, 2 mismatch | 3 bad signature, offered agreement key).
     pub key_events: Vec<(String, u8, String)>,
     pub errors: Vec<String>,
+    pub files: Vec<FileRec>,
+    pub timers: Vec<TimerRec>,
+    /// Our sent messages' `expire_secs` as the core used it (§I.2).
+    pub sent_expire: HashMap<String, u32>,
+    /// Disappearing messages (sent or received) by id, and when each one's
+    /// countdown ends: a sent one from the relay's ack, a received one from
+    /// when it was stored (the app's "displayed").
+    pub expiry: Vec<(String, Instant)>,
+    /// Ids purged when their countdown ended (content dropped, the core
+    /// told with `forget_message`), in order.
+    pub purged: Vec<String>,
+    /// `--timer-override-secs` (test client only): every countdown is this
+    /// long instead of the message's `expire_secs`.
+    pub timer_override: Option<Duration>,
 }
 
 impl Recorded {
@@ -274,6 +362,33 @@ impl Recorded {
             .count()
     }
 
+    /// Start the countdown of a disappearing message (`secs` > 0).
+    fn start_countdown(&mut self, id: &str, secs: u32) {
+        if secs == 0
+            || self.expiry.iter().any(|(i, _)| i == id)
+            || self.purged.iter().any(|p| p == id)
+        {
+            return;
+        }
+        let d = self
+            .timer_override
+            .unwrap_or_else(|| Duration::from_secs(u64::from(secs)));
+        self.expiry.push((id.to_string(), Instant::now() + d));
+    }
+
+    /// Received texts and files whose `expire_secs` is not `secs`.
+    pub fn expire_mismatches(&self, from: &str, secs: u32) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| m.sender_identity == from && m.expire_secs != secs)
+            .count()
+            + self
+                .files
+                .iter()
+                .filter(|f| f.sender == from && f.expire_secs != secs)
+                .count()
+    }
+
     pub fn key_events_for(&self, ik: &str, code: u8) -> usize {
         self.key_events
             .iter()
@@ -292,7 +407,11 @@ impl RChatCallbacks for Recorder {
     }
     fn on_message_received(&self, message: ReceivedMessage) {
         let (sender, id) = (message.sender_identity.clone(), message.id.clone());
-        self.0.lock().unwrap().messages.push(message);
+        {
+            let mut r = self.0.lock().unwrap();
+            r.start_countdown(&id, message.expire_secs);
+            r.messages.push(message);
+        }
         // Recorded is "stored": tell the core, which queues the delivered
         // receipt only now (spec §18.7 D36). Callbacks may call back in.
         if let Some(client) = self.1.upgrade() {
@@ -306,7 +425,46 @@ impl RChatCallbacks for Recorder {
         }
     }
     fn on_message_delivered(&self, message_id: String) {
-        self.0.lock().unwrap().acks.push(message_id);
+        let mut r = self.0.lock().unwrap();
+        // §I.2 (R33 N-2): the sender's countdown starts at the relay's ack.
+        if let Some(secs) = r.sent_expire.get(&message_id).copied() {
+            r.start_countdown(&message_id, secs);
+        }
+        r.acks.push(message_id);
+    }
+    fn on_file_received(&self, file: ReceivedFile) {
+        let rec = FileRec {
+            id: file.id.clone(),
+            sender: file.sender_identity.clone(),
+            name: file.name.clone(),
+            mime: file.mime.clone(),
+            expire_secs: file.expire_secs,
+            len: file.bytes.len(),
+            content_ok: file.bytes == file_bytes(file.bytes.len()),
+        };
+        {
+            let mut r = self.0.lock().unwrap();
+            r.start_countdown(&rec.id, rec.expire_secs);
+            r.files.push(rec);
+        }
+        // Stored: the delivered receipt may go (D36), as for a text.
+        if let Some(client) = self.1.upgrade() {
+            if let Err(e) = client.mark_message_seen(file.sender_identity, file.id) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .errors
+                    .push(format!("mark seen: {e}"));
+            }
+        }
+    }
+    fn on_timer_changed(&self, peer_hex: String, secs: u32, changed_at_ms: u64, by_me: bool) {
+        self.0.lock().unwrap().timers.push(TimerRec {
+            peer: peer_hex,
+            secs,
+            changed_at_ms,
+            by_me,
+        });
     }
     fn on_error(&self, error: String) {
         self.0.lock().unwrap().errors.push(error);
@@ -395,6 +553,28 @@ impl Peer {
         state_dir: Option<PathBuf>,
         device_key_seed: Option<String>,
     ) -> Result<Peer, String> {
+        Self::with_timer_override(
+            name,
+            server_url,
+            origin,
+            seed_text,
+            state_dir,
+            device_key_seed,
+            None,
+        )
+    }
+
+    /// `Peer::new`, with every disappearing countdown `timer_override`
+    /// long (the test client's `--timer-override-secs`; never the app).
+    pub fn with_timer_override(
+        name: &str,
+        server_url: &str,
+        origin: Option<&str>,
+        seed_text: &str,
+        state_dir: Option<PathBuf>,
+        device_key_seed: Option<String>,
+        timer_override: Option<Duration>,
+    ) -> Result<Peer, String> {
         let config = ClientConfig {
             server_url: ws_url(server_url),
             dev_origin: origin.map(str::to_string),
@@ -427,13 +607,22 @@ impl Peer {
             }
             None => None,
         };
+        let kem = {
+            use base64::Engine as _;
+            let pk = client.get_kem_public_key().map_err(|e| e.to_string())?;
+            base64::engine::general_purpose::STANDARD.encode(pk)
+        };
         let card = Card {
             name: name.to_string(),
             ik: client.get_identity().map_err(|e| e.to_string())?,
             ak: client.get_agreement_key().map_err(|e| e.to_string())?,
             dk,
+            kem: Some(kem),
         };
-        let rec = Arc::new(Mutex::new(Recorded::default()));
+        let rec = Arc::new(Mutex::new(Recorded {
+            timer_override,
+            ..Recorded::default()
+        }));
         let mut sent_log = None;
         if let Some(dir) = state_dir {
             std::fs::create_dir_all(&dir).map_err(|e| format!("state dir: {e}"))?;
@@ -453,6 +642,7 @@ impl Peer {
             client.import_state_records(read_records(&dir)?);
         }
         client.set_callbacks(Box::new(Recorder(rec.clone(), Arc::downgrade(&client))));
+        spawn_purger(Arc::downgrade(&rec), Arc::downgrade(&client));
         Ok(Peer {
             name: name.to_string(),
             client,
@@ -484,8 +674,19 @@ impl Peer {
     /// Pin the card's keys, then its device key if it has one: the test
     /// analog of a scan (D44: DK values only ever come from a card).
     pub fn pin(&self, c: &Card) -> Result<(), String> {
+        // The card's ML-KEM key goes in with the agreement key (§A.6).
+        let kem = match &c.kem {
+            Some(k) => {
+                use base64::Engine as _;
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(k)
+                    .map_err(|_| format!("{}: pin {}: bad kem", self.name, c.name))?;
+                Some(hex::encode(raw))
+            }
+            None => None,
+        };
         self.client
-            .pin_peer_key(c.ik.clone(), c.ak.clone())
+            .pin_peer_key(c.ik.clone(), c.ak.clone(), kem)
             .map_err(|e| format!("{}: pin {}: {e}", self.name, c.name))?;
         let Some(d) = &c.dk else {
             return Ok(());
@@ -512,10 +713,12 @@ impl Peer {
 
     /// Send, and log the text under its id (answers `ResendEligible`).
     pub fn send(&self, to: &Card, text: &str) -> Result<String, String> {
-        let id = self
+        let sent = self
             .client
-            .send_text_message(to.ik.clone(), text.to_string())
+            .send_text(to.ik.clone(), text.to_string(), None)
             .map_err(|e| e.to_string())?;
+        let id = sent.id;
+        self.note_expire(&id, sent.expire_secs);
         if let Some(log) = &self.sent_log {
             let mut line = serde_json::to_string(&(&id, text)).map_err(|e| e.to_string())?;
             line.push('\n');
@@ -532,6 +735,41 @@ impl Peer {
         Ok(id)
     }
 
+    /// Record the `expire_secs` a send used; an ack already in starts the
+    /// countdown now.
+    fn note_expire(&self, id: &str, secs: u32) {
+        let mut r = self.rec.lock().unwrap();
+        r.sent_expire.insert(id.to_string(), secs);
+        if r.acks.iter().any(|a| a == id) {
+            r.start_countdown(id, secs);
+        }
+    }
+
+    /// Send a file of `len` test bytes (`file_bytes`) under `name`.
+    pub fn send_file(
+        &self,
+        to: &Card,
+        name: &str,
+        mime: &str,
+        len: usize,
+    ) -> Result<String, String> {
+        let sent = self
+            .client
+            .send_file(
+                to.ik.clone(),
+                name.to_string(),
+                mime.to_string(),
+                file_bytes(len),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        self.note_expire(&sent.id, sent.expire_secs);
+        let mut r = self.rec.lock().unwrap();
+        r.sent.insert(sent.id.clone(), format!("file {len}"));
+        r.sent_order.push(sent.id.clone());
+        Ok(sent.id)
+    }
+
     pub fn wait(&self, timeout: Duration, f: impl Fn(&Recorded) -> bool) -> bool {
         wait_until(timeout, || f(&self.rec.lock().unwrap()))
     }
@@ -539,6 +777,41 @@ impl Peer {
     pub fn snapshot<T>(&self, f: impl FnOnce(&Recorded) -> T) -> T {
         f(&self.rec.lock().unwrap())
     }
+}
+
+/// Purge disappearing messages whose countdown ended (§I.2, as the app's
+/// timer does): content dropped, the id recorded as purged, and the core
+/// told (`forget_message`). Ends with the recorder.
+fn spawn_purger(rec: Weak<Mutex<Recorded>>, client: Weak<RChatClient>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(200));
+        let Some(rec) = rec.upgrade() else { return };
+        let due: Vec<String> = {
+            let mut r = rec.lock().unwrap();
+            let now = Instant::now();
+            let (gone, keep): (Vec<_>, Vec<_>) = r.expiry.drain(..).partition(|(_, at)| *at <= now);
+            r.expiry = keep;
+            let ids: Vec<String> = gone.into_iter().map(|(id, _)| id).collect();
+            for id in &ids {
+                for m in r.messages.iter_mut().filter(|m| m.id == *id) {
+                    m.content.clear();
+                }
+                // The id stays ours (its receipts and acks still match).
+                if let Some(text) = r.sent.get_mut(id) {
+                    text.clear();
+                }
+                r.purged.push(id.clone());
+            }
+            ids
+        };
+        if let Some(client) = client.upgrade() {
+            for id in due {
+                if let Err(e) = client.forget_message(id) {
+                    rec.lock().unwrap().errors.push(format!("forget: {e}"));
+                }
+            }
+        }
+    });
 }
 
 /// Poll `f` every 100 ms until it holds or `timeout` passes.

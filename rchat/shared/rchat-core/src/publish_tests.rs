@@ -14,11 +14,16 @@ fn publishes(msgs: &[SignalingMessage]) -> Vec<(SignedBundle, [u8; 64])> {
             let kb = &data["key_bundle"];
             let h = |v: &serde_json::Value| hex::decode(v.as_str().unwrap()).unwrap();
             assert!(kb["one_time_pre_keys"].as_array().unwrap().is_empty());
-            let bundle = SignedBundle::from_slices(
+            assert!(kb.get("signed_pre_key").is_none(), "v3 has no SPK");
+            use base64::Engine as _;
+            let kem = base64::engine::general_purpose::STANDARD
+                .decode(kb["kem_pk"].as_str().unwrap())
+                .unwrap();
+            let bundle = SignedBundle::from_wire(
                 &h(&kb["identity_key"]),
                 &h(&kb["identity_agreement_key"]),
-                &h(&kb["signed_pre_key"]),
-                &h(&kb["signed_pre_key_signature"]),
+                &kem,
+                &h(&kb["bundle_signature"]),
             )
             .unwrap();
             let sig: [u8; 64] = h(&data["conn_signature"]).try_into().unwrap();
@@ -80,7 +85,7 @@ fn k10_reconnect_sends_hello_again_and_republishes() {
         .expect("hello re-sent");
     assert_eq!(
         hello.payload.inner["data"]["supported_versions"],
-        serde_json::json!([2])
+        serde_json::json!([3])
     );
     assert!(!inner.is_key_bundle_published);
     assert!(!inner.is_connected);
@@ -202,13 +207,15 @@ fn authentication_failure_reports_key_auth_rejected_and_stops() {
     );
 }
 
-/// Version gate: v1 hello_response, a malformed challenge, or VersionMismatch → ServerTooNew.
+/// Version gate: a v1 or v2 hello_response (v3 hard cutover), a malformed
+/// challenge, or VersionMismatch → ServerTooNew.
 #[test]
 fn version_or_challenge_problems_report_server_too_new() {
     let cases = [
         hello_response_raw(1, Some(&"4e".repeat(32))),
-        hello_response_raw(2, None),
-        hello_response_raw(2, Some("not-hex")),
+        hello_response_raw(2, Some(&"4e".repeat(32))),
+        hello_response_raw(3, None),
+        hello_response_raw(3, Some("not-hex")),
         error_message("VersionMismatch"),
     ];
     for msg in cases {
@@ -275,7 +282,7 @@ fn stale_hello_response_from_a_retired_connection_is_dropped() {
         .set_channel_binding_for_test(Some([0x43; 32]));
     inner.handle_event(
         old_generation,
-        CoreEvent::Frame(Frame::Signaling(hello_response(old))),
+        CoreEvent::Frame(Box::new(Frame::Signaling(hello_response(old)))),
     );
     assert!(
         publishes(&sent_signaling(&mut rx)).is_empty(),
@@ -288,7 +295,9 @@ fn stale_hello_response_from_a_retired_connection_is_dropped() {
     let current = inner.connection_generation;
     inner.handle_event(
         current,
-        CoreEvent::Frame(Frame::Signaling(hello_response_bound(fresh, [0x43; 32]))),
+        CoreEvent::Frame(Box::new(Frame::Signaling(hello_response_bound(
+            fresh, [0x43; 32],
+        )))),
     );
     let p = publishes(&sent_signaling(&mut rx));
     assert_eq!(p.len(), 1);
@@ -298,13 +307,17 @@ fn stale_hello_response_from_a_retired_connection_is_dropped() {
     // After a protocol failure the generation moves on: late events are dropped.
     inner.handle_event(
         current,
-        CoreEvent::Frame(Frame::Signaling(error_message("AuthenticationFailed"))),
+        CoreEvent::Frame(Box::new(Frame::Signaling(error_message(
+            "AuthenticationFailed",
+        )))),
     );
     assert!(inner.websocket.is_none());
     inner.handle_event(current, CoreEvent::Reconnected);
     inner.handle_event(
         current,
-        CoreEvent::Frame(Frame::Signaling(hello_response_bound(fresh, [0x43; 32]))),
+        CoreEvent::Frame(Box::new(Frame::Signaling(hello_response_bound(
+            fresh, [0x43; 32],
+        )))),
     );
     assert!(
         !inner.is_connected,

@@ -45,8 +45,11 @@ fn fake_conn(
             key_bundle: id.map(|i| KeyBundle {
                 identity_key: i.hex.clone(),
                 identity_agreement_key: hex::encode(i.bundle.identity_agreement_key),
-                signed_pre_key: hex::encode(i.bundle.signed_pre_key),
-                signed_pre_key_signature: hex::encode(i.bundle.bundle_signature),
+                kem_pk: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &i.bundle.kem_pk[..],
+                ),
+                bundle_signature: hex::encode(i.bundle.bundle_signature),
                 one_time_pre_keys: Vec::new(),
             }),
             identity_key: id.map(|i| i.hex.clone()),
@@ -57,13 +60,16 @@ fn fake_conn(
             identified: id.is_some(),
             created_circuits: Default::default(),
             pending_charges: Default::default(),
-            protocol_version: 2,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             auth_nonce: None,
             channel_binding: [0u8; 32],
             proven_identity: id.map(|i| i.bytes),
             closing: false,
             auth_budget: crate::limits::AuthBudget::new(Instant::now()),
             source: None,
+            has_asked: false,
+            blind_ask_bucket: None,
+            peer_bundle: None,
         },
     );
     if let Some(i) = id {
@@ -279,11 +285,29 @@ async fn q1_knock_to_an_online_target_with_a_full_queue_takes_no_longer_than_off
     }
 
     let t0 = Instant::now();
-    circuits::handle_circuit_ask(caller, b.bytes, rand::random(), knock(1), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(1),
+        None,
+        &state,
+    )
+    .await;
     let online_full = t0.elapsed();
 
     let t1 = Instant::now();
-    circuits::handle_circuit_ask(caller, d.bytes, rand::random(), knock(2), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        d.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(2),
+        None,
+        &state,
+    )
+    .await;
     let offline = t1.elapsed();
 
     // A blocked send would wait for queue space (seconds); 1 s leaves room
@@ -344,7 +368,7 @@ const Q8_MAX_ROUNDS: u32 = 10;
 
 /// Protocol-level client: closes its circuit, then re-asks with 2 s, 4 s,
 /// 8 s, ... (x (1 + jitter)) backoff until a pair forms. Returns the round in
-/// which its `CircuitCreatedV2` arrived.
+/// which its `CircuitCreatedV3` arrived.
 async fn sim_client(
     state: RelayState,
     me: ClientId,
@@ -353,10 +377,10 @@ async fn sim_client(
     jitter: f64,
     asks: Arc<AtomicUsize>,
 ) -> u32 {
-    // The initial pair's CircuitCreatedV2 (a knock may precede it).
+    // The initial pair's CircuitCreatedV3 (a knock may precede it).
     let own = loop {
         let (msg, _) = rx.recv().await.expect("connection open");
-        if let Ok(UnifiedFrame::Control(ControlMessage::CircuitCreatedV2 { circuit_id, .. })) =
+        if let Ok(UnifiedFrame::Control(ControlMessage::CircuitCreatedV3 { circuit_id, .. })) =
             UnifiedFrame::decode(&msg)
         {
             break circuit_id;
@@ -368,8 +392,16 @@ async fn sim_client(
         let delay = Duration::from_secs_f64(2f64.powi(round as i32) * (1.0 + jitter));
         tokio::time::sleep(delay).await;
         asks.fetch_add(1, Ordering::SeqCst);
-        circuits::handle_circuit_ask(me, peer, rand::random(), knock(round as u8), None, &state)
-            .await;
+        circuits::handle_circuit_ask(
+            me,
+            peer,
+            rand::random(),
+            kem_for(rand::random()),
+            knock(round as u8),
+            None,
+            &state,
+        )
+        .await;
         let deadline = tokio::time::sleep(Duration::from_secs_f64(2f64.powi(round as i32 + 1)));
         tokio::pin!(deadline);
         loop {
@@ -377,7 +409,7 @@ async fn sim_client(
                 _ = &mut deadline => break,
                 m = rx.recv() => {
                     let (msg, _) = m.expect("connection open");
-                    if let Ok(UnifiedFrame::Control(ControlMessage::CircuitCreatedV2 { .. })) =
+                    if let Ok(UnifiedFrame::Control(ControlMessage::CircuitCreatedV3 { .. })) =
                         UnifiedFrame::decode(&msg)
                     {
                         return round;
@@ -401,8 +433,26 @@ async fn q8_scenario(seed: u8, jitter_a: f64, jitter_b: f64) {
     );
     let (ca, rx_a, _ka) = fake_conn(&state, Some(&a));
     let (cb, rx_b, _kb) = fake_conn(&state, Some(&b));
-    circuits::handle_circuit_ask(ca, b.bytes, rand::random(), knock(1), None, &state).await;
-    circuits::handle_circuit_ask(cb, a.bytes, rand::random(), knock(2), None, &state).await;
+    circuits::handle_circuit_ask(
+        ca,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(1),
+        None,
+        &state,
+    )
+    .await;
+    circuits::handle_circuit_ask(
+        cb,
+        a.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(2),
+        None,
+        &state,
+    )
+    .await;
     assert_eq!(state.identity_pair_circuits.len(), 1, "initial pair");
 
     let asks = Arc::new(AtomicUsize::new(0));
@@ -587,7 +637,16 @@ async fn knock_racing_a_publish_is_delivered_not_stranded() {
         st.identity_to_client.insert(btag, target);
         st.message_queues.remove(&btag);
     });
-    circuits::handle_circuit_ask(caller, b.bytes, rand::random(), knock(7), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(7),
+        None,
+        &state,
+    )
+    .await;
 
     let mut delivered = 0;
     while let Ok((msg, _)) = rx_b.try_recv() {
@@ -619,12 +678,30 @@ async fn reask_does_not_keep_an_ask_alive_past_ask_ttl() {
     let state = server.state();
     let (a, offline) = (TestIdentity::from_seed(0x76), TestIdentity::from_seed(0x77));
     let (caller, _rx, _k) = fake_conn(&state, Some(&a));
-    circuits::handle_circuit_ask(caller, offline.bytes, [1; 32], knock(1), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        offline.bytes,
+        [1; 32],
+        kem_for([1; 32]),
+        knock(1),
+        None,
+        &state,
+    )
+    .await;
     let pair = tags::pair_tag(&a.bytes, &offline.bytes);
     let first_at = state.pending_asks.get(&pair).map(|p| p.at).unwrap();
 
     tokio::time::sleep(Duration::from_millis(20)).await;
-    circuits::handle_circuit_ask(caller, offline.bytes, [2; 32], knock(2), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        offline.bytes,
+        [2; 32],
+        kem_for([2; 32]),
+        knock(2),
+        None,
+        &state,
+    )
+    .await;
     {
         let p = state.pending_asks.get(&pair).unwrap();
         assert_eq!(p.ephemeral, [2; 32], "re-ask replaces the EK");
@@ -641,11 +718,29 @@ async fn reask_does_not_keep_an_ask_alive_past_ask_ttl() {
     );
 
     // An expired-but-unswept ask is not refreshed by a re-ask either.
-    circuits::handle_circuit_ask(caller, offline.bytes, [3; 32], knock(3), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        offline.bytes,
+        [3; 32],
+        kem_for([3; 32]),
+        knock(3),
+        None,
+        &state,
+    )
+    .await;
     let at3 = state.pending_asks.get(&pair).map(|p| p.at).unwrap();
     state.pending_asks.get_mut(&pair).unwrap().at =
         at3 - (circuits::ASK_TTL + Duration::from_secs(1));
-    circuits::handle_circuit_ask(caller, offline.bytes, [4; 32], knock(4), None, &state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        offline.bytes,
+        [4; 32],
+        kem_for([4; 32]),
+        knock(4),
+        None,
+        &state,
+    )
+    .await;
     let p = state.pending_asks.get(&pair).unwrap();
     assert!(p.at >= at3, "an expired ask is replaced by a new one");
     assert_eq!(
@@ -665,12 +760,48 @@ async fn close_of_an_old_circuit_leaves_the_new_pair_alone() {
     let (a, b) = (TestIdentity::from_seed(0x78), TestIdentity::from_seed(0x79));
     let (ca, _rx_a, _ka) = fake_conn(&state, Some(&a));
     let (cb, _rx_b, _kb) = fake_conn(&state, Some(&b));
-    circuits::handle_circuit_ask(ca, b.bytes, rand::random(), knock(1), None, &state).await;
-    circuits::handle_circuit_ask(cb, a.bytes, rand::random(), knock(2), None, &state).await;
+    circuits::handle_circuit_ask(
+        ca,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(1),
+        None,
+        &state,
+    )
+    .await;
+    circuits::handle_circuit_ask(
+        cb,
+        a.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(2),
+        None,
+        &state,
+    )
+    .await;
     let old: Vec<CircuitId> = state.circuits.iter().map(|e| *e.key()).collect();
     // A re-asks without resume: teardown, then B re-asks: a new pair.
-    circuits::handle_circuit_ask(ca, b.bytes, rand::random(), knock(3), None, &state).await;
-    circuits::handle_circuit_ask(cb, a.bytes, rand::random(), knock(4), None, &state).await;
+    circuits::handle_circuit_ask(
+        ca,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(3),
+        None,
+        &state,
+    )
+    .await;
+    circuits::handle_circuit_ask(
+        cb,
+        a.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(4),
+        None,
+        &state,
+    )
+    .await;
     assert_eq!(state.identity_pair_circuits.len(), 1);
     for id in old {
         circuits::handle_close_circuit(ca, id, &state).await;
@@ -870,8 +1001,26 @@ async fn r1_resume_of_a_pair_removed_during_the_rebind_is_not_reported() {
     let (a, b) = (TestIdentity::from_seed(0x86), TestIdentity::from_seed(0x87));
     let (ca, _rx_a, _ka) = fake_conn(&state, Some(&a));
     let (cb, _rx_b, _kb) = fake_conn(&state, Some(&b));
-    circuits::handle_circuit_ask(ca, b.bytes, rand::random(), knock(1), None, &state).await;
-    circuits::handle_circuit_ask(cb, a.bytes, rand::random(), knock(2), None, &state).await;
+    circuits::handle_circuit_ask(
+        ca,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(1),
+        None,
+        &state,
+    )
+    .await;
+    circuits::handle_circuit_ask(
+        cb,
+        a.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(2),
+        None,
+        &state,
+    )
+    .await;
     let a_tag = tags::id_tag(&a.bytes);
     let own = state
         .circuits
@@ -888,7 +1037,16 @@ async fn r1_resume_of_a_pair_removed_during_the_rebind_is_not_reported() {
     circuits::tests_hook::set_after_rebind(move || {
         circuits::teardown_pair(pair, &st, None);
     });
-    circuits::handle_circuit_ask(ca2, b.bytes, rand::random(), knock(3), Some(own), &state).await;
+    circuits::handle_circuit_ask(
+        ca2,
+        b.bytes,
+        rand::random(),
+        kem_for(rand::random()),
+        knock(3),
+        Some(own),
+        &state,
+    )
+    .await;
 
     while let Ok((msg, _)) = rx_a2.try_recv() {
         assert!(

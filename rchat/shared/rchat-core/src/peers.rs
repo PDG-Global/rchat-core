@@ -5,12 +5,17 @@
 
 use crate::crypto::EphemeralKeyPair;
 pub use crate::device_key::DevicePin;
+use crate::kem::{KemKeyPair, KEM_PK_LEN, KEM_SEED_LEN};
 use constant_time_eq::constant_time_eq;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
-/// Outstanding asks kept per peer.
-pub const ASK_RING: usize = 3;
+/// Outstanding asks kept per peer: the most blind asks held for one peer
+/// (`blind::MAX_HELD_BLIND_ASKS`, four) and one identity ask beside them
+/// (final re-review N-1, N-2). With three, the oldest of four held blind
+/// asks lost its keys while the relay could still match it.
+pub const ASK_RING: usize = crate::blind::MAX_HELD_BLIND_ASKS + 1;
 /// How long an ask's ephemeral key may be echoed back.
 pub const ASK_TTL: Duration = Duration::from_secs(600);
 
@@ -24,6 +29,45 @@ pub const REQUEST_INTROS_PER_HOUR: usize = 2;
 pub const SEEN_IDS_CAP: usize = 256;
 /// At most one silent re-pin per contact per 24 h (spec §4.8).
 pub const SILENT_REPIN_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// The ephemeral keys of one ask (protocol v3 §A.3): the X25519 ephemeral
+/// and the ML-KEM-768 ephemeral, with the 64-byte seed the KEM pair was
+/// built from (persisted, R4, if the ask becomes a pending session-init).
+/// Both secrets are wiped when the entry drops.
+pub struct AskKeys {
+    pub ek: EphemeralKeyPair,
+    pub kem: KemKeyPair,
+    pub kem_seed: Zeroizing<[u8; KEM_SEED_LEN]>,
+    /// The token epoch of a blind ask (§C.2), None for an identity ask: the
+    /// match's origin comes from the ask the relay echoed (R14).
+    pub blind: Option<crate::pairing::PairEpoch>,
+}
+
+impl AskKeys {
+    /// Fresh keys for one ask (OS RNG).
+    pub fn generate() -> Self {
+        Self::with_ek(EphemeralKeyPair::generate())
+    }
+
+    /// `ek` with a fresh KEM ephemeral (tests build asks from a given EK).
+    pub fn with_ek(ek: EphemeralKeyPair) -> Self {
+        let (kem, kem_seed) = KemKeyPair::generate_with_seed();
+        #[cfg(test)]
+        crate::test_support::register_ask_kem(ek.public_key().to_bytes(), *kem.public());
+        Self {
+            ek,
+            kem,
+            kem_seed,
+            blind: None,
+        }
+    }
+}
+
+impl From<EphemeralKeyPair> for AskKeys {
+    fn from(ek: EphemeralKeyPair) -> Self {
+        Self::with_ek(ek)
+    }
+}
 
 /// Per-peer exponential backoff for automatic re-asks (M9).
 #[derive(Debug, Default, Clone)]
@@ -103,6 +147,10 @@ struct RequestSeen {
     identity: String,
     hour: u64,
     intros: Vec<[u8; 16]>,
+    /// The agreement key and ML-KEM key of the requester's verified knock
+    /// bundle (signed by its identity), adopted if the user accepts it
+    /// under that agreement key (§A.5: "or an earlier session").
+    bundle_kem: Option<([u8; 32], Box<[u8; KEM_PK_LEN]>)>,
 }
 
 #[derive(Default)]
@@ -111,7 +159,7 @@ pub struct PeerBook {
     blocked: HashSet<String>,
     mismatch: HashSet<String>,
     bad_signature: HashMap<String, Instant>,
-    asks: HashMap<String, VecDeque<(EphemeralKeyPair, Instant)>>,
+    asks: HashMap<String, VecDeque<(AskKeys, Instant)>>,
     backoff: HashMap<String, Backoff>,
     /// LRU of identities already reported as requests (one entry each),
     /// with the newest issued hour seen and the intro ids reported for it.
@@ -135,6 +183,12 @@ pub struct PeerBook {
     /// by `pin_device_key`, which only the app's scan, paste or restore of a
     /// stored scan reaches; never from anything received.
     device_keys: HashMap<String, DevicePin>,
+    /// Pinned ML-KEM-768 keys (R1, protocol v3 §A.5/§A.6): knocks are
+    /// encapsulated to them. They come from the contact's card (Task 6),
+    /// or from a bundle the pinned identity signed (an accepted request's
+    /// knock, a pinned contact's knock, a verified rotation); never from a
+    /// relay lookup. Like pins, the app keeps them and re-pins at launch.
+    kem_pks: HashMap<String, Box<[u8; KEM_PK_LEN]>>,
 }
 
 impl PeerBook {
@@ -144,19 +198,90 @@ impl PeerBook {
     /// key (an in-person re-scan, Task 9b re-review 2). Mismatch stays
     /// sticky: only `repin` (a new key from their code) clears it.
     pub fn pin(&mut self, id: &str, ak: [u8; 32]) -> Result<(), PinError> {
+        self.pin_with_kem(id, ak, None)
+    }
+
+    /// `pin`, with the contact's ML-KEM key from their card or the app's
+    /// stored copy of one (§A.6, R11), in one step: either both are taken
+    /// or nothing changes. A KEM key different from the pinned one is a
+    /// `Conflict`, as a different agreement key is: it is never replaced
+    /// here, only after an unpin (the explicit re-pin) or a `repin` to
+    /// other keys. With `kem` None the pinned key (if any) is kept, and a
+    /// first pin adopts an accepted request's key.
+    pub fn pin_with_kem(
+        &mut self,
+        id: &str,
+        ak: [u8; 32],
+        kem: Option<&[u8; KEM_PK_LEN]>,
+    ) -> Result<(), PinError> {
         if let Some(existing) = self.pins.get(id) {
-            return if constant_time_eq(existing, &ak) {
-                self.bad_signature.remove(id);
-                Ok(())
-            } else {
-                Err(PinError::Conflict)
+            let kem_ok = match kem {
+                Some(k) => self.kem_matches(id, k),
+                None => true,
             };
+            if !constant_time_eq(existing, &ak) || !kem_ok {
+                return Err(PinError::Conflict);
+            }
+            self.bad_signature.remove(id);
+            if let Some(k) = kem {
+                self.kem_pks
+                    .entry(id.to_string())
+                    .or_insert_with(|| Box::new(*k));
+            }
+            return Ok(());
         }
         if self.pinned_elsewhere(id, &ak) {
             return Err(PinError::AgreementKeyInUse);
         }
         self.pins.insert(id.to_string(), ak);
+        match kem {
+            Some(k) => {
+                self.kem_pks.insert(id.to_string(), Box::new(*k));
+            }
+            None => self.adopt_request_kem(id, &ak),
+        }
         Ok(())
+    }
+
+    /// Attach `kem` to `id`'s existing pin (R11): taken when none is
+    /// pinned, accepted when equal, a `Conflict` when different or when
+    /// `id` is not pinned (or blocked). Never replaces a key.
+    pub fn pin_kem(&mut self, id: &str, kem: &[u8; KEM_PK_LEN]) -> Result<(), PinError> {
+        if !self.pins.contains_key(id) || self.blocked.contains(id) || !self.kem_matches(id, kem) {
+            return Err(PinError::Conflict);
+        }
+        self.kem_pks
+            .entry(id.to_string())
+            .or_insert_with(|| Box::new(*kem));
+        Ok(())
+    }
+
+    /// Whether `kem` agrees with `id`'s pinned ML-KEM key (constant time):
+    /// true when none is pinned. A signed bundle whose key does not agree
+    /// is a key mismatch (§A.6, R11).
+    pub fn kem_matches(&self, id: &str, kem: &[u8; KEM_PK_LEN]) -> bool {
+        match self.kem_pks.get(id) {
+            Some(pinned) => constant_time_eq(&pinned[..], &kem[..]),
+            None => true,
+        }
+    }
+
+    /// An accepted request: the KEM key of the requester's knock bundle, if
+    /// that bundle named the agreement key now pinned and no KEM key is.
+    fn adopt_request_kem(&mut self, id: &str, ak: &[u8; 32]) {
+        if self.kem_pks.contains_key(id) {
+            return;
+        }
+        let found = self
+            .requests_seen
+            .iter()
+            .find(|r| r.identity == id)
+            .and_then(|r| r.bundle_kem.as_ref())
+            .filter(|(req_ak, _)| constant_time_eq(req_ak, ak))
+            .map(|(_, kem)| kem.clone());
+        if let Some(kem) = found {
+            self.kem_pks.insert(id.to_string(), kem);
+        }
     }
 
     /// Replace the pin with a value from the contact's code (QR is
@@ -165,7 +290,17 @@ impl PeerBook {
         if self.pinned_elsewhere(id, &ak) {
             return Err(PinError::AgreementKeyInUse);
         }
+        // New keys: a KEM key pinned with the old ones is stale (the new
+        // card brings its own, Task 6). The same keys keep it.
+        if self
+            .pins
+            .get(id)
+            .is_some_and(|old| !constant_time_eq(old, &ak))
+        {
+            self.kem_pks.remove(id);
+        }
         self.pins.insert(id.to_string(), ak);
+        self.adopt_request_kem(id, &ak);
         self.mismatch.remove(id);
         self.bad_signature.remove(id);
         Ok(())
@@ -181,6 +316,7 @@ impl PeerBook {
         self.seen.remove(id);
         self.versions.remove(id);
         self.clear_device_key(id);
+        self.kem_pks.remove(id);
         self.unpinned.insert(id.to_string());
         self.pins.remove(id).is_some()
     }
@@ -303,6 +439,20 @@ impl PeerBook {
                 self.pin_device_key(&id, dk);
             }
         }
+        // KEM keys travel the same way (R1), but only onto the agreement
+        // key they were staged with (fix round 1 M-3): a staged pin this
+        // book skipped must not bring its KEM key along. A different key
+        // here is replaced only after an explicit re-pin in the staged book
+        // (an unpin, then the pin: R11); otherwise it only fills a gap.
+        for (id, kem) in newer.kem_pks {
+            let same_ak = match (newer.pins.get(&id), self.pins.get(&id)) {
+                (Some(staged), Some(here)) => constant_time_eq(staged, here),
+                _ => false,
+            };
+            if same_ak && (newer.unpinned.contains(&id) || self.kem_pk_for(&id).is_none()) {
+                self.set_kem_pk(&id, kem);
+            }
+        }
     }
 
     /// Identities whose current pin `overlay(newer)` would remove or replace,
@@ -340,6 +490,44 @@ impl PeerBook {
 
     pub fn pin_for(&self, id: &str) -> Option<[u8; 32]> {
         self.pins.get(id).copied()
+    }
+
+    /// Pin (or replace) `id`'s ML-KEM-768 key (R1). Only for a pinned,
+    /// unblocked identity; false (nothing stored) otherwise. The caller
+    /// has checked the key (`kem::validate_public_key`) or took it from a
+    /// bundle whose signature verified. Internal: it fills a missing key
+    /// or carries an explicit re-pin; the app's pin calls go through
+    /// `pin_with_kem` / `pin_kem`, which never replace one (R11).
+    pub fn set_kem_pk(&mut self, id: &str, kem_pk: Box<[u8; KEM_PK_LEN]>) -> bool {
+        if !self.pins.contains_key(id) || self.blocked.contains(id) {
+            return false;
+        }
+        self.kem_pks.insert(id.to_string(), kem_pk);
+        true
+    }
+
+    /// Every pinned ML-KEM key with the agreement key it is pinned under.
+    pub fn kem_pins(&self) -> Vec<(String, [u8; 32], Box<[u8; KEM_PK_LEN]>)> {
+        self.kem_pks
+            .iter()
+            .filter_map(|(id, k)| self.pins.get(id).map(|ak| (id.clone(), *ak, k.clone())))
+            .collect()
+    }
+
+    /// Identities with a staged KEM key (for `overlay`'s callers).
+    pub fn kem_ids(&self) -> Vec<String> {
+        self.kem_pks.keys().cloned().collect()
+    }
+
+    /// Whether this book's most recent change for `id` included an unpin
+    /// (an explicit re-pin when `id` is pinned again).
+    pub fn was_unpinned(&self, id: &str) -> bool {
+        self.unpinned.contains(id)
+    }
+
+    /// `id`'s pinned ML-KEM key; None means no knock can be sent to it.
+    pub fn kem_pk_for(&self, id: &str) -> Option<&[u8; KEM_PK_LEN]> {
+        self.kem_pks.get(id).map(|k| &**k)
     }
 
     /// Pin (or replace) `id`'s device key, from their scanned or pasted
@@ -410,29 +598,30 @@ impl PeerBook {
         self.bad_signature.remove(id);
     }
 
-    /// Remember an ask's ephemeral key; only the last `ASK_RING` are kept.
-    pub fn push_ask(&mut self, id: &str, ek: EphemeralKeyPair, now: Instant) {
+    /// Remember an ask's ephemeral keys; only the last `ASK_RING` are kept.
+    pub fn push_ask(&mut self, id: &str, keys: impl Into<AskKeys>, now: Instant) {
         let ring = self.asks.entry(id.to_string()).or_default();
-        ring.push_back((ek, now));
+        ring.push_back((keys.into(), now));
         while ring.len() > ASK_RING {
             ring.pop_front();
         }
     }
 
-    /// Consume the outstanding ask whose public key is `ek_pub`, if it is
-    /// younger than `ASK_TTL`. Expired entries are dropped on the way.
-    pub fn take_ask(
-        &mut self,
-        id: &str,
-        ek_pub: &[u8; 32],
-        now: Instant,
-    ) -> Option<EphemeralKeyPair> {
+    /// Consume the outstanding ask whose X25519 public key is `ek_pub`, if
+    /// it is younger than `ASK_TTL`. Expired entries are dropped on the way.
+    pub fn take_ask(&mut self, id: &str, ek_pub: &[u8; 32], now: Instant) -> Option<AskKeys> {
         let ring = self.asks.get_mut(id)?;
         ring.retain(|(_, at)| now.saturating_duration_since(*at) <= ASK_TTL);
         let pos = ring
             .iter()
-            .position(|(ek, _)| constant_time_eq(ek.public_key().as_bytes(), ek_pub))?;
-        ring.remove(pos).map(|(ek, _)| ek)
+            .position(|(k, _)| constant_time_eq(k.ek.public_key().as_bytes(), ek_pub))?;
+        ring.remove(pos).map(|(k, _)| k)
+    }
+
+    /// Drop every outstanding ask for `id`, with its ephemeral secrets (a
+    /// pair formed, review M-4).
+    pub fn drop_asks(&mut self, id: &str) {
+        self.asks.remove(id);
     }
 
     /// Drop every ask older than `ASK_TTL` (C-13), with its ephemeral secret.
@@ -467,6 +656,7 @@ impl PeerBook {
                 identity: id.to_string(),
                 hour: issued_hour,
                 intros: intro_id.into_iter().collect(),
+                bundle_kem: None,
             });
             while self.requests_seen.len() > REQUEST_DEDUPE_CAP {
                 self.requests_seen.pop_front();
@@ -496,6 +686,15 @@ impl PeerBook {
         };
         self.requests_seen.push_back(seen);
         new
+    }
+
+    /// Remember the ML-KEM key of `id`'s verified knock bundle (with the
+    /// agreement key it came with) for `pin` to adopt if the user accepts
+    /// the request. Only for an identity already in the request set.
+    pub fn note_request_kem(&mut self, id: &str, ak: &[u8; 32], kem_pk: &[u8; KEM_PK_LEN]) {
+        if let Some(r) = self.requests_seen.iter_mut().find(|r| r.identity == id) {
+            r.bundle_kem = Some((*ak, Box::new(*kem_pk)));
+        }
     }
 
     /// Round-2 M1: is `id` in the request de-duplication set (Task 14)?
@@ -741,15 +940,19 @@ mod tests {
     }
 
     #[test]
-    fn k16_ring_keeps_last_three_each_valid_600s_and_consumes_on_match() {
+    fn k16_ring_keeps_last_asks_each_valid_600s_and_consumes_on_match() {
+        // K16 said three; the ring holds `ASK_RING` (five: four held blind
+        // asks and one identity ask, final re-review N-2).
+        assert_eq!(ASK_RING, 5);
         let mut book = PeerBook::default();
         let t0 = Instant::now();
-        let eks: Vec<EphemeralKeyPair> = (0..4).map(|_| EphemeralKeyPair::generate()).collect();
+        let n = ASK_RING;
+        let eks: Vec<EphemeralKeyPair> = (0..=n).map(|_| EphemeralKeyPair::generate()).collect();
         let pubs: Vec<[u8; 32]> = eks.iter().map(|e| e.public_key().to_bytes()).collect();
-        for (i, ek) in eks.iter().take(3).enumerate() {
+        for (i, ek) in eks.iter().take(n).enumerate() {
             book.push_ask(A, ek.clone(), t0 + Duration::from_secs(i as u64));
         }
-        // Any of the three matches (take the middle one).
+        // Any of them matches (take the second one).
         assert!(book
             .take_ask(A, &pubs[1], t0 + Duration::from_secs(10))
             .is_some());
@@ -757,17 +960,17 @@ mod tests {
         assert!(book
             .take_ask(A, &pubs[1], t0 + Duration::from_secs(10))
             .is_none());
-        // A fourth evicts the oldest once the ring is full again.
+        // One more evicts the oldest once the ring is full again.
         book.push_ask(A, eks[1].clone(), t0 + Duration::from_secs(11));
-        book.push_ask(A, eks[3].clone(), t0 + Duration::from_secs(12));
-        assert_eq!(book.outstanding_asks(A), 3);
+        book.push_ask(A, eks[n].clone(), t0 + Duration::from_secs(12));
+        assert_eq!(book.outstanding_asks(A), n);
         assert!(
             book.take_ask(A, &pubs[0], t0 + Duration::from_secs(13))
                 .is_none(),
             "oldest evicted"
         );
         assert!(book
-            .take_ask(A, &pubs[3], t0 + Duration::from_secs(13))
+            .take_ask(A, &pubs[n], t0 + Duration::from_secs(13))
             .is_some());
         // Expiry: older than 600 s is refused.
         book.push_ask(B, eks[2].clone(), t0);
@@ -1202,5 +1405,181 @@ mod tests {
         base.overlay(newer);
         assert_eq!(base.pin_for(&a), Some([2; 32]), "a pin after an unpin wins");
         assert!(base.is_blocked(&b), "a block after an unblock wins");
+    }
+
+    fn kem(b: u8) -> Box<[u8; KEM_PK_LEN]> {
+        Box::new([b; KEM_PK_LEN])
+    }
+
+    /// R1: the pinned ML-KEM key (from the contact's card, Task 6) is kept
+    /// with the pin and goes with it: unpin, block and a re-pin to other
+    /// keys forget it; a same-key re-pin (safety number, re-scan) keeps it.
+    /// It can only be set for a pinned identity.
+    #[test]
+    fn kem_pk_follows_the_pin() {
+        let mut book = PeerBook::default();
+        assert!(!book.set_kem_pk(A, kem(1)), "no pin, no KEM key");
+        assert!(book.kem_pk_for(A).is_none());
+        book.pin(A, [1; 32]).unwrap();
+        assert!(book.kem_pk_for(A).is_none(), "a pin alone has no KEM key");
+        assert!(book.set_kem_pk(A, kem(1)));
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(1));
+        book.repin(A, [1; 32]).unwrap();
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(1), "same keys");
+        book.repin(A, [2; 32]).unwrap();
+        assert!(
+            book.kem_pk_for(A).is_none(),
+            "new keys: the card's KEM key is stale"
+        );
+        book.set_kem_pk(A, kem(2));
+        book.unpin(A);
+        assert!(book.kem_pk_for(A).is_none());
+        book.pin(B, [3; 32]).unwrap();
+        book.set_kem_pk(B, kem(3));
+        book.set_blocked(B, true);
+        assert!(book.kem_pk_for(B).is_none());
+    }
+
+    /// The C FFI's staged book carries KEM keys onto the client's book, for
+    /// identities pinned there, as it carries device keys.
+    #[test]
+    fn overlay_carries_kem_keys() {
+        let mut base = PeerBook::default();
+        let mut staged = PeerBook::default();
+        staged.pin(A, [1; 32]).unwrap();
+        staged.set_kem_pk(A, kem(7));
+        base.overlay(staged);
+        assert_eq!(base.kem_pk_for(A).map(|k| k[0]), Some(7));
+    }
+
+    /// Fix round 1 M-3: a staged KEM key lands only where this book pinned
+    /// the same agreement key the staged book had it for.
+    #[test]
+    fn overlay_skips_a_kem_key_staged_for_other_keys() {
+        let mut base = PeerBook::default();
+        base.pin(A, [1; 32]).unwrap();
+        base.pin(B, [2; 32]).unwrap();
+        let mut staged = PeerBook::default();
+        // [2; 32] is B's key in the base book: this pin is skipped there.
+        staged.pin(A, [2; 32]).unwrap();
+        staged.set_kem_pk(A, kem(8));
+        base.overlay(staged);
+        assert_eq!(base.pin_for(A), Some([1; 32]));
+        assert!(base.kem_pk_for(A).is_none(), "staged for other keys");
+    }
+
+    /// Task 6 (§A.6): a card's pin brings its ML-KEM key with the agreement
+    /// key, in one step. A first pin stores it; pinning the same keys again
+    /// is accepted and keeps it.
+    #[test]
+    fn pin_stores_kem_pk() {
+        let mut book = PeerBook::default();
+        book.pin_with_kem(A, [1; 32], Some(&kem(4))).unwrap();
+        assert_eq!(book.pin_for(A), Some([1; 32]));
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(4));
+        book.pin_with_kem(A, [1; 32], Some(&kem(4))).unwrap();
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(4));
+        // A pin without a KEM key leaves the pinned one alone.
+        book.pin_with_kem(A, [1; 32], None).unwrap();
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(4));
+        // An existing pin without a KEM key takes one (a stored card's).
+        book.pin(B, [2; 32]).unwrap();
+        book.pin_with_kem(B, [2; 32], Some(&kem(5))).unwrap();
+        assert_eq!(book.kem_pk_for(B).map(|k| k[0]), Some(5));
+    }
+
+    /// R11 / M-1: the pin call never replaces a different KEM key. Like a
+    /// different agreement key it is a `Conflict` and changes nothing (not
+    /// the pin, not the KEM key, not a bad-signature flag); only an unpin
+    /// first (the explicit re-pin) or a re-pin to other keys clears it.
+    #[test]
+    fn pin_call_cannot_silently_overwrite_kem() {
+        let mut book = PeerBook::default();
+        book.pin_with_kem(A, [1; 32], Some(&kem(4))).unwrap();
+        book.mark_bad_signature(A, Instant::now());
+        assert_eq!(
+            book.pin_with_kem(A, [1; 32], Some(&kem(9))),
+            Err(PinError::Conflict)
+        );
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(4));
+        assert_eq!(book.state(A), PeerKeyState::BadSignature, "unchanged");
+        assert_eq!(book.pin_kem(A, &kem(9)), Err(PinError::Conflict));
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(4));
+        // Not pinned at all: nothing to attach it to.
+        assert_eq!(book.pin_kem(B, &kem(9)), Err(PinError::Conflict));
+        // The explicit re-pin: unpin, then pin the new card.
+        book.unpin(A);
+        book.pin_with_kem(A, [1; 32], Some(&kem(9))).unwrap();
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(9));
+        // The matching key, and a re-pin to other keys, are fine.
+        assert_eq!(book.pin_kem(A, &kem(9)), Ok(()));
+        book.repin(A, [3; 32]).unwrap();
+        assert_eq!(book.pin_kem(A, &kem(6)), Ok(()));
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(6));
+    }
+
+    /// A pin with a card's KEM key wins over the request's adopted one only
+    /// when there is none; the request's is used when the pin has none.
+    #[test]
+    fn a_card_kem_key_is_not_replaced_by_the_requests() {
+        let mut book = PeerBook::default();
+        assert!(book.note_request(A, None, 10));
+        book.note_request_kem(A, &[1; 32], &[5; KEM_PK_LEN]);
+        book.pin_with_kem(A, [1; 32], Some(&kem(4))).unwrap();
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(4));
+    }
+
+    /// R11: the staged book replaces the client book's KEM key only after
+    /// an explicit re-pin there (an unpin, then the pin); otherwise it
+    /// only fills a missing one.
+    #[test]
+    fn overlay_never_silently_replaces_a_kem_key() {
+        let mut base = PeerBook::default();
+        base.pin_with_kem(A, [1; 32], Some(&kem(1))).unwrap();
+        let mut staged = PeerBook::default();
+        staged.pin_with_kem(A, [1; 32], Some(&kem(2))).unwrap();
+        base.overlay(staged);
+        assert_eq!(base.kem_pk_for(A).map(|k| k[0]), Some(1), "kept");
+        let mut staged = PeerBook::default();
+        staged.unpin(A);
+        staged.pin_with_kem(A, [1; 32], Some(&kem(3))).unwrap();
+        base.overlay(staged);
+        assert_eq!(base.kem_pk_for(A).map(|k| k[0]), Some(3), "re-pinned");
+    }
+
+    /// `kem_matches`: no pinned key matches anything (it is adopted from a
+    /// signed bundle); a pinned one must be equal.
+    #[test]
+    fn kem_matches_the_pinned_key_only() {
+        let mut book = PeerBook::default();
+        book.pin(A, [1; 32]).unwrap();
+        assert!(book.kem_matches(A, &kem(1)));
+        book.pin_kem(A, &kem(1)).unwrap();
+        assert!(book.kem_matches(A, &kem(1)));
+        assert!(!book.kem_matches(A, &kem(2)));
+    }
+
+    /// Accepting a request: the requester's KEM key came in its knock, in
+    /// a bundle its identity signed. Pinning the identity with the same
+    /// agreement key the request named adopts it; a pin under another key
+    /// does not.
+    #[test]
+    fn accepting_a_request_adopts_the_knock_bundle_kem_key() {
+        let mut book = PeerBook::default();
+        assert!(book.note_request(A, None, 10));
+        book.note_request_kem(A, &[1; 32], &[5; KEM_PK_LEN]);
+        book.pin(A, [1; 32]).unwrap();
+        assert_eq!(book.kem_pk_for(A).map(|k| k[0]), Some(5));
+        assert!(book.note_request(B, None, 10));
+        book.note_request_kem(B, &[2; 32], &[6; KEM_PK_LEN]);
+        book.pin(B, [9; 32]).unwrap();
+        assert!(
+            book.kem_pk_for(B).is_none(),
+            "other keys than the request's"
+        );
+        // Only an identity already in the request set is noted.
+        book.note_request_kem("cc".repeat(32).as_str(), &[3; 32], &[7; KEM_PK_LEN]);
+        book.pin(&"cc".repeat(32), [3; 32]).unwrap();
+        assert!(book.kem_pk_for(&"cc".repeat(32)).is_none());
     }
 }

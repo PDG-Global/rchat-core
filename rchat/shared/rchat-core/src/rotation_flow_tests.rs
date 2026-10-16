@@ -44,7 +44,7 @@ fn rotated(log: &std::sync::Arc<std::sync::Mutex<Vec<Ev>>>) -> Vec<(String, Stri
         .unwrap()
         .iter()
         .filter_map(|e| match e {
-            Ev::Rotated(o, n, _, v) => Some((o.clone(), n.clone(), *v)),
+            Ev::Rotated(o, n, _, _, v) => Some((o.clone(), n.clone(), *v)),
             _ => None,
         })
         .collect()
@@ -65,9 +65,7 @@ fn kr3_knock_with_valid_chain_repins_silently() {
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
     let me = peer(0xB2);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     feed(
         &mut b,
         queued(knock_from_rotating(
@@ -97,9 +95,7 @@ fn kr4_forged_chain_is_a_request() {
     let (old, new, stranger) = (peer(0xA1), peer(0xA9), peer(0xC5));
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     let forged = RotationBlock {
         current_version: 1,
         links: vec![sign_link(
@@ -129,9 +125,7 @@ fn kr5_replayed_or_stale_link_is_ignored() {
     let (old, new) = (peer(0xA1), peer(0xA9));
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     b.peers.set_pin_version(&old.hex, 1);
     feed(
         &mut b,
@@ -225,9 +219,7 @@ fn kr11_mismatch_blocks_silent_rotation() {
     let (old, new) = (peer(0xA1), peer(0xA9));
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     b.peers.mark_mismatch(&old.hex);
     feed(
         &mut b,
@@ -270,9 +262,7 @@ fn kr13_refusals_and_block_propagation() {
     // Already requested.
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     b.peers.note_request(&new.hex, None, now_hour());
     feed(
         &mut b,
@@ -287,9 +277,7 @@ fn kr13_refusals_and_block_propagation() {
     // Agreement key pinned elsewhere.
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     b.peers
         .pin(&peer(0xC7).hex, new.bundle.identity_agreement_key)
         .unwrap();
@@ -338,9 +326,7 @@ fn kr7_rate_limits() {
     let (old, mid, new) = (peer(0xA1), peer(0xA8), peer(0xA9));
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&old.hex, old.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&old).unwrap();
     feed(
         &mut b,
         queued(knock_from_rotating(
@@ -398,9 +384,7 @@ fn kr8_no_relay_handover_after_rotation() {
     );
     // A pinned contact still knocking on our old identity cannot reach us: it does not open.
     let contact = peer(0xC3);
-    b.peers
-        .pin(&contact.hex, contact.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&contact).unwrap();
     feed(&mut b, queued(knock_from(&contact, &old_me, now_hour())));
     assert!(
         !b.pending_reasks.contains_key(&contact.hex),
@@ -408,7 +392,7 @@ fn kr8_no_relay_handover_after_rotation() {
     );
 }
 
-/// KR9: the largest intro and a 3-link block fit in one 2048-byte knock.
+/// KR9: the largest intro and a 3-link block fit in one 5120-byte knock.
 #[test]
 fn kr9_max_intro_and_full_chain_fit() {
     let (a, b2, c, d) = (peer(0xA1), peer(0xA2), peer(0xA3), peer(0xA4));
@@ -446,14 +430,16 @@ fn kr9_max_intro_and_full_chain_fit() {
         &d.bundle,
         &r.bundle.identity_key,
         &r.bundle.identity_agreement_key,
+        &r.bundle.kem_pk,
         now_hour(),
         Some(&intro),
         Some(&blk),
+        false,
     )
     .unwrap();
     assert_eq!(k.len(), sealed::KNOCK_PAYLOAD_LEN);
-    let opened = sealed::open(&r.bundle.identity_key, r.id.agreement_secret(), &k).unwrap();
-    let parsed = knock::parse_knock(&r.id, &opened, now_hour(), 72, true).unwrap();
+    let opened = sealed::open_knock(r.id.agreement_secret(), r.id.kem(), &k).unwrap();
+    let parsed = knock::parse_knock(&r.id, opened, now_hour(), 72, true).unwrap();
     assert_eq!(parsed.intro.unwrap().text.len(), MAX_INTRO_BYTES);
     assert_eq!(parsed.rotation, Some(blk));
 }
@@ -468,12 +454,8 @@ fn kr14_unreached_set_quota_and_reach() {
         ..rotated_config(&old_me, &new_me, 1)
     };
     let (mut a, mut rx) = published_with_config(0xA9, cfg);
-    a.peers
-        .pin(&b_peer.hex, b_peer.bundle.identity_agreement_key)
-        .unwrap();
-    a.peers
-        .pin(&c_peer.hex, c_peer.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&b_peer).unwrap();
+    a.peers.pin_card(&c_peer).unwrap();
     a.after_publish_ok(Instant::now());
     assert!(
         a.pending_reasks.contains_key(&b_peer.hex),
@@ -484,9 +466,8 @@ fn kr14_unreached_set_quota_and_reach() {
         "only unreached peers"
     );
     let tail_of = |knock: &[u8], to: &Peer| {
-        let opened =
-            sealed::open(&to.bundle.identity_key, to.id.agreement_secret(), knock).unwrap();
-        knock::parse_knock(&to.id, &opened, now_hour(), 72, true)
+        let opened = sealed::open_knock(to.id.agreement_secret(), to.id.kem(), knock).unwrap();
+        knock::parse_knock(&to.id, opened, now_hour(), 72, true)
             .unwrap()
             .rotation
     };
@@ -772,7 +753,11 @@ fn own_rotation_api() {
         Err(RChatError::NoPinnedKeys { .. })
     ));
     client
-        .pin_peer_key(c.hex.clone(), hex::encode(c.bundle.identity_agreement_key))
+        .pin_peer_key(
+            c.hex.clone(),
+            hex::encode(c.bundle.identity_agreement_key),
+            None,
+        )
         .unwrap();
     client
         .set_peer_key_version(c.hex.to_uppercase(), 3)
@@ -811,9 +796,7 @@ fn foreign_notice_cannot_capture_a_new_identity() {
     // B pins A (0xA1, later Mismatch) and M (established pair, 0xD1).
     let mut p = establish(0xD1, 0xB2);
     let (m, a, a_new) = (p.pa.hex.clone(), peer(0xA1), peer(0xA9));
-    p.b.peers
-        .pin(&a.hex, a.bundle.identity_agreement_key)
-        .unwrap();
+    p.b.peers.pin_card(&a).unwrap();
     p.b.peers.mark_mismatch(&a.hex);
     let mallory = peer(0xD1);
     let capture = block(&mallory, &a_new, 1);
@@ -916,4 +899,51 @@ fn owed_receipts_move_to_the_new_identity() {
         .b
         .pending_receipts
         .contains_key(&(p.pa.hex.clone(), crate::receipts::DELIVERED)));
+}
+
+/// R11 / I-2: a contact's rotation tells the app the new identity's KEM
+/// key (from the bundle it signed) with the new agreement key, so the app
+/// stores both; after a restart, re-pinning them keeps the contact
+/// askable under the new identity.
+#[test]
+fn rotation_reports_the_new_kem_key_and_a_restart_keeps_it_askable() {
+    let (old, new) = (peer(0xA1), peer(0xA9));
+    let (mut b, _rx) = published(0xB2);
+    let log = install_event_log(&mut b);
+    b.peers.pin_card(&old).unwrap();
+    feed(
+        &mut b,
+        queued(knock_from_rotating(
+            &new,
+            &peer(0xB2),
+            now_hour(),
+            &block(&old, &new, 1),
+        )),
+    );
+    let reported: Vec<(String, String, String)> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Rotated(_, n, ak, kem, _) => Some((n.clone(), ak.clone(), kem.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![(
+            new.hex.clone(),
+            hex::encode(new.bundle.identity_agreement_key),
+            hex::encode(&new.bundle.kem_pk[..])
+        )]
+    );
+    drop(b);
+    let (mut b2, mut rx2) = published(0xB2);
+    let (id, ak, kem) = &reported[0];
+    b2.pin_peer(id, ak, Some(kem)).unwrap();
+    b2.ask(id, crate::circuits::AskTrigger::User, Instant::now())
+        .unwrap();
+    assert!(sent_controls(&mut rx2)
+        .iter()
+        .any(|m| matches!(m, ControlMessage::CircuitAsk { .. })));
 }

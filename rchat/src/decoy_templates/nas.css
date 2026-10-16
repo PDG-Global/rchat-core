@@ -1,0 +1,14 @@
+body.nas{background:#f5f6f8}
+.split{display:flex;min-height:100vh}
+.panel{flex:1.05;background:linear-gradient(165deg,#101823,#1b2634);color:#dbe2ea;display:flex;align-items:center;justify-content:center;padding:3rem}
+.panel-inner{width:100%;max-width:330px}
+.panel .brand h1{color:#f3f6f9}
+.tagline{color:#94a1b0;font-size:.9rem;margin-top:.85rem}
+.device{margin-top:2.2rem;border-top:1px solid rgba(255,255,255,.12)}
+.device>div{display:flex;justify-content:space-between;gap:1rem;padding:.7rem 0;border-bottom:1px solid rgba(255,255,255,.12);font-size:.86rem}
+.device dt{color:#8d99a8}
+.device dd{color:#eef2f6;font-weight:500;text-align:right}
+.form-side{flex:1;display:flex;align-items:center;justify-content:center;padding:3rem 1.5rem}
+.form-box{width:100%;max-width:352px}
+.form-box .muted{margin:.45rem 0 1.5rem}
+@media(max-width:760px){.split{flex-direction:column}.panel{flex:none;padding:1rem 1.25rem}.tagline,.device{display:none}}

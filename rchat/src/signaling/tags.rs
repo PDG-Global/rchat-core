@@ -1,4 +1,5 @@
-//! Per-boot keyed tags for identities (spec §5.1).
+//! Per-boot keyed tags for identities (spec §5.1), identity pairs and
+//! blinded pairing tokens (protocol v3 §C.2).
 //!
 //! Relay maps that must find an identity again (its routing slot, its
 //! offline queue) key it by `IdTag = BLAKE3-keyed(ID_KEY, "rchat/id/v1\0" ||
@@ -86,6 +87,33 @@ pub fn pair_tag_with(key: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> PairTag {
 /// This boot's tag for the pair {a, b}.
 pub fn pair_tag(a: &[u8; 32], b: &[u8; 32]) -> PairTag {
     pair_tag_with(pair_key_ref(), a, b)
+}
+
+/// Keyed tag of a blinded pairing token (protocol v3 §C.2). It is
+/// pair-derived: whoever holds the token is one of a pair, so it is never
+/// logged next to an identity-derived value. Keyed with the per-boot pair
+/// key under its own domain, so it is useless outside this process.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlindTag(pub [u8; 32]);
+
+impl fmt::Debug for BlindTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BlindTag(..)")
+    }
+}
+
+/// `blind_tag` under an explicit key:
+/// `BLAKE3-keyed(key, "rchat/blind/v3\0" || token)`.
+pub fn blind_tag_with(key: &[u8; 32], token: &[u8; 32]) -> BlindTag {
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(b"rchat/blind/v3\0");
+    h.update(token);
+    BlindTag(*h.finalize().as_bytes())
+}
+
+/// This boot's tag for a blinded pairing token (keyed with `PAIR_KEY`).
+pub fn blind_tag(token: &[u8; 32]) -> BlindTag {
+    blind_tag_with(pair_key_ref(), token)
 }
 
 #[cfg(test)]

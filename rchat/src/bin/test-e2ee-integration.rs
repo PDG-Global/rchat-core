@@ -1,5 +1,5 @@
 //! In-process protocol-v2 end-to-end scenarios (spec §12.3: E1, E2, E3, E4,
-//! E6). The binary owns the relay process so E2 can restart it.
+//! E6), and E7 (protocol v3 blind re-pair across reconnects). The binary owns the relay process so E2 can restart it.
 //!
 //! cargo run --bin test-e2ee-integration -- \
 //!   --server-bin target/debug/rchat-server --config /tmp/x/server.toml \
@@ -9,7 +9,7 @@
 pub mod harness;
 
 use clap::Parser;
-use harness::{wait_until, Card, Peer};
+use harness::{wait_until, Peer};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -167,6 +167,9 @@ fn main() -> ExitCode {
     run("E3", &e3_offline_delivery);
     run("E4", &e4_requests);
     run("E6", &e6_block_stops_flooding);
+    run("E7", &e7_blind_repair_delivers_once);
+    run("E8", &e8_background_drain);
+    run("E9", &e9_ffi_background_drain);
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
@@ -243,20 +246,41 @@ fn deliver(from: &Peer, to: &Peer, text: &str) -> Result<String, String> {
     Ok(id)
 }
 
-fn reconnect_transport(p: &Peer, peer: &Card) -> Result<(), String> {
+/// Transport down and up again in the same process (sessions kept): the
+/// core's own `after_publish_ok` re-pairs a known contact with a blind ask
+/// under the next token (protocol v3 §C.3). The harness never asks itself:
+/// its ask would race the core's.
+fn bounce_transport(p: &Peer) -> Result<(), String> {
     p.client
         .disconnect_transport_only()
         .map_err(|e| e.to_string())?;
     std::thread::sleep(Duration::from_millis(500));
-    p.start(T)?;
-    // Same process, established session, transport reconnected: the core's
-    // own `after_publish_ok` sends the resume ask and the relay answers
-    // CircuitExists. The harness must not ask again: a resume-less ask that
-    // races CircuitExists makes the relay tear the pair down (spec §6.2
-    // step 2). Wait until the session is live again.
+    p.start(T)
+}
+
+/// Both hold a live session again.
+fn wait_paired(a: &Peer, b: &Peer, what: &str) -> Result<(), String> {
     check(
-        wait_until(T, || p.client.has_session(peer.ik.clone())),
-        &format!("{} did not resume its circuit after reconnecting", p.name),
+        wait_until(T, || {
+            a.client.has_session(b.card.ik.clone()) && b.client.has_session(a.card.ik.clone())
+        }),
+        what,
+    )
+}
+
+/// None of the spec §18 recovery warnings (PeerSessionReset 3,
+/// SessionReplaced 4, DecryptFailed 1, PeerUndelivered 2, ResendEligible
+/// 10): a routine blind re-pair raises none of them.
+fn no_recovery_warnings(p: &Peer) -> Result<(), String> {
+    let raised: Vec<i32> = p.snapshot(|r| {
+        [1, 2, 3, 4, 10]
+            .into_iter()
+            .filter(|k| r.events_of(*k) > 0)
+            .collect()
+    });
+    check(
+        raised.is_empty(),
+        &format!("{} raised recovery warnings {raised:?}", p.name),
     )
 }
 
@@ -303,23 +327,36 @@ fn e2_reconnect_matrix(args: &Args, relay: &mut Relay) -> Result<(), String> {
     pair_up(&a, &b)?;
     let circuits = |p: &Peer, q: &Peer| p.snapshot(|r| r.circuits_with(&q.card.ik));
 
-    // Transport-only reconnects resume the circuit: no new CircuitCreatedV2.
-    reconnect_transport(&a, &b.card)?;
-    std::thread::sleep(Duration::from_secs(2));
+    // Messages both ways first: Bob's answer to Alice's session-init has
+    // reached her, so she may close the first-contact circuit (she leaves
+    // it to the relay's grace while Bob may still await her init there).
+    deliver(&a, &b, "before reconnects a->b")?;
+    deliver(&b, &a, "before reconnects b->a")?;
+    // Protocol v3 §C.3: every transport reconnect re-pairs blind, so each
+    // one makes a new circuit (a new CircuitCreatedV3), never a resume.
+    // Alice alone first: she closes the first-contact identity circuit, Bob
+    // is told and re-asks blind, and the pair re-forms at once.
+    bounce_transport(&a)?;
+    wait_paired(&a, &b, "no blind re-pair after alice's reconnect")?;
     deliver(&a, &b, "after initiator reconnect a->b")?;
     deliver(&b, &a, "after initiator reconnect b->a")?;
-    reconnect_transport(&b, &a.card)?;
-    std::thread::sleep(Duration::from_secs(2));
+    // Bob alone, with a blinded circuit: Alice, who stayed, sends first. The
+    // relay ends the stale blinded row at her packet (ruling R18), she
+    // re-asks blind, and her message is re-sent on the new pair.
+    bounce_transport(&b)?;
     deliver(&a, &b, "after responder reconnect a->b")?;
     deliver(&b, &a, "after responder reconnect b->a")?;
-    reconnect_transport(&a, &b.card)?;
-    reconnect_transport(&b, &a.card)?;
-    std::thread::sleep(Duration::from_secs(2));
+    bounce_transport(&a)?;
+    bounce_transport(&b)?;
+    wait_paired(&a, &b, "no blind re-pair after both reconnected")?;
     deliver(&a, &b, "after both reconnect")?;
+    let (ca, cb) = (circuits(&a, &b), circuits(&b, &a));
     check(
-        circuits(&a, &b) == 1 && circuits(&b, &a) == 1,
-        "a transport reconnect created a new circuit instead of resuming",
+        ca == 4 && cb == 4,
+        &format!("each transport reconnect re-pairs once (1 + 3 circuits): {ca}, {cb}"),
     )?;
+    no_recovery_warnings(&a)?;
+    no_recovery_warnings(&b)?;
 
     // Relay restart: all relay state is gone. After republishing, each core
     // asks on its own (`after_publish_ok`, resume naming a circuit the new
@@ -333,15 +370,16 @@ fn e2_reconnect_matrix(args: &Args, relay: &mut Relay) -> Result<(), String> {
         "clients did not republish after the relay restart",
     )?;
     check(
-        wait_until(T, || circuits(&a, &b) == 2 && circuits(&b, &a) == 2),
+        wait_until(T, || circuits(&a, &b) == 5 && circuits(&b, &a) == 5),
         "no new circuit after relay restart",
     )?;
     deliver(&a, &b, "after relay restart")?;
 
-    // App restart of alice: a new process has no session, so its ask carries
-    // no resume; the relay tears the pair down (bob gets CircuitClosed) and
-    // bob's core re-asks, so a new pair forms. Counted per identity:
-    // 1 original + 1 after relay restart + 1 now = 3.
+    // App restart of alice: a new process has no session, so she asks on
+    // the identity path and her knock reaches bob; bob's live blinded
+    // circuit is one she no longer uses, so bob closes it and answers on
+    // the identity path (Task 9), and a new pair forms. Counted per
+    // identity: 5 so far + 1 now = 6.
     let _ = a.client.disconnect();
     drop(a);
     let a2 = peer_with_seed(args, "alice", &a_seed)?;
@@ -350,7 +388,7 @@ fn e2_reconnect_matrix(args: &Args, relay: &mut Relay) -> Result<(), String> {
     a2.ask(&b.card)?;
     check(
         wait_until(T, || {
-            circuits(&b, &a2) == 3 && a2.client.has_session(b.card.ik.clone())
+            circuits(&b, &a2) == 6 && a2.client.has_session(b.card.ik.clone())
         }),
         "no teardown and re-ask after alice's app restart",
     )?;
@@ -436,7 +474,11 @@ fn e4_requests(args: &Args, _relay: &mut Relay) -> Result<(), String> {
         "intro id changed in transit",
     )?;
     b.client
-        .pin_peer_key(req.identity_hex.clone(), req.agreement_hex.clone())
+        .pin_peer_key(
+            req.identity_hex.clone(),
+            req.agreement_hex.clone(),
+            Some(req.kem_hex.clone()),
+        )
         .map_err(|e| e.to_string())?;
     b.client
         .mark_message_seen(req.identity_hex.clone(), req.intro_message_id_hex.clone())
@@ -506,8 +548,15 @@ fn e6_block_stops_flooding(args: &Args, _relay: &mut Relay) -> Result<(), String
     // `a8_member_close_tears_down_the_whole_pair` (Task 7). Here we assert
     // the end-to-end consequence: the send fails, and the relay never
     // acknowledges (so never queued) anything from alice after the block.
+    // Protocol v3 (R21): alice's core re-pairs blind after the close, and
+    // a send meanwhile is parked on her session (Ok), not refused; it never
+    // leaves her device while bob blocks her (no pair forms), as checked
+    // below.
     let sent = a.send(&b.card, "after block");
-    check(sent.is_err(), "a send succeeded after the block")?;
+    check(
+        sent.is_ok(),
+        &format!("the send after the block was not parked: {sent:?}"),
+    )?;
     // Alice's core re-asks (she still pins bob): only knocks, which bob drops.
     std::thread::sleep(Duration::from_secs(5));
     check(
@@ -519,10 +568,284 @@ fn e6_block_stops_flooding(args: &Args, _relay: &mut Relay) -> Result<(), String
         "blocked alice's knock surfaced",
     )?;
     // Nothing was queued for bob either: reconnecting delivers nothing.
-    reconnect_transport(&b, &a.card).ok();
+    bounce_transport(&b).ok();
     std::thread::sleep(Duration::from_secs(3));
     check(
         b.snapshot(|r| r.texts_from(&a.card.ik).len()) == before,
         "a message from blocked alice reached bob",
     )
+}
+
+/// E7 (protocol v3 §C.3, Task 9): a message sent across a reconnect is
+/// delivered exactly once while the pair re-pairs blind, with none of the
+/// §18 recovery warnings: Bob's transport is down while Alice sends (the
+/// relay queues it under Bob's blinded pair, R15); Bob comes back, gets it
+/// once, and the pair re-pairs blind; then both reconnect once more.
+fn e7_blind_repair_delivers_once(args: &Args, _relay: &mut Relay) -> Result<(), String> {
+    let a = peer(args, "alice")?;
+    let b = peer(args, "bob")?;
+    pair_up(&a, &b)?;
+    // Both reconnect: the first blind pair.
+    bounce_transport(&a)?;
+    bounce_transport(&b)?;
+    wait_paired(&a, &b, "no blind pair after both reconnected")?;
+    let before = a.snapshot(|r| r.circuits_with(&b.card.ik));
+
+    b.client
+        .disconnect_transport_only()
+        .map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(500));
+    a.send(&b.card, "across bob's reconnect")?;
+    std::thread::sleep(Duration::from_millis(500));
+    b.start(T)?;
+    check(
+        b.wait(T, |r| {
+            r.texts_from(&a.card.ik)
+                .iter()
+                .any(|t| t == "across bob's reconnect")
+        }),
+        "bob never received the message sent across his reconnect",
+    )?;
+    deliver(&a, &b, "after bob's reconnect a->b")?;
+    deliver(&b, &a, "after bob's reconnect b->a")?;
+
+    // Both away and back: the pair re-pairs blind again.
+    bounce_transport(&a)?;
+    bounce_transport(&b)?;
+    wait_paired(&a, &b, "no blind re-pair after both reconnected")?;
+    deliver(&a, &b, "after both reconnects a->b")?;
+    deliver(&b, &a, "after both reconnects b->a")?;
+    std::thread::sleep(Duration::from_secs(2));
+    for text in ["across bob's reconnect", "after bob's reconnect a->b"] {
+        let copies = b.snapshot(|r| {
+            r.texts_from(&a.card.ik)
+                .iter()
+                .filter(|t| *t == text)
+                .count()
+        });
+        check(copies == 1, &format!("{text:?} arrived {copies} times"))?;
+    }
+    let after = a.snapshot(|r| r.circuits_with(&b.card.ik));
+    check(after >= before + 2, "the reconnects re-paired")?;
+    no_recovery_warnings(&a)?;
+    no_recovery_warnings(&b)
+}
+
+/// E8 (protocol v3 §H.1): a background drain over a real relay. Bob goes
+/// offline and Alice's message waits in the relay's queue; Bob's drain
+/// connects, publishes, takes it and has it stored (the recorder marks it
+/// seen) before returning. It forms no circuit (Alice sees none) and sends
+/// no receipt; the receipt reaches Alice at Bob's next foreground connect.
+fn e8_background_drain(args: &Args, _relay: &mut Relay) -> Result<(), String> {
+    let a = peer(args, "alice")?;
+    let b = peer(args, "bob")?;
+    pair_up(&a, &b)?;
+    b.client
+        .disconnect_transport_only()
+        .map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_secs(1));
+    let text = "drained in the background";
+    let id = a.send(&b.card, text)?;
+    check(
+        a.wait(T, |r| r.acks.contains(&id)),
+        "relay did not acknowledge the queued message",
+    )?;
+    let circuits_before = a.snapshot(|r| r.circuits_with(&b.card.ik));
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let n = b
+        .client
+        .background_drain(Duration::from_secs(20), &cancel)
+        .map_err(|e| format!("drain: {e}"))?;
+    check(n == 1, &format!("drain handed over {n} items, not 1"))?;
+    check(
+        b.snapshot(|r| r.texts_from(&a.card.ik).iter().any(|t| t == text)),
+        "the message was not stored before the drain returned",
+    )?;
+    check(
+        !b.client.is_key_bundle_published(),
+        "the drain left its connection up",
+    )?;
+    std::thread::sleep(Duration::from_secs(4));
+    check(
+        a.snapshot(|r| r.circuits_with(&b.card.ik)) == circuits_before,
+        "a background drain formed a circuit",
+    )?;
+    check(
+        !a.snapshot(|r| r.has_receipt(&id, 1)),
+        "a background drain sent a receipt",
+    )?;
+    // The next foreground connection re-pairs and delivers the receipt.
+    b.start(T)?;
+    check(
+        a.wait(T, |r| r.has_receipt(&id, 1)),
+        "the receipt never reached Alice after the foreground connect",
+    )
+}
+
+// --- E9: the C FFI drain (R34 M-8) -----------------------------------------
+
+use rchat_core::ffi as cffi;
+use std::ffi::{c_char, c_int, CStr, CString};
+use std::sync::Mutex;
+
+/// What the FFI callbacks saw: message ids stored, requests.
+static E9_SEEN: Mutex<(Vec<String>, usize)> = Mutex::new((Vec::new(), 0));
+
+fn cstr(p: *const c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+extern "C" fn e9_message(
+    sender: *const c_char,
+    _t: *const c_char,
+    _ts: u64,
+    id: *const c_char,
+    _k: c_int,
+    _e: u32,
+) {
+    let (sender_c, id_c) = (
+        CString::new(cstr(sender)).unwrap(),
+        CString::new(cstr(id)).unwrap(),
+    );
+    // "Stored": confirmed to the core, as the app does (D36).
+    unsafe { cffi::rchat_mark_message_seen(sender_c.as_ptr(), id_c.as_ptr()) };
+    E9_SEEN.lock().unwrap().0.push(cstr(id));
+}
+extern "C" fn e9_state(_: c_int) {}
+extern "C" fn e9_error(_: *const c_char) {}
+extern "C" fn e9_circuit(_: *const c_char, _: c_int) {}
+extern "C" fn e9_delivered(_: *const c_char) {}
+extern "C" fn e9_reconnect() {}
+extern "C" fn e9_key(_: *const c_char, _: c_int, _: *const c_char) {}
+#[allow(clippy::too_many_arguments)]
+extern "C" fn e9_request(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u64,
+    _: *const c_char,
+    _: *const c_char,
+    _: u64,
+    _: u32,
+) {
+    E9_SEEN.lock().unwrap().1 += 1;
+}
+extern "C" fn e9_receipt(_: *const c_char, _: *const c_char, _: c_int) {}
+extern "C" fn e9_rotated(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u32,
+) {
+}
+extern "C" fn e9_status(_: c_int, _: *const c_char, _: *const c_char, _: c_int) {}
+#[allow(clippy::too_many_arguments)]
+extern "C" fn e9_file(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u32,
+    _: *const u8,
+    _: usize,
+    _: u64,
+) {
+}
+extern "C" fn e9_timer(_: *const c_char, _: u32, _: u64, _: c_int) {}
+
+/// E9 (protocol v3 §H.1, R34 M-8): `rchat_background_drain` itself, against
+/// the real relay. Bob has never connected; Alice asks him (a one-sided
+/// ask, so the relay queues her knock). Bob's first drain builds, installs
+/// and connects a new client, hands the request over and returns 1, ended
+/// by the relay's marker. A second drain reuses the kept client and ends at
+/// the marker at once (0 items), well before the no-marker fallback.
+fn e9_ffi_background_drain(args: &Args, _relay: &mut Relay) -> Result<(), String> {
+    let a = peer(args, "alice")?;
+    let bob_seed_text = seed("bob-ffi");
+    let bob_card = peer_with_seed(args, "bob", &bob_seed_text)?.card;
+    a.pin(&bob_card)?;
+    a.start(T)?;
+    a.ask(&bob_card)?;
+    std::thread::sleep(Duration::from_millis(500));
+    check(cffi::rchat_initialize() == 0, "rchat_initialize")?;
+    let registered = cffi::rchat_register_callbacks(
+        Some(e9_message),
+        Some(e9_state),
+        Some(e9_error),
+        Some(e9_circuit),
+        Some(e9_delivered),
+        Some(e9_reconnect),
+        Some(e9_key),
+        Some(e9_request),
+        Some(e9_receipt),
+        Some(e9_rotated),
+        Some(e9_status),
+        Some(e9_file),
+        Some(e9_timer),
+    );
+    check(registered == 0, "rchat_register_callbacks")?;
+    let config = CString::new(format!(
+        r#"{{"server_url":"{}","dev_origin":"{}","connection_timeout_secs":10,
+        "reconnect_max_attempts":1,"message_retry_count":0,
+        "enable_delivery_confirmation":true,"keepalive_interval_secs":30,"tls_fingerprint":"None"}}"#,
+        harness::ws_url(&args.server),
+        args.origin
+    ))
+    .unwrap();
+    let seed_bytes = harness::derive_seed(&bob_seed_text);
+    let started = std::time::Instant::now();
+    let n = unsafe {
+        cffi::rchat_background_drain(
+            config.as_ptr(),
+            seed_bytes.as_ptr(),
+            seed_bytes.len(),
+            20_000,
+        )
+    };
+    check(
+        n == 1,
+        &format!("the first drain returned {n}, not 1 (the request)"),
+    )?;
+    check(
+        E9_SEEN.lock().unwrap().1 == 1,
+        "the request reached the callbacks",
+    )?;
+    check(
+        started.elapsed() < Duration::from_secs(6),
+        &format!(
+            "ended by the marker, not the fallback: {:?}",
+            started.elapsed()
+        ),
+    )?;
+    let again = std::time::Instant::now();
+    let n2 = unsafe {
+        cffi::rchat_background_drain(
+            config.as_ptr(),
+            seed_bytes.as_ptr(),
+            seed_bytes.len(),
+            20_000,
+        )
+    };
+    check(n2 == 0, &format!("the second drain returned {n2}"))?;
+    check(
+        again.elapsed() < Duration::from_secs(4),
+        &format!(
+            "the kept client's drain ended at the marker: {:?}",
+            again.elapsed()
+        ),
+    )?;
+    // The lock is free: a foreground connect goes ahead at once.
+    let connected = unsafe {
+        cffi::rchat_connect_with_seed(config.as_ptr(), seed_bytes.as_ptr(), seed_bytes.len())
+    };
+    check(
+        connected == 0,
+        &format!("foreground connect after the drains: {connected}"),
+    )?;
+    cffi::rchat_disconnect();
+    Ok(())
 }

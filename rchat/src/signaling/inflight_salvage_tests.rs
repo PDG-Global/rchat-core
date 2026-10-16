@@ -303,3 +303,92 @@ async fn a_requeued_record_keeps_its_first_store_time_and_still_expires() {
     );
     assert_eq!(state.offline_budget.used(), 0);
 }
+
+/// Final review L3: salvage weighs each record against the R26 steady-size
+/// sub-cap, but a salvaged record was already acknowledged to its sender,
+/// so one over the sub-cap is kept, never dropped silently (the queue's
+/// byte and count caps still apply). New steady-sized records are still
+/// refused while the queue is over the sub-cap.
+#[tokio::test]
+async fn salvaged_steady_sized_records_over_the_sub_cap_are_kept() {
+    let server = Server::new(test_config()).await.unwrap();
+    let state = server.state();
+    let r = TestIdentity::random();
+    let tag = tags::id_tag(&r.bytes);
+    let cap = limits::OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT;
+    for i in 0..cap {
+        queue_test_message(&state, &r, payload(limits::STEADY_SEALED_LEN, i as u8));
+    }
+    let salvaged = [
+        payload(limits::STEADY_SEALED_LEN, 0xE1),
+        payload(limits::STEADY_SEALED_LEN, 0xE2),
+    ];
+    let before = metrics::SALVAGED_OVER_STEADY_SUBCAP.get();
+    salvage_records(&state, tag, &salvaged).await;
+    assert!(
+        metrics::SALVAGED_OVER_STEADY_SUBCAP.get() >= before + 2,
+        "counted"
+    );
+    let q = queued(&state, &r);
+    assert_eq!(q.len(), cap + 2, "both kept over the sub-cap");
+    assert_eq!(&q[..2], &salvaged[..], "at the front, older first");
+    // R26 still holds for new records.
+    let guard = pair_lock::ID_LOCKS.lock(tag).await;
+    assert!(!store_offline(
+        tag,
+        payload(limits::STEADY_SEALED_LEN, 0xE3),
+        &state
+    ));
+    assert!(store_offline(tag, payload(300, 0xE4), &state));
+    drop(guard);
+}
+
+/// Salvage `payloads` as the unsent remainder of a closed connection of
+/// `tag`'s identity.
+async fn salvage_records(state: &RelayState, tag: tags::IdTag, payloads: &[Vec<u8>]) {
+    let (old_tx, old_rx, _kill) = limits::ConnTx::channel();
+    for p in payloads {
+        old_tx
+            .send(FrameBuilder::queued_message(p.clone()).encode())
+            .unwrap();
+    }
+    salvage_unsent(None, old_rx, tag, state).await;
+}
+
+/// Final review L5: records salvaged from a closed connection are handed
+/// over at once only to a connection of the identity that has asked (its
+/// foreground connection). A background drain that already read its
+/// `QueueHandedOver` marker may be closing; written to it, a record could
+/// be accepted by its socket and never read. They wait in the queue
+/// instead, for the next publish or the first ask; the same for a record
+/// re-queued after a failed D34 hand-over.
+#[tokio::test]
+async fn salvaged_records_go_only_to_a_connection_that_has_asked() {
+    let server = Server::new(test_config()).await.unwrap();
+    let state = server.state();
+    let r = TestIdentity::random();
+    let tag = tags::id_tag(&r.bytes);
+    let (client, mut rx) = proven_bare(&state, &r, None);
+    salvage_records(&state, tag, &[payload(300, 1)]).await;
+    assert_eq!(queued(&state, &r), vec![payload(300, 1)], "kept queued");
+    assert!(rx.try_recv().is_err(), "nothing handed to the drain");
+    let _ = requeue_after_failed_forward(tag, payload(300, 2), &state).await;
+    assert_eq!(queued(&state, &r).len(), 2, "kept queued");
+    assert!(rx.try_recv().is_err());
+
+    state.connections.get_mut(&client).unwrap().has_asked = true;
+    salvage_records(&state, tag, &[payload(300, 3)]).await;
+    assert!(queued(&state, &r).is_empty(), "handed to the foreground");
+    let mut got = 0;
+    while rx.try_recv().is_ok() {
+        got += 1;
+    }
+    assert_eq!(got, 3);
+    let _ = requeue_after_failed_forward(tag, payload(300, 4), &state).await;
+    assert!(queued(&state, &r).is_empty());
+    // That hand-over runs on a task of its own.
+    let handed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("handed over");
+    assert!(handed.is_some());
+}

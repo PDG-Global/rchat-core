@@ -224,15 +224,19 @@ fn sweep_removes_expired_and_orphaned_asks_and_pairs_without_circuits() {
     let peer = PeerBundle {
         identity_key: vec![0; 32],
         identity_agreement_key: vec![0; 32],
-        signed_pre_key: vec![0; 32],
+        kem_pk: vec![0; 1184],
         bundle_signature: vec![0; 64],
     };
     let pending = |asker, at, n: u8| PendingAsk {
         asker,
         asker_tag: IdTag([n; 32]),
-        target_tag: IdTag([n.wrapping_add(1); 32]),
-        asker_bundle: peer.clone(),
+        target_tag: Some(IdTag([n.wrapping_add(1); 32])),
+        asker_bundle: std::sync::Arc::new(peer.clone()),
         ephemeral: [0; 32],
+        kem_ephemeral: Box::new(crate::signaling::circuits::AskEphemerals {
+            kem: [0; crate::validate::KEM_PK_BYTES],
+            sig: [0; crate::validate::ASK_EPH_SIG_BYTES],
+        }),
         knocks_delivered: 1,
         at,
         source: None,
@@ -261,7 +265,7 @@ fn sweep_removes_expired_and_orphaned_asks_and_pairs_without_circuits() {
             tag_b: IdTag([8; 32]),
             token_a: token(ca),
             token_b: token(cb),
-            pair: PairTag([4; 32]),
+            pair: PairKey::Identity(PairTag([4; 32])),
             peer_circuit: cb,
         },
     );
@@ -303,7 +307,7 @@ fn sweep_asks_count_survives_concurrent_inserts() {
     let peer = PeerBundle {
         identity_key: vec![0; 32],
         identity_agreement_key: vec![0; 32],
-        signed_pre_key: vec![0; 32],
+        kem_pk: vec![0; 1184],
         bundle_signature: vec![0; 64],
     };
     let live: std::collections::HashSet<ClientId> = [ClientId::generate()].into();
@@ -318,9 +322,13 @@ fn sweep_asks_count_survives_concurrent_inserts() {
                 PendingAsk {
                     asker,
                     asker_tag: IdTag(k),
-                    target_tag: IdTag(k),
-                    asker_bundle: peer.clone(),
+                    target_tag: Some(IdTag(k)),
+                    asker_bundle: std::sync::Arc::new(peer.clone()),
                     ephemeral: [0; 32],
+                    kem_ephemeral: Box::new(crate::signaling::circuits::AskEphemerals {
+                        kem: [0; crate::validate::KEM_PK_BYTES],
+                        sig: [0; crate::validate::ASK_EPH_SIG_BYTES],
+                    }),
                     knocks_delivered: 1,
                     at: Instant::now(),
                     source: None,

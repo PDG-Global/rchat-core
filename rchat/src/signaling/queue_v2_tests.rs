@@ -136,6 +136,8 @@ fn knock_ttl_hours_follow_the_offline_queue_ttl() {
     assert_eq!(key_auth::knock_ttl_hours(&config), 72);
     config.offline_queue.ttl_secs = 3_600;
     assert_eq!(key_auth::knock_ttl_hours(&config), 1);
+    // Defence in depth: `validate` refuses a TTL over 72 h (R33 M-6), but
+    // the knock cap must hold even for a config built without it.
     config.offline_queue.ttl_secs = 604_800;
     assert_eq!(
         key_auth::knock_ttl_hours(&config),
@@ -261,6 +263,9 @@ fn p3_plaintext_queue_persistence_code_is_gone() {
 #[tokio::test]
 async fn knock_flood_leaves_the_message_budget_untouched_and_expires_at_the_knock_ttl() {
     let mut config = test_config();
+    // Defence in depth: `validate` refuses a TTL over 72 h (R33 M-6); this
+    // config is built without it to show knocks still expire at their own
+    // 72 h cap whatever the message TTL.
     config.offline_queue.ttl_secs = 604_800;
     config.offline_queue.knock_budget_bytes = 64 * validate::KNOCK_BYTES;
     let server = Server::new(config).await.unwrap();
@@ -284,7 +289,7 @@ async fn knock_flood_leaves_the_message_budget_untouched_and_expires_at_the_knoc
     for i in 0..1_000u32 {
         let target = tags::id_tag(&targets[(i % 3) as usize].bytes);
         let mut knock = vec![(i % 251) as u8; validate::KNOCK_BYTES];
-        knock[0] = validate::SEALED_V2;
+        knock[0] = validate::KNOCK_VERSION;
         circuits::deliver_knock(target, PairTag(rand::random()), knock, None, &state);
     }
     let after: Vec<(usize, usize)> = targets.iter().map(charge).collect();

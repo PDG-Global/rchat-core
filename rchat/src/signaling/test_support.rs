@@ -131,17 +131,17 @@ pub(super) fn hello_message(versions: Vec<u32>) -> Message {
     .encode()
 }
 
-/// Say hello (v2) and return the relay's auth challenge.
+/// Say hello (v3) and return the relay's auth challenge.
 pub(super) async fn hello<S>(ws: &mut WebSocketStream<S>) -> [u8; 32]
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ws.send(hello_message(vec![2])).await.expect("send hello");
+    ws.send(hello_message(vec![3])).await.expect("send hello");
     let reply = next_signaling(ws, MSG_TYPE_HELLO_RESPONSE, Duration::from_secs(5))
         .await
         .expect("hello_response");
     let p: HelloResponsePayload = reply.payload.deserialize_data().expect("hello payload");
-    assert_eq!(p.selected_version, 2);
+    assert_eq!(p.selected_version, 3);
     let challenge = hex::decode(p.auth_challenge.expect("auth_challenge")).expect("hex");
     challenge.try_into().expect("32-byte challenge")
 }
@@ -151,8 +151,11 @@ pub(super) fn key_bundle_of(id: &TestIdentity) -> KeyBundle {
     KeyBundle {
         identity_key: id.hex.clone(),
         identity_agreement_key: hex::encode(id.bundle.identity_agreement_key),
-        signed_pre_key: hex::encode(id.bundle.signed_pre_key),
-        signed_pre_key_signature: hex::encode(id.bundle.bundle_signature),
+        kem_pk: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &id.bundle.kem_pk[..],
+        ),
+        bundle_signature: hex::encode(id.bundle.bundle_signature),
         one_time_pre_keys: Vec::new(),
     }
 }
@@ -287,7 +290,11 @@ where
         match tokio::time::timeout(wait, ws.next()).await {
             Ok(Some(Ok(m))) => {
                 if let Ok(UnifiedFrame::Control(c)) = UnifiedFrame::decode(&m) {
-                    return Some(c);
+                    // The queue-handed-over marker follows every publish
+                    // (R34a); tests that look for it read raw frames.
+                    if !matches!(c, ControlMessage::QueueHandedOver { .. }) {
+                        return Some(c);
+                    }
                 }
             }
             _ => return None,
@@ -307,10 +314,19 @@ where
     while let Ok(Some(Ok(m))) = tokio::time::timeout(quiet, ws.next()).await {
         match UnifiedFrame::decode(&m) {
             Ok(UnifiedFrame::Keepalive(_)) | Err(_) => {}
+            Ok(frame) if is_marker(&frame) => {}
             Ok(frame) => frames.push(frame),
         }
     }
     frames
+}
+
+/// The queue-handed-over marker every publish ends with (R34a).
+pub(super) fn is_marker(frame: &UnifiedFrame) -> bool {
+    matches!(
+        frame,
+        UnifiedFrame::Control(ControlMessage::QueueHandedOver { .. })
+    )
 }
 
 /// Every non-keepalive frame until the relay closes the connection; panics
@@ -330,6 +346,7 @@ where
             Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return frames,
             Ok(Some(Ok(m))) => match UnifiedFrame::decode(&m) {
                 Ok(UnifiedFrame::Keepalive(_)) | Err(_) => {}
+                Ok(frame) if is_marker(&frame) => {}
                 Ok(frame) => frames.push(frame),
             },
         }
@@ -363,10 +380,10 @@ pub(super) fn signaling_error_code(frames: &[UnifiedFrame]) -> Option<String> {
     })
 }
 
-/// A 2048-byte sealed-v2-shaped knock (the relay never opens it).
+/// A `KNOCK_BYTES` (5120) knock-v3-shaped knock (the relay never opens it).
 pub(super) fn knock(fill: u8) -> Vec<u8> {
-    let mut k = vec![fill; 2048];
-    k[0] = 0x02;
+    let mut k = vec![fill; crate::validate::KNOCK_BYTES];
+    k[0] = crate::validate::KNOCK_VERSION;
     k
 }
 
@@ -422,6 +439,9 @@ pub(super) fn bare_connection(
             closing: false,
             auth_budget: crate::limits::AuthBudget::new(Instant::now()),
             source: None,
+            has_asked: false,
+            blind_ask_bucket: None,
+            peer_bundle: None,
         },
         rx,
     )
@@ -479,14 +499,56 @@ pub(super) fn mapped_client(state: &RelayState, id: &TestIdentity) -> Option<Cli
     state.identity_to_client.get(&id_tag(&id.bytes)).map(|c| *c)
 }
 
-/// `CircuitAsk` for `target` with a filler knock.
+/// The test ML-KEM-768 ephemeral of an ask whose X25519 ephemeral is `ek`:
+/// `ek` repeated 37 times (exactly 1184 bytes), so a test can tell which
+/// ask a forwarded KEM ephemeral came from. The relay checks only its size.
+pub(super) fn kem_for(ek: [u8; 32]) -> Box<circuits::AskEphemerals> {
+    let v = ek.repeat(crate::validate::KEM_PK_BYTES / 32);
+    Box::new(circuits::AskEphemerals {
+        kem: v.try_into().expect("1184 bytes"),
+        sig: sig_for(ek),
+    })
+}
+
+/// A stand-in ephemeral signature derived from `ek` (the relay never
+/// verifies it, R7): 64 bytes, distinct per ask.
+pub(super) fn sig_for(ek: [u8; 32]) -> [u8; crate::validate::ASK_EPH_SIG_BYTES] {
+    let mut s = [0u8; 64];
+    s[..32].copy_from_slice(&ek);
+    s[32..].copy_from_slice(&ek);
+    s[0] ^= 0x5a;
+    s
+}
+
+/// The all-zero resume id a client sends when it resumes nothing (the
+/// relay refuses an ask whose `resume_circuit` is `None`, §C.2).
+pub(super) const NO_RESUME: CircuitId = CircuitId([0; 16]);
+
+/// `CircuitAsk` for `target` with a filler knock (KEM ephemeral
+/// `kem_for(ek)`). `None` is sent as `Some(NO_RESUME)`, as the core does.
 pub(super) fn ask(target: &TestIdentity, ek: [u8; 32], resume: Option<CircuitId>) -> Message {
-    FrameBuilder::circuit_ask(target.bytes.to_vec(), ek.to_vec(), knock(0x5a), resume).encode()
+    FrameBuilder::circuit_ask(
+        target.bytes.to_vec(),
+        ek.to_vec(),
+        kem_for(ek).kem.to_vec(),
+        sig_for(ek).to_vec(),
+        knock(0x5a),
+        Some(resume.unwrap_or(NO_RESUME)),
+    )
+    .encode()
 }
 
 /// `CircuitAsk` for `target` carrying `knock`.
 pub(super) fn ask_with_knock(target: &TestIdentity, ek: [u8; 32], knock: Vec<u8>) -> Message {
-    FrameBuilder::circuit_ask(target.bytes.to_vec(), ek.to_vec(), knock, None).encode()
+    FrameBuilder::circuit_ask(
+        target.bytes.to_vec(),
+        ek.to_vec(),
+        kem_for(ek).kem.to_vec(),
+        sig_for(ek).to_vec(),
+        knock,
+        Some(NO_RESUME),
+    )
+    .encode()
 }
 
 /// `asker` asks `target` on `ws` (ephemeral key `ek`) and returns once the
@@ -515,7 +577,7 @@ pub(super) async fn ask_held<S>(
 
 /// Pair two clients: `a` (on `wa`) asks `b`, and `b` (on `wb`) asks back
 /// once the relay holds `a`'s ask, so `a` is the initiator (role 0). The
-/// two `CircuitCreatedV2` frames are left for the caller to read.
+/// two `CircuitCreatedV3` frames are left for the caller to read.
 pub(super) async fn ask_each_other<S>(
     state: &RelayState,
     wa: &mut WebSocketStream<S>,
@@ -531,7 +593,7 @@ pub(super) async fn ask_each_other<S>(
 
 /// Test-only verifier: the TLS relays here use throwaway self-signed certs.
 #[derive(Debug)]
-pub(super) struct AcceptAnyCert(Arc<CryptoProvider>);
+pub(super) struct AcceptAnyCert(pub(super) Arc<CryptoProvider>);
 
 impl ServerCertVerifier for AcceptAnyCert {
     fn verify_server_cert(
@@ -590,10 +652,7 @@ pub(super) async fn tls_relay_with(
     let mut config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         max_connections_per_ip: 0,
-        tls: Some(crate::config::TlsConfig {
-            cert_path,
-            key_path,
-        }),
+        tls: Some(crate::config::TlsConfig::static_cert(cert_path, key_path)),
         ..ServerConfig::default()
     };
     adjust(&mut config);
@@ -655,7 +714,7 @@ pub(super) fn proven_bare(
     tokio::sync::mpsc::Receiver<crate::limits::Outbound>,
 ) {
     let (mut conn, rx) = bare_connection([0u8; 32]);
-    conn.protocol_version = 2;
+    conn.protocol_version = crate::protocol::PROTOCOL_VERSION;
     conn.proven_identity = Some(id.bytes);
     conn.key_bundle = Some(key_bundle_of(id));
     conn.identity_key = Some(id.hex.clone());
@@ -674,21 +733,30 @@ pub(super) fn source_key(n: u8) -> crate::limits::SourceKey {
 
 /// `caller` asks for a circuit with `target` through the real handler.
 pub(super) async fn ask_direct(state: &RelayState, caller: ClientId, target: &TestIdentity) {
-    circuits::handle_circuit_ask(caller, target.bytes, [7; 32], knock(0x5a), None, state).await;
+    circuits::handle_circuit_ask(
+        caller,
+        target.bytes,
+        [7; 32],
+        kem_for([7; 32]),
+        knock(0x5a),
+        None,
+        state,
+    )
+    .await;
 }
 
-/// The next `CircuitCreatedV2`: (own circuit id, token, peer circuit id).
+/// The next `CircuitCreatedV3`: (own circuit id, token, peer circuit id).
 pub(super) async fn created(ws: &mut Ws) -> (CircuitId, Vec<u8>, CircuitId) {
     loop {
         match next_control(ws, Duration::from_secs(3)).await {
-            Some(ControlMessage::CircuitCreatedV2 {
+            Some(ControlMessage::CircuitCreatedV3 {
                 circuit_id,
                 token,
                 target_circuit_id,
                 ..
             }) => return (circuit_id, token, target_circuit_id),
             Some(_) => continue,
-            None => panic!("no CircuitCreatedV2"),
+            None => panic!("no CircuitCreatedV3"),
         }
     }
 }
@@ -707,7 +775,7 @@ pub(super) fn relay_on(target_circuit: CircuitId, my_token: &[u8], payload: Vec<
     UnifiedFrame::relay(p).encode()
 }
 
-/// A `CircuitCreatedV2` as one member received it.
+/// A `CircuitCreatedV3` as one member received it.
 #[derive(Debug, Clone)]
 pub(super) struct Created {
     pub circuit_id: CircuitId,
@@ -730,10 +798,10 @@ pub(super) async fn until_control(
     }
 }
 
-/// The next `CircuitCreatedV2`; panics if none arrives.
+/// The next `CircuitCreatedV3`; panics if none arrives.
 pub(super) async fn until_created(ws: &mut Ws) -> Created {
-    match until_control(ws, |m| matches!(m, ControlMessage::CircuitCreatedV2 { .. })).await {
-        Some(ControlMessage::CircuitCreatedV2 {
+    match until_control(ws, |m| matches!(m, ControlMessage::CircuitCreatedV3 { .. })).await {
+        Some(ControlMessage::CircuitCreatedV3 {
             circuit_id,
             token,
             target_circuit_id,
@@ -745,11 +813,11 @@ pub(super) async fn until_created(ws: &mut Ws) -> Created {
             target_circuit_id,
             role,
         },
-        other => panic!("expected CircuitCreatedV2, got {other:?}"),
+        other => panic!("expected CircuitCreatedV3, got {other:?}"),
     }
 }
 
-/// A and B ask each other; returns both sockets and both CircuitCreatedV2.
+/// A and B ask each other; returns both sockets and both CircuitCreatedV3.
 pub(super) async fn pair_up(
     state: &RelayState,
     addr: SocketAddr,

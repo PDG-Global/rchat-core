@@ -52,9 +52,17 @@ struct GlobalState {
     callbacks: Option<CCallbackBridge>,
     /// Pins and blocks set before `rchat_connect`; moved into the new client.
     staged: PeerBook,
+    /// The ML-KEM pins (identity, agreement key, key) of the book a running
+    /// connect took from `staged`: a staged pin naming another key for the
+    /// same agreement key is refused (-2) as the live client would refuse
+    /// it, instead of being dropped by `overlay` later (fix round 1, minor 6).
+    connecting_kems: Vec<(String, [u8; 32], Box<[u8; crate::kem::KEM_PK_LEN]>)>,
     /// Cover traffic (enabled, foreground), applied to each new client at
     /// `rchat_connect` so a scene phase reported before connecting is kept.
     cover: (bool, bool),
+    /// Steady traffic (enabled, slot ms, foreground), applied to each new
+    /// client like `cover`.
+    steady: (bool, u32, bool),
     /// The state key and writer from `rchat_set_state_store`, applied to
     /// each new client at `rchat_connect` (spec §18.4 D27). Dropped (the
     /// key wiped) by `rchat_disconnect`: they belong to one account.
@@ -77,7 +85,9 @@ static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
         identity: None,
         callbacks: None,
         staged: PeerBook::default(),
+        connecting_kems: Vec::new(),
         cover: (false, false),
+        steady: (false, crate::steady::STEADY_DEFAULT_SLOT_MS, false),
         state_key: None,
         state_write: None,
         staged_records: Vec::new(),
@@ -125,6 +135,25 @@ static DISCONNECT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 ///      sent or delivered, try again later)
 /// 26 = Automatic resend refused (ResendRefused: the session that made the
 ///      id eligible is gone, or the contact is no longer plainly pinned)
+/// 27 = No ML-KEM key pinned for this contact (NoKemKey: no request or ask
+///      can be sent until their v3 card's key is pinned, protocol v3 §A.5)
+/// 28 = File too large (FileTooLarge: a file send's whole plaintext
+///      is over `file_msg::MAX_FILE_PLAINTEXT`, 4 MiB - 128 KiB - 1 bytes;
+///      refused before anything is sent, protocol v3 §E.2)
+/// 29 = A client is connected (ForegroundConnected: `rchat_background_drain`
+///      only, returned as -29; protocol v3 §H.1)
+///
+/// `rchat_set_steady_traffic` returns 9 (Invalid parameter) for a slot
+/// length other than 500, 1000 or 2000 ms.
+///
+/// `rchat_send_file` (file messages, plaintext 0x07, protocol v3 §E.2)
+/// returns the message id as a heap string (free with `rchat_free_string`)
+/// or NULL with the code recorded: 9 for a NULL or non-UTF-8 recipient,
+/// name or MIME, `bytes` NULL with `len > 0`, or a MIME that is not
+/// printable ASCII of at most 255 bytes; 28 for a file too large; 7 when
+/// not connected; otherwise the send's code as `rchat_send_binary_with_id`.
+/// Received files arrive only through `on_file` (12th callback of
+/// `rchat_register_callbacks`), never through `on_message`.
 ///
 /// `rchat_last_error_code` returns the code of the most recent failing call
 /// on the calling thread; every error return records the code it returns.
@@ -282,6 +311,7 @@ fn error_code_from_err(e: &RChatError) -> c_int {
         RChatError::SessionNotEstablished { .. } => 5,
         RChatError::MessageTimeout { .. } => 8,
         RChatError::Internal { .. } => 8,
+        RChatError::InvalidParameter { .. } => 9,
         RChatError::KeyAuthRejected => 14,
         RChatError::ServerTooNew => 15,
         RChatError::NoChannelBinding => 16,
@@ -300,6 +330,9 @@ fn error_code_from_err(e: &RChatError) -> c_int {
         RChatError::InvalidSafetyNumber => 9,
         RChatError::StatePersistFailed => 25,
         RChatError::ResendRefused { .. } => 26,
+        RChatError::NoKemKey { .. } => 27,
+        RChatError::FileTooLarge { .. } => 28,
+        RChatError::ForegroundConnected => 29,
     }
 }
 
@@ -314,21 +347,76 @@ fn error_code_from_err(e: &RChatError) -> c_int {
 pub const MESSAGE_KIND_TEXT: c_int = 1;
 pub const MESSAGE_KIND_BINARY: c_int = 2;
 
+/// `on_message_request(identity_hex, agreement_hex, kem_hex, issued_hour,
+/// intro_id_hex, intro_text, intro_sent_at_ms, key_version)`. `kem_hex` is
+/// the requester's signed ML-KEM key (2368 hex): the app stores it with
+/// the request and passes it to `rchat_pin_peer_key` on accept (R11).
+pub type MessageRequestFn = extern "C" fn(
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    u64,
+    *const c_char,
+    *const c_char,
+    u64,
+    u32,
+);
+
+/// `on_peer_rotated(old_hex, new_hex, new_agreement_hex, new_kem_hex,
+/// new_version)`. The app stores the new KEM key with the new pin (R11).
+pub type PeerRotatedFn =
+    extern "C" fn(*const c_char, *const c_char, *const c_char, *const c_char, u32);
+
+/// `on_file(peer_hex, message_id_hex, name, mime, expire_secs, bytes, len,
+/// timestamp_ms)`: a received file message (`0x07`, protocol v3 §E.2).
+/// `name` is already cleaned (`file_msg::sanitise_name`, at most 255 UTF-8
+/// bytes, never empty); `mime` is advisory printable ASCII, possibly `""`,
+/// and must never decide how the file is opened; `expire_secs` is the
+/// sender's disappearing timer (0 = never). `bytes` points at the file's
+/// `len` bytes (NULL when `len` is 0). Ownership as for every callback
+/// argument: the core owns all of them, they are valid only for the call,
+/// and the app copies what it keeps; the core wipes the bytes and frees
+/// everything when the callback returns. The delivered receipt is queued
+/// when the app calls `rchat_mark_message_seen`, as for any message.
+pub type FileReceivedFn = extern "C" fn(
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    u32,
+    *const u8,
+    usize,
+    u64,
+);
+
+/// `on_message(sender_hex, content_hex, timestamp_ms, message_id_hex, kind,
+/// expire_secs)`: `kind` is `MESSAGE_KIND_TEXT` or `MESSAGE_KIND_BINARY`;
+/// `expire_secs` is the sender's disappearing timer for this message (0 =
+/// never, protocol v3 §I.2), which the app honours whatever its own setting.
+pub type MessageFn = extern "C" fn(*const c_char, *const c_char, u64, *const c_char, c_int, u32);
+
+/// `on_timer_changed(peer_hex, secs, changed_at_ms, by_me)`: a contact's
+/// disappearing timer changed (protocol v3 §I.2). `secs` is one of the
+/// timer choices (0 = off); `by_me` is 1 when this device made the change,
+/// 0 when the contact did. Only a change that won is reported.
+pub type TimerChangedFn = extern "C" fn(*const c_char, u32, u64, c_int);
+
 /// Function pointers received from Swift / C.
 #[derive(Clone, Copy)]
 struct CCallbackPointers {
-    on_message: extern "C" fn(*const c_char, *const c_char, u64, *const c_char, c_int),
+    on_message: MessageFn,
     on_state_change: extern "C" fn(c_int),
     on_error: extern "C" fn(*const c_char),
     on_circuit_established: extern "C" fn(*const c_char, c_int),
     on_message_delivered: extern "C" fn(*const c_char),
     on_reconnect: extern "C" fn(),
     on_peer_key_event: extern "C" fn(*const c_char, c_int, *const c_char),
-    on_message_request:
-        extern "C" fn(*const c_char, *const c_char, u64, *const c_char, *const c_char, u64, u32),
+    on_message_request: MessageRequestFn,
     on_message_receipt: extern "C" fn(*const c_char, *const c_char, c_int),
-    on_peer_rotated: extern "C" fn(*const c_char, *const c_char, *const c_char, u32),
+    on_peer_rotated: PeerRotatedFn,
     on_status_event: extern "C" fn(c_int, *const c_char, *const c_char, c_int),
+    on_file: FileReceivedFn,
+    on_timer_changed: TimerChangedFn,
 }
 
 #[derive(Clone)]
@@ -375,7 +463,44 @@ impl RChatCallbacks for CCallbackBridge {
             } else {
                 MESSAGE_KIND_BINARY
             },
+            message.expire_secs,
         );
+    }
+
+    fn on_timer_changed(&self, peer_hex: String, secs: u32, changed_at_ms: u64, by_me: bool) {
+        if let Ok(peer) = CString::new(peer_hex) {
+            (self.ptrs.on_timer_changed)(peer.as_ptr(), secs, changed_at_ms, c_int::from(by_me));
+        }
+    }
+
+    /// The bytes cross raw (pointer and length), valid for the call only;
+    /// they are wiped once the callback returns.
+    fn on_file_received(&self, file: crate::ReceivedFile) {
+        let mut file = file;
+        let strings = (
+            CString::new(std::mem::take(&mut file.sender_identity)),
+            CString::new(std::mem::take(&mut file.id)),
+            CString::new(std::mem::take(&mut file.name)),
+            CString::new(std::mem::take(&mut file.mime)),
+        );
+        if let (Ok(peer), Ok(id), Ok(name), Ok(mime)) = strings {
+            let bytes = if file.bytes.is_empty() {
+                std::ptr::null()
+            } else {
+                file.bytes.as_ptr()
+            };
+            (self.ptrs.on_file)(
+                peer.as_ptr(),
+                id.as_ptr(),
+                name.as_ptr(),
+                mime.as_ptr(),
+                file.expire_secs,
+                bytes,
+                file.bytes.len(),
+                file.timestamp_ms,
+            );
+        }
+        zeroize::Zeroize::zeroize(&mut file.bytes);
     }
 
     fn on_peer_key_event(&self, identity_hex: String, code: u8, agreement_hex: String) {
@@ -389,13 +514,15 @@ impl RChatCallbacks for CCallbackBridge {
         let parts = (
             CString::new(r.identity_hex),
             CString::new(r.agreement_hex),
+            CString::new(r.kem_hex),
             CString::new(r.intro_message_id_hex),
             CString::new(r.intro_text),
         );
-        if let (Ok(id), Ok(ak), Ok(intro_id), Ok(text)) = parts {
+        if let (Ok(id), Ok(ak), Ok(kem), Ok(intro_id), Ok(text)) = parts {
             (self.ptrs.on_message_request)(
                 id.as_ptr(),
                 ak.as_ptr(),
+                kem.as_ptr(),
                 r.issued_hour,
                 intro_id.as_ptr(),
                 text.as_ptr(),
@@ -405,9 +532,14 @@ impl RChatCallbacks for CCallbackBridge {
         }
     }
 
-    fn on_peer_rotated(&self, old: String, new: String, ak: String, version: u32) {
-        if let (Ok(o), Ok(n), Ok(a)) = (CString::new(old), CString::new(new), CString::new(ak)) {
-            (self.ptrs.on_peer_rotated)(o.as_ptr(), n.as_ptr(), a.as_ptr(), version);
+    fn on_peer_rotated(&self, old: String, new: String, ak: String, kem: String, version: u32) {
+        if let (Ok(o), Ok(n), Ok(a), Ok(k)) = (
+            CString::new(old),
+            CString::new(new),
+            CString::new(ak),
+            CString::new(kem),
+        ) {
+            (self.ptrs.on_peer_rotated)(o.as_ptr(), n.as_ptr(), a.as_ptr(), k.as_ptr(), version);
         }
     }
 
@@ -581,6 +713,16 @@ pub unsafe extern "C" fn rchat_connect_with_seed(
         return record_error(9, "Invalid parameter".to_string());
     }
     // SAFETY: non-null and valid for `seed_len` bytes per the contract.
+    let hex = unsafe { seed_hex(seed, seed_len) };
+    unsafe { connect_with(config_json, Some(hex)) }
+}
+
+/// The seed bytes as lowercase hex in a wiped buffer.
+///
+/// # Safety
+///
+/// `seed` must be valid for reads of `seed_len` bytes.
+unsafe fn seed_hex(seed: *const u8, seed_len: usize) -> zeroize::Zeroizing<String> {
     let bytes = unsafe { std::slice::from_raw_parts(seed, seed_len) };
     // Sized up front so no growing buffer is freed holding seed hex (N-3).
     let mut hex = zeroize::Zeroizing::new(String::with_capacity(seed_len * 2));
@@ -589,7 +731,7 @@ pub unsafe extern "C" fn rchat_connect_with_seed(
         hex.push(DIGITS[usize::from(b >> 4)] as char);
         hex.push(DIGITS[usize::from(b & 0x0f)] as char);
     }
-    unsafe { connect_with(config_json, Some(hex)) }
+    hex
 }
 
 /// A seed from JSON, wrapped the moment it is read (R1-3).
@@ -634,59 +776,10 @@ unsafe fn connect_with(
     let _connecting = CONNECT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // The seed is read on its own, straight into a wiped buffer, so no
-    // failure later in the JSON frees a plain copy of it (R1-3); the
-    // config proper never deserializes it.
-    let json_seed = match serde_json::from_str::<SeedField>(json_str.as_str()) {
-        Ok(f) => f.identity_key_seed,
-        Err(e) => return record_error(1, format!("Invalid config JSON: {}", e)),
+    let (client, runtime) = match new_client_from(json_str.as_str(), seed_hex) {
+        Ok(made) => made,
+        Err(code) => return code,
     };
-    let mut config: ClientConfig = match serde_json::from_str(json_str.as_str()) {
-        Ok(c) => c,
-        Err(e) => return record_error(1, format!("Invalid config JSON: {}", e)),
-    };
-    // The seed, from the JSON or as bytes, is held in a wiped buffer until
-    // the last fallible step before the client takes it (R1-N2): every early
-    // return below drops it wiped, never as a plain `String` in `config`.
-    let mut seed = match (seed_hex, json_seed) {
-        (Some(_), Some(_)) => {
-            return record_error(9, "Seed given both in the config and as bytes".to_string());
-        }
-        (bytes, json) => bytes.or(json),
-    };
-
-    // Extract what we need from global state, then drop the lock before spawning
-    // a thread: the connect thread may need GLOBAL_STATE, so holding the
-    // lock across join() would deadlock.
-    let (runtime, callbacks_snapshot) = {
-        let guard = lock_state();
-        let runtime = match guard.runtime {
-            Some(ref rt) => Arc::new(rt.handle().clone()),
-            None => {
-                return record_error(
-                    8,
-                    "Runtime not initialized. Call rchat_initialize() first.".to_string(),
-                );
-            }
-        };
-        let cb = guard.callbacks.clone();
-        (runtime, cb)
-    };
-
-    // Moved, not copied: the client takes it into its own wiped buffer
-    // before anything else can fail (C-10, R1-N2).
-    config.identity_key_seed = seed.as_mut().map(|hex| std::mem::take(&mut **hex));
-    drop(seed);
-    // Create client
-    let client = match RChatClient::new(config) {
-        Ok(c) => c,
-        Err(e) => return record_rchat_error(&e, "Failed to create client"),
-    };
-
-    // Register callbacks if they were previously set
-    if let Some(ref bridge) = callbacks_snapshot {
-        client.set_callbacks(Box::new(bridge.clone()));
-    }
     // A client kept by `rchat_disconnect_transport_only` holds the live pins
     // and blocks: move them to the staged book before it is replaced.
     retire_previous_client();
@@ -696,6 +789,8 @@ unsafe fn connect_with(
     apply_store_and_signer(&client, generation);
     let (cover_on, cover_fg) = lock_state().cover;
     client.set_cover_traffic(cover_on, cover_fg);
+    let (steady_on, steady_ms, steady_fg) = lock_state().steady;
+    let _ = client.set_steady_traffic(steady_on, steady_ms, steady_fg);
 
     // Connect (block_on via the runtime handle) — no lock held during this call
     let client_for_connect = client.clone();
@@ -729,9 +824,76 @@ unsafe fn connect_with(
     }
 }
 
+/// A new client from a connect's config JSON and seed (callbacks set, not
+/// connected), with the runtime handle to drive it. Called with
+/// `CONNECT_LOCK` held. Every failure records and returns its code.
+fn new_client_from(
+    json_str: &str,
+    seed_hex: Option<zeroize::Zeroizing<String>>,
+) -> Result<(Arc<RChatClient>, Arc<tokio::runtime::Handle>), c_int> {
+    // The seed is read on its own, straight into a wiped buffer, so no
+    // failure later in the JSON frees a plain copy of it (R1-3); the
+    // config proper never deserializes it.
+    let json_seed = match serde_json::from_str::<SeedField>(json_str) {
+        Ok(f) => f.identity_key_seed,
+        Err(e) => return Err(record_error(1, format!("Invalid config JSON: {}", e))),
+    };
+    let mut config: ClientConfig = match serde_json::from_str(json_str) {
+        Ok(c) => c,
+        Err(e) => return Err(record_error(1, format!("Invalid config JSON: {}", e))),
+    };
+    // The seed, from the JSON or as bytes, is held in a wiped buffer until
+    // the last fallible step before the client takes it (R1-N2): every early
+    // return below drops it wiped, never as a plain `String` in `config`.
+    let mut seed = match (seed_hex, json_seed) {
+        (Some(_), Some(_)) => {
+            return Err(record_error(
+                9,
+                "Seed given both in the config and as bytes".to_string(),
+            ));
+        }
+        (bytes, json) => bytes.or(json),
+    };
+
+    // Extract what we need from global state, then drop the lock before spawning
+    // a thread: the connect thread may need GLOBAL_STATE, so holding the
+    // lock across join() would deadlock.
+    let (runtime, callbacks_snapshot) = {
+        let guard = lock_state();
+        let runtime = match guard.runtime {
+            Some(ref rt) => Arc::new(rt.handle().clone()),
+            None => {
+                return Err(record_error(
+                    8,
+                    "Runtime not initialized. Call rchat_initialize() first.".to_string(),
+                ));
+            }
+        };
+        let cb = guard.callbacks.clone();
+        (runtime, cb)
+    };
+
+    // Moved, not copied: the client takes it into its own wiped buffer
+    // before anything else can fail (C-10, R1-N2).
+    config.identity_key_seed = seed.as_mut().map(|hex| std::mem::take(&mut **hex));
+    drop(seed);
+    // Create client
+    let client = match RChatClient::new(config) {
+        Ok(c) => c,
+        Err(e) => return Err(record_rchat_error(&e, "Failed to create client")),
+    };
+
+    // Register callbacks if they were previously set
+    if let Some(ref bridge) = callbacks_snapshot {
+        client.set_callbacks(Box::new(bridge.clone()));
+    }
+    Ok((client, runtime))
+}
+
 /// A client whose connect was overtaken by `rchat_disconnect`: its peer
 /// book is discarded and it is silenced and disconnected.
 fn abandon_client(client: &RChatClient) {
+    lock_state().connecting_kems.clear();
     drop(client.export_peer_book());
     // Before retiring: it belongs to an account that has logged out.
     client.detach_state_store();
@@ -781,7 +943,9 @@ pub extern "C" fn rchat_disconnect() -> c_int {
     guard.client = None;
     guard.runtime = None;
     guard.staged = PeerBook::default();
+    guard.connecting_kems.clear();
     guard.cover = (false, false);
+    guard.steady = (false, crate::steady::STEADY_DEFAULT_SLOT_MS, false);
     // The account's state key (wiped on drop), writer and staged records.
     guard.state_key = None;
     guard.state_write = None;
@@ -793,7 +957,12 @@ pub extern "C" fn rchat_disconnect() -> c_int {
 
 /// Move pins/blocks set before `rchat_connect` into the new client.
 fn adopt_staged(client: &RChatClient) {
-    let staged = std::mem::take(&mut lock_state().staged);
+    let staged = {
+        let mut guard = lock_state();
+        let staged = std::mem::take(&mut guard.staged);
+        guard.connecting_kems = staged.kem_pins();
+        staged
+    };
     client.import_peer_book(staged);
 }
 
@@ -875,10 +1044,13 @@ fn install_client_locked(
     // connect goes, wiped on drop (its keys zeroize), so a retired identity
     // can never sign again (Task 9b re-review).
     guard.identity = None;
+    guard.connecting_kems.clear();
     let newer = std::mem::take(&mut guard.staged);
     client.overlay_peer_book(newer);
     let (cover_on, cover_fg) = guard.cover;
     client.set_cover_traffic(cover_on, cover_fg);
+    let (steady_on, steady_ms, steady_fg) = guard.steady;
+    let _ = client.set_steady_traffic(steady_on, steady_ms, steady_fg);
 }
 
 /// A connect failed: hand the book `adopt_staged` gave the client back to
@@ -887,6 +1059,7 @@ fn install_client_locked(
 fn restore_staged(client: &RChatClient) {
     let mut book = client.export_peer_book();
     let mut guard = lock_state();
+    guard.connecting_kems.clear();
     let newer = std::mem::take(&mut guard.staged);
     book.overlay(newer);
     guard.staged = book;
@@ -990,6 +1163,189 @@ pub extern "C" fn rchat_reconnect() -> c_int {
     }
 }
 
+/// When `rchat_cancel_background_drain` was last called: milliseconds
+/// since `DRAIN_EPOCH`, plus one (0 = none). Cleared when a drain ends
+/// (R34 M-1). A cancel counts for a drain that started at most
+/// `DRAIN_CANCEL_FRESH` after it, so one issued just before the drain
+/// starts (the expiration handler racing the start) is not lost, and a
+/// stale one never cancels a later run.
+static DRAIN_CANCEL_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAIN_EPOCH: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+const DRAIN_CANCEL_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn drain_millis_now() -> u64 {
+    DRAIN_EPOCH.elapsed().as_millis() as u64 + 1
+}
+
+/// A cancel issued after `started - DRAIN_CANCEL_FRESH` applies.
+fn drain_cancel_requested(started_ms: u64) -> bool {
+    let at = DRAIN_CANCEL_AT.load(Ordering::SeqCst);
+    at != 0 && at + DRAIN_CANCEL_FRESH.as_millis() as u64 >= started_ms
+}
+
+/// Background delivery (protocol v3 §H.1). Connects with `config_json` and
+/// the seed (as `rchat_connect_with_seed`, the same pins, state store,
+/// records and signer staged first), publishes, takes the relay's
+/// offline-queue drain and any knocks, hands each to the registered
+/// callbacks, waits until the relay's `QueueHandedOver` marker and the app
+/// has stored every message and file it was handed
+/// (`rchat_mark_message_seen`), then drops the transport. The client, with
+/// its sessions, stays installed for the next foreground `rchat_reconnect`
+/// or `rchat_connect`.
+///
+/// A kept client (disconnected, e.g. after `rchat_disconnect_transport_only`)
+/// drains itself, keeping its deferred asks and ack tracker; the config and
+/// seed are then not used. Otherwise a new client is built and installed.
+///
+/// While it runs only signaling leaves: no circuit ask (identity or
+/// blind), resume, close, receipt, queued send, cover or steady packet.
+/// Delivered receipts stay owed (persisted) for the next foreground
+/// connection. The relay pin is checked exactly as on any connect.
+///
+/// `timeout_ms` is clamped to 1,000..=25,000 (iOS gives a refresh about
+/// 30 s; the app passes 20,000). The connect makes one attempt, bounded by
+/// 40% of the budget (at most 8 s), and races the cancel. The drain ends
+/// at the relay's marker plus a 0.3 s grace, or, without a marker, after
+/// 6 s once no byte has arrived for 1.5 s; or when cancelled.
+///
+/// Returns the number of messages, files and requests handed to the app
+/// (0 or more), or a negative error code (`-code`, codes as listed at the
+/// top of this file): -29 when a client is connected (it already receives
+/// the queue; nothing is touched), -9 for a bad argument, -8 before
+/// `rchat_initialize`, -2 when the relay can't be reached, the connect was
+/// cancelled or the drain timed out before its publish, -21..=-23 for a
+/// relay identity failure. Serialised with connects; the lock is released
+/// when it returns, whatever a given-up connect attempt still does.
+///
+/// # Safety
+///
+/// `config_json` must point to a NUL-terminated string valid for the call;
+/// `seed` must be valid for reads of `seed_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_background_drain(
+    config_json: *const c_char,
+    seed: *const u8,
+    seed_len: usize,
+    timeout_ms: u32,
+) -> c_int {
+    refuse_reentry!(-8);
+    let started_ms = drain_millis_now();
+    let result =
+        unsafe { background_drain_with(config_json, seed, seed_len, timeout_ms, started_ms) };
+    // A cancel belongs to the run it ended (M-1).
+    DRAIN_CANCEL_AT.store(0, Ordering::SeqCst);
+    result
+}
+
+unsafe fn background_drain_with(
+    config_json: *const c_char,
+    seed: *const u8,
+    seed_len: usize,
+    timeout_ms: u32,
+    started_ms: u64,
+) -> c_int {
+    if seed.is_null() || !(seed_len == 64 || seed_len == 32) {
+        return -record_error(9, "Invalid parameter".to_string());
+    }
+    // SAFETY: non-null and valid for `seed_len` bytes per the contract.
+    let hex = unsafe { seed_hex(seed, seed_len) };
+    let generation = DISCONNECT_GENERATION.load(Ordering::SeqCst);
+    let Some(json_str) = arg(config_json).map(zeroize::Zeroizing::new) else {
+        return -record_error(9, "Invalid parameter".to_string());
+    };
+    let timeout = std::time::Duration::from_millis(u64::from(timeout_ms))
+        .clamp(crate::drain::DRAIN_MIN, crate::drain::DRAIN_MAX);
+    let deadline = std::time::Instant::now() + timeout;
+    let cancelled = || drain_cancel_requested(started_ms);
+    let _connecting = CONNECT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let kept = lock_state().client.clone();
+    let kept_client = kept.as_ref().filter(|c| !c.connected_now()).cloned();
+    let client = match kept {
+        // Never next to a connected client: it receives the queue itself.
+        Some(c) if c.connected_now() => {
+            return -record_rchat_error(&RChatError::ForegroundConnected, "Background drain");
+        }
+        // The kept client drains itself (R34 M-2). It restored the stored
+        // records at its connect and holds newer state in memory: the
+        // records staged for a new client are dropped, not piled up.
+        Some(c) => {
+            lock_state().staged_records.clear();
+            c
+        }
+        None => {
+            let (client, _runtime) = match new_client_from(json_str.as_str(), Some(hex)) {
+                Ok(made) => made,
+                Err(code) => return -code,
+            };
+            adopt_staged(&client);
+            apply_store_and_signer(&client, generation);
+            // Installed before the connect, so the app's
+            // `rchat_mark_message_seen` reaches it during the drain.
+            if !install_client_if_current(client.clone(), generation) {
+                abandon_client(&client);
+                return -record_error(7, "Disconnected while connecting".to_string());
+            }
+            client
+        }
+    };
+    let end = client.drain_connecting(deadline, &cancelled);
+    if DISCONNECT_GENERATION.load(Ordering::SeqCst) != generation {
+        // A logout ran meanwhile: rchat_disconnect already retired it.
+        return -record_error(7, "Disconnected while draining".to_string());
+    }
+    match end {
+        crate::drain::DrainEnd::Drained(n) => c_int::try_from(n).unwrap_or(c_int::MAX),
+        crate::drain::DrainEnd::Failed(e) => -record_rchat_error(&e, "Background drain"),
+        crate::drain::DrainEnd::GaveUp(e) => {
+            // A given-up attempt may still be finishing on its thread: this
+            // client goes (retired: it never connects again), its pins back
+            // to the staged book, so the next foreground connect builds a
+            // new one instead of meeting a client still busy connecting.
+            uninstall_client(&client);
+            -record_rchat_error(&e, "Background drain connect given up")
+        }
+        crate::drain::DrainEnd::NotConnected(e) => {
+            // The connect returned an error (unreachable, refused): a kept
+            // client stays installed with its state (round 2 N-3); a new one
+            // goes, as after a failed `rchat_connect`.
+            if kept_client.is_none() {
+                uninstall_client(&client);
+            }
+            -record_rchat_error(&e, "Background drain connect failed")
+        }
+    }
+}
+
+/// Take `client` out of the state if it is the installed one, moving its
+/// peer book to the staged book (as `retire_previous_client`).
+fn uninstall_client(client: &Arc<RChatClient>) {
+    let installed = {
+        let mut g = lock_state();
+        if g.client.as_ref().is_some_and(|c| Arc::ptr_eq(c, client)) {
+            g.client.take()
+        } else {
+            None
+        }
+    };
+    if installed.is_some() {
+        restore_staged(client);
+        client.detach_state_store();
+        client.retire_delivering_queued();
+    }
+}
+
+/// End a running `rchat_background_drain` now (the iOS expiration
+/// handler): what was stored stays stored, the transport is dropped and
+/// the drain returns. One issued up to 5 s before a drain starts cancels
+/// it too. Takes no lock; safe from any thread. Returns 0.
+#[no_mangle]
+pub extern "C" fn rchat_cancel_background_drain() -> c_int {
+    DRAIN_CANCEL_AT.store(drain_millis_now(), Ordering::SeqCst);
+    0
+}
+
 /// # Safety
 ///
 /// Every non-NULL pointer argument must point to a NUL-terminated string
@@ -1062,14 +1418,20 @@ pub extern "C" fn rchat_publish_key_bundle() -> c_int {
     }
 }
 
+/// Send a text message (0 ok, else an error code). `expire_out`, when not
+/// NULL, receives the disappearing timer the message carries: the
+/// contact's current one (protocol v3 §I.2, ruling R32).
+///
 /// # Safety
 ///
-/// Every non-NULL pointer argument must point to a NUL-terminated string
-/// that stays valid and unmodified for the duration of the call.
+/// Every non-NULL string argument must point to a NUL-terminated string
+/// that stays valid and unmodified for the duration of the call;
+/// `expire_out` must be NULL or valid for one `uint32_t` write.
 #[no_mangle]
 pub unsafe extern "C" fn rchat_send_message(
     recipient: *const c_char,
     text: *const c_char,
+    expire_out: *mut u32,
 ) -> c_int {
     refuse_reentry!(8);
     let (Some(recipient_str), Some(text_str)) = (arg(recipient), arg(text)) else {
@@ -1088,12 +1450,16 @@ pub unsafe extern "C" fn rchat_send_message(
     drop(guard);
 
     let result = std::thread::spawn(move || {
-        runtime_handle.block_on(async move { client.send_text_message(recipient_str, text_str) })
+        runtime_handle.block_on(async move { client.send_text(recipient_str, text_str, None) })
     })
     .join();
 
     match result {
-        Ok(Ok(_msg_id)) => 0,
+        Ok(Ok(sent)) => {
+            // SAFETY: per the contract.
+            unsafe { write_expire(expire_out, sent.expire_secs) };
+            0
+        }
         Ok(Err(e)) => record_rchat_error(&e, "Send failed"),
         Err(e) => record_error(8, format!("Send thread panicked: {:?}", e)),
     }
@@ -1101,27 +1467,35 @@ pub unsafe extern "C" fn rchat_send_message(
 
 /// Send a text message and return the message ID (heap C string; free with `rchat_free_string`).
 /// Returns NULL on failure. Use with `on_message_delivered` to track delivery.
+/// `expire_out`, when not NULL, receives the disappearing timer the message
+/// carries (the contact's current one, §I.2): label the sent copy from it.
 ///
 /// # Safety
 ///
-/// Every non-NULL pointer argument must point to a NUL-terminated string
-/// that stays valid and unmodified for the duration of the call.
+/// Every non-NULL string argument must point to a NUL-terminated string
+/// that stays valid and unmodified for the duration of the call;
+/// `expire_out` must be NULL or valid for one `uint32_t` write.
 #[no_mangle]
 pub unsafe extern "C" fn rchat_send_message_with_id(
     recipient: *const c_char,
     text: *const c_char,
+    expire_out: *mut u32,
 ) -> *mut c_char {
     refuse_reentry!(std::ptr::null_mut());
     let (Some(recipient_str), Some(text_str)) = (arg(recipient), arg(text)) else {
         record_error(9, "Invalid parameter".to_string());
         return std::ptr::null_mut();
     };
-    send_returning_id(move |client| client.send_text_message(recipient_str, text_str))
+    unsafe {
+        send_returning_id(expire_out, move |client| {
+            client.send_text(recipient_str, text_str, None)
+        })
+    }
 }
 
 /// Send media (or text that starts with an old in-band media prefix) as a
 /// binary plaintext, type 0x02, and return the message ID as
-/// `rchat_send_message_with_id` does. `data` must start with a known magic
+/// `rchat_send_message_with_id` does (`expire_out` likewise). `data` must start with a known magic
 /// (`IMG1` image, `VOCE` voice note, `TXT1` text); anything else is refused
 /// with code 9.
 ///
@@ -1135,6 +1509,7 @@ pub unsafe extern "C" fn rchat_send_binary_with_id(
     recipient: *const c_char,
     data: *const u8,
     len: usize,
+    expire_out: *mut u32,
 ) -> *mut c_char {
     refuse_reentry!(std::ptr::null_mut());
     let Some(recipient_str) = arg(recipient) else {
@@ -1144,7 +1519,317 @@ pub unsafe extern "C" fn rchat_send_binary_with_id(
     let Ok(body) = (unsafe { binary_body(data, len) }) else {
         return std::ptr::null_mut();
     };
-    send_returning_id(move |client| client.send_binary_message(recipient_str, body))
+    unsafe {
+        send_returning_id(expire_out, move |client| {
+            client.send_binary(recipient_str, body, None)
+        })
+    }
+}
+
+/// Send a file message (plaintext 0x07, protocol v3 §E.2) and return the
+/// message id as `rchat_send_binary_with_id` does (a heap string to free
+/// with `rchat_free_string`, or NULL with the code recorded). `name` is the
+/// original file name (cleaned by the core before it leaves; `""` becomes
+/// `file`), `mime` an advisory printable-ASCII label of at most 255 bytes
+/// (`""` for none), `bytes` the file's `len` bytes (NULL only when `len`
+/// is 0). The message carries the contact's current disappearing timer
+/// (`rchat_set_disappearing_timer`, protocol v3 §I.2), which `expire_out`
+/// (when not NULL) receives. Codes: 9 for a NULL or non-UTF-8 string, NULL `bytes` with `len > 0`, or
+/// a bad MIME; 28 when the whole plaintext is over
+/// `file_msg::MAX_FILE_PLAINTEXT` (checked before the bytes are copied);
+/// 7 when not connected; otherwise as `rchat_send_binary_with_id`.
+///
+/// # Safety
+///
+/// `recipient`, `name` and `mime` must be NULL or NUL-terminated strings,
+/// and `bytes` NULL or valid for reads of `len` bytes; all stay valid and
+/// unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_send_file(
+    recipient: *const c_char,
+    name: *const c_char,
+    mime: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    expire_out: *mut u32,
+) -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    let Ok(FileArgs {
+        recipient,
+        name,
+        mime,
+        data,
+    }) = (unsafe { file_args(recipient, name, mime, bytes, len) })
+    else {
+        return std::ptr::null_mut();
+    };
+    let mut data = data;
+    unsafe {
+        send_returning_id(expire_out, move |client| {
+            // The client wipes the bytes it is handed; if this never runs
+            // (no client or runtime), `data` wipes them on drop.
+            client.send_file(recipient, name, mime, std::mem::take(&mut *data), None)
+        })
+    }
+}
+
+/// The cleaned form of a file name (`file_msg::sanitise_name`, protocol v3
+/// §E.2): what the core sends for `name` and what a receiver's `on_file`
+/// shows. The app uses it to label a sent file and to name the temporary
+/// copy it hands the share sheet. A heap string to free with
+/// `rchat_free_string`, or NULL (code 9) for a NULL or non-UTF-8 `name`.
+/// Needs no client.
+///
+/// # Safety
+///
+/// `name` must be NULL or a NUL-terminated string that stays valid and
+/// unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_sanitise_file_name(name: *const c_char) -> *mut c_char {
+    let Some(name) = arg(name) else {
+        record_error(9, "Invalid parameter".to_string());
+        return std::ptr::null_mut();
+    };
+    // NUL becomes `_`, so the cleaned name never holds one.
+    match CString::new(crate::file_msg::sanitise_name(name.as_bytes())) {
+        Ok(s) => s.into_raw(),
+        Err(_) => {
+            record_error(8, "File name contained NUL".to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// A file send's checked arguments (`file_args`).
+struct FileArgs {
+    recipient: String,
+    name: String,
+    mime: String,
+    /// Wiped when dropped (final review L4): a send refused before the
+    /// client takes the bytes (no client, no runtime) leaves no copy.
+    data: zeroize::Zeroizing<Vec<u8>>,
+}
+
+/// The file sends' shared checks, in order, before anything is copied:
+/// the strings (9), `bytes` NULL with `len > 0` (9), the MIME (9), then the
+/// size (28). `Err(code)`, recorded, otherwise; on success the bytes are
+/// copied (the client wipes the copy).
+///
+/// # Safety
+///
+/// As `rchat_send_file`.
+unsafe fn file_args(
+    recipient: *const c_char,
+    name: *const c_char,
+    mime: *const c_char,
+    bytes: *const u8,
+    len: usize,
+) -> Result<FileArgs, c_int> {
+    let (Some(recipient), Some(name), Some(mime)) = (arg(recipient), arg(name), arg(mime)) else {
+        return Err(record_error(9, "Invalid parameter".to_string()));
+    };
+    if bytes.is_null() && len != 0 {
+        return Err(record_error(9, "Invalid parameter".to_string()));
+    }
+    if !crate::file_msg::mime_ok(mime.as_bytes()) {
+        return Err(record_error(
+            9,
+            "MIME type must be printable ASCII, at most 255 bytes".to_string(),
+        ));
+    }
+    // The cleaned name is at most 255 bytes: refuse what cannot fit even
+    // then before copying anything (the core checks the exact total).
+    let fixed = crate::file_msg::FILE_HEADER_LEN + mime.len();
+    if len > crate::file_msg::MAX_FILE_PLAINTEXT.saturating_sub(fixed) {
+        return Err(record_error(28, "File too large".to_string()));
+    }
+    let data = zeroize::Zeroizing::new(if len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: non-null and valid for `len` bytes per the contract.
+        unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
+    });
+    Ok(FileArgs {
+        recipient,
+        name,
+        mime,
+        data,
+    })
+}
+
+/// Which same-id file entry is running.
+#[derive(Clone, Copy)]
+enum FileResend {
+    /// A first send under the app's id: the current timer, reported
+    /// through the out-parameter.
+    SameId(*mut u32),
+    /// The app's same-id Retry or manual resend
+    /// (`retry_file_message_using_id`), with the original `expire_secs`.
+    Retry(u32),
+    /// The checked automatic resend (`resend_file_message_using_id`, H-1),
+    /// with the file's original `expire_secs` (§I.2).
+    Checked(u32),
+}
+
+/// The shared body of `rchat_send_file_using_id` and
+/// `rchat_resend_file_using_id`.
+///
+/// # Safety
+///
+/// As `rchat_send_file_using_id`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn file_using_id(
+    recipient: *const c_char,
+    name: *const c_char,
+    mime: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    message_id_hex: *const c_char,
+    which: FileResend,
+) -> c_int {
+    let Some(id) = arg(message_id_hex) else {
+        return record_error(9, "Invalid parameter".to_string());
+    };
+    if crate::message_id_from_hex(&id).is_err() {
+        return record_error(9, "Message id must be 32 hex characters".to_string());
+    }
+    let FileArgs {
+        recipient,
+        name,
+        mime,
+        mut data,
+    } = match unsafe { file_args(recipient, name, mime, bytes, len) } {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    // Without a client `data` wipes the copy on drop (L4).
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let data = std::mem::take(&mut *data);
+    let sent = match which {
+        FileResend::SameId(expire_out) => {
+            client
+                .send_file(recipient, name, mime, data, Some(id))
+                .map(|sent| {
+                    // SAFETY: per `rchat_send_file_using_id`'s contract.
+                    unsafe { write_expire(expire_out, sent.expire_secs) };
+                })
+        }
+        FileResend::Retry(expire_secs) => client
+            .retry_file_message_using_id(recipient, name, mime, data, expire_secs, id)
+            .map(|_| ()),
+        FileResend::Checked(expire_secs) => client
+            .resend_file_message_using_id(recipient, name, mime, data, expire_secs, id)
+            .map(|_| ()),
+    };
+    match sent {
+        Ok(()) => 0,
+        Err(e) => record_rchat_error(&e, "Send failed"),
+    }
+}
+
+/// Send a file (as `rchat_send_file`) under a caller-chosen 32-hex id: a
+/// first send with an id the app picked, carrying the contact's current
+/// timer (`expire_out`, when not NULL, receives it). A Retry of a file
+/// already sent uses `rchat_retry_file_using_id`. 0 ok, else an error code:
+/// as `rchat_send_file` (9, 28 before anything is copied, 7), and 9 for a
+/// NULL or malformed id.
+///
+/// # Safety
+///
+/// As `rchat_send_file`; `message_id_hex` must be NULL or a NUL-terminated
+/// string that stays valid and unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_send_file_using_id(
+    recipient: *const c_char,
+    name: *const c_char,
+    mime: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    message_id_hex: *const c_char,
+    expire_out: *mut u32,
+) -> c_int {
+    refuse_reentry!(8);
+    unsafe {
+        file_using_id(
+            recipient,
+            name,
+            mime,
+            bytes,
+            len,
+            message_id_hex,
+            FileResend::SameId(expire_out),
+        )
+    }
+}
+
+/// The app's same-id Retry or manual resend of a file it already sent
+/// (spec §18.8): the core keeps no file bytes after an ack or eviction, so
+/// the app passes the original name, MIME and bytes and the file's
+/// original `expire_secs` (protocol v3 §I.2, ruling R32; 9 for a value
+/// outside the timer choices). Checked as `rchat_send_file_using_id`.
+///
+/// # Safety
+///
+/// As `rchat_send_file_using_id` (no `expire_out`).
+#[no_mangle]
+pub unsafe extern "C" fn rchat_retry_file_using_id(
+    recipient: *const c_char,
+    name: *const c_char,
+    mime: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    expire_secs: u32,
+    message_id_hex: *const c_char,
+) -> c_int {
+    refuse_reentry!(8);
+    unsafe {
+        file_using_id(
+            recipient,
+            name,
+            mime,
+            bytes,
+            len,
+            message_id_hex,
+            FileResend::Retry(expire_secs),
+        )
+    }
+}
+
+/// The automatic resend of a `ResendEligible` file (spec §18.6 D38, final
+/// review H-1): as `rchat_send_file_using_id`, but refused with code 26
+/// unless the current session is the one that made the id eligible, as
+/// `rchat_resend_binary_using_id`. On 26 the app offers its manual Resend.
+/// `expire_secs` is the file's timer when it was first sent (protocol v3
+/// §I.2), never the current one: one of the timer choices (9 otherwise).
+///
+/// # Safety
+///
+/// As `rchat_send_file_using_id`.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_resend_file_using_id(
+    recipient: *const c_char,
+    name: *const c_char,
+    mime: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    expire_secs: u32,
+    message_id_hex: *const c_char,
+) -> c_int {
+    refuse_reentry!(8);
+    unsafe {
+        file_using_id(
+            recipient,
+            name,
+            mime,
+            bytes,
+            len,
+            message_id_hex,
+            FileResend::Checked(expire_secs),
+        )
+    }
 }
 
 /// A binary send's body: `data` non-NULL, `len > 0` and a known magic
@@ -1168,8 +1853,25 @@ unsafe fn binary_body(data: *const u8, len: usize) -> Result<Vec<u8>, c_int> {
 /// The shared tail of the id-returning sends: run `send` on the client off
 /// the caller's thread and hand back the id as a heap C string, or NULL with
 /// the error recorded.
-fn send_returning_id(
-    send: impl FnOnce(Arc<RChatClient>) -> Result<String, RChatError> + Send + 'static,
+/// Write the timer a send carried to the caller's out-parameter, when it
+/// gave one (`expire_out` may be NULL).
+///
+/// # Safety
+///
+/// `expire_out` must be NULL or valid for one aligned `u32` write.
+unsafe fn write_expire(expire_out: *mut u32, expire_secs: u32) {
+    if !expire_out.is_null() {
+        // SAFETY: non-null and valid per the contract.
+        unsafe { expire_out.write(expire_secs) };
+    }
+}
+
+/// # Safety
+///
+/// `expire_out` must be NULL or valid for one aligned `u32` write.
+unsafe fn send_returning_id(
+    expire_out: *mut u32,
+    send: impl FnOnce(Arc<RChatClient>) -> Result<crate::Sent, RChatError> + Send + 'static,
 ) -> *mut c_char {
     let guard = lock_state();
     let client = match guard.client {
@@ -1192,8 +1894,12 @@ fn send_returning_id(
         std::thread::spawn(move || runtime_handle.block_on(async move { send(client) })).join();
 
     match result {
-        Ok(Ok(msg_id)) => match CString::new(msg_id) {
-            Ok(cstr) => cstr.into_raw(),
+        Ok(Ok(sent)) => match CString::new(sent.id) {
+            Ok(cstr) => {
+                // SAFETY: per this function's contract.
+                unsafe { write_expire(expire_out, sent.expire_secs) };
+                cstr.into_raw()
+            }
             Err(_) => {
                 record_error(8, "Message ID contained NUL".to_string());
                 std::ptr::null_mut()
@@ -1343,6 +2049,196 @@ pub extern "C" fn rchat_get_agreement_pubkey() -> *mut c_char {
     }
 }
 
+/// Our identity's ML-KEM-768 public key as 2368 hex digits, for our v3
+/// contact card (§A.6, base64 there). Derived from the identity seed
+/// (`HKDF(seed, "rchat/kem-seed/v3")`), so the one seed backup restores it
+/// with the other keys; there is nothing else to back up. Like
+/// `rchat_get_agreement_pubkey`: the client's identity, else the one from
+/// `rchat_generate_identity*`; NULL (code 8) when there is none. Free with
+/// `rchat_free_string`.
+#[no_mangle]
+pub extern "C" fn rchat_get_kem_pubkey() -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    // The state lock is released before asking the client (C-14).
+    let (client, staged) = {
+        let guard = lock_state();
+        (
+            guard.client.clone(),
+            guard.identity.as_ref().map(|i| hex::encode(i.kem_public())),
+        )
+    };
+    let hex_str = if let Some(client) = client {
+        match client.get_kem_public_key() {
+            Ok(k) => hex::encode(k),
+            Err(e) => {
+                record_rchat_error(&e, "No identity");
+                return std::ptr::null_mut();
+            }
+        }
+    } else if let Some(hex) = staged {
+        hex
+    } else {
+        record_error(8, "No identity available".to_string());
+        return std::ptr::null_mut();
+    };
+    match CString::new(hex_str) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// The ML-KEM-768 public key (2368 hex) of the identity the 64-byte `seed`
+/// rebuilds, without loading it: the app's card while the core has no
+/// identity loaded (an offline launch), as it derives the other public keys
+/// from the stored seed. Nothing is kept. NULL (code 9) for a NULL pointer
+/// or a seed of any other length (a legacy 32-byte seed included: the app
+/// stores 64). Free with `rchat_free_string`.
+///
+/// # Safety
+///
+/// `seed` must be NULL or valid for reads of `len` bytes for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_kem_pubkey_from_seed(seed: *const u8, len: usize) -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    let Some(identity) = (unsafe { identity_from_seed_arg(seed, len) }) else {
+        return std::ptr::null_mut();
+    };
+    match CString::new(hex::encode(identity.kem_public())) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// The identity a 64-byte seed argument rebuilds; None (code 9) otherwise.
+///
+/// # Safety
+///
+/// `seed` must be NULL or valid for reads of `len` bytes for the call.
+unsafe fn identity_from_seed_arg(seed: *const u8, len: usize) -> Option<IdentityKeyPair> {
+    if seed.is_null() || len != 64 {
+        record_error(9, "Invalid parameter".to_string());
+        return None;
+    }
+    // SAFETY: `seed` is non-null and the caller promises `len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(seed, len) };
+    match IdentityKeyPair::from_seed(bytes) {
+        Ok(identity) => Some(identity),
+        Err(_) => {
+            record_error(9, "Invalid seed".to_string());
+            None
+        }
+    }
+}
+
+/// Our card's `"bs"` (protocol v3 §A.6, R13): the 64-byte Ed25519
+/// signature of our identity over the v3 bundle transcript
+/// (`rchat/bundle/v3\0 ‖ ik ‖ ak ‖ kem_pk`, the bytes the relay bundle is
+/// signed over), as 128 hex. The client's identity, else the one loaded by
+/// `rchat_generate_identity*`; NULL (code 8) when there is none. Free with
+/// `rchat_free_string`.
+#[no_mangle]
+pub extern "C" fn rchat_get_bundle_signature() -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    let (client, staged) = {
+        let guard = lock_state();
+        (
+            guard.client.clone(),
+            guard
+                .identity
+                .as_ref()
+                .and_then(|i| crate::keyauth::sign_bundle(i).ok())
+                .map(|b| hex::encode(b.bundle_signature)),
+        )
+    };
+    let hex_str = if let Some(client) = client {
+        match client.get_bundle_signature() {
+            Ok(s) => hex::encode(s),
+            Err(e) => {
+                record_rchat_error(&e, "No identity");
+                return std::ptr::null_mut();
+            }
+        }
+    } else if let Some(hex) = staged {
+        hex
+    } else {
+        record_error(8, "No identity available".to_string());
+        return std::ptr::null_mut();
+    };
+    match CString::new(hex_str) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// `rchat_get_bundle_signature` for the identity the 64-byte `seed`
+/// rebuilds, without loading it (an offline launch's card). Ed25519 is
+/// deterministic: the same seed gives the same signature. NULL (code 9) for
+/// a NULL pointer or another length. Free with `rchat_free_string`.
+///
+/// # Safety
+///
+/// `seed` must be NULL or valid for reads of `len` bytes for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_bundle_signature_from_seed(
+    seed: *const u8,
+    len: usize,
+) -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    let Some(identity) = (unsafe { identity_from_seed_arg(seed, len) }) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(bundle) = crate::keyauth::sign_bundle(&identity) else {
+        record_error(8, "Could not sign".to_string());
+        return std::ptr::null_mut();
+    };
+    match CString::new(hex::encode(bundle.bundle_signature)) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Check a scanned or pasted v3 card (protocol v3 §A.6, R13): `sig_hex`
+/// (the card's `"bs"`, 128 hex) must be the identity `ik_hex`'s Ed25519
+/// signature over the v3 bundle transcript of `ik ‖ ak ‖ kem`, the key a
+/// valid ML-KEM-768 key (FIPS 203 check) and the agreement key not of low
+/// order. So a card whose agreement key or ML-KEM key was changed after
+/// its owner made it is refused at scan. 1 valid; 0 refused; -1 malformed
+/// arguments (code 9: not hex of the right lengths: 64, 64, 2368, 128).
+///
+/// # Safety
+///
+/// Every non-NULL pointer argument must point to a NUL-terminated string
+/// that stays valid and unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_verify_card_bundle(
+    ik_hex: *const c_char,
+    ak_hex: *const c_char,
+    kem_hex: *const c_char,
+    sig_hex: *const c_char,
+) -> c_int {
+    let parsed = (|| {
+        let ik = key_from_hex(&arg(ik_hex)?)?;
+        let ak = key_from_hex(&arg(ak_hex)?)?;
+        let kem: [u8; crate::kem::KEM_PK_LEN] = hex::decode(arg(kem_hex)?).ok()?.try_into().ok()?;
+        let sig: [u8; 64] = hex::decode(arg(sig_hex)?).ok()?.try_into().ok()?;
+        Some((ik, ak, kem, sig))
+    })();
+    let Some((ik, ak, kem, sig)) = parsed else {
+        record_error(9, "Invalid parameter".to_string());
+        return -1;
+    };
+    let bundle = crate::keyauth::SignedBundle {
+        identity_key: ik,
+        identity_agreement_key: ak,
+        kem_pk: Box::new(kem),
+        bundle_signature: sig,
+    };
+    match crate::keyauth::verify_bundle(&bundle) {
+        Ok(()) => 1,
+        Err(_) => 0,
+    }
+}
+
 /// # Safety
 ///
 /// Every non-NULL pointer argument must point to a NUL-terminated string
@@ -1375,10 +2271,12 @@ pub unsafe extern "C" fn rchat_validate_identity(identity_content: *const c_char
     0
 }
 
-/// Register the C callbacks (all eleven are required). Receipts carry the
+/// Register the C callbacks (all thirteen are required). Receipts carry the
 /// peer that sent them (`sender_hex`), so the app binds a receipt to the
 /// contact the message went to. Key event codes use the
-/// `rchat_peer_key_state` numbering (2 mismatch, 3 bad signature).
+/// `rchat_peer_key_state` numbering (2 mismatch, 3 bad signature), plus 5:
+/// a pinned contact's ML-KEM key learned from a bundle their identity
+/// signed, its third argument the key as 2368 hex (store it with the pin).
 ///
 /// Every pointer must be non-NULL. Each parameter is an
 /// `Option<extern "C" fn>` (the same ABI as a C function pointer, with NULL
@@ -1401,22 +2299,29 @@ pub unsafe extern "C" fn rchat_validate_identity(identity_content: *const c_char
 /// locked; they are only queued there, and reach this callback on the
 /// callback thread after the lock is released, so a callback that obeys
 /// the rule above cannot deadlock the connect.
+///
+/// `on_file` (12th, protocol v3 §E.2): a received file message, as
+/// `FileReceivedFn` documents. A file never reaches `on_message`.
+///
+/// `on_message` (1st) carries the message's `expire_secs` last, as
+/// `MessageFn` documents; `on_timer_changed` (13th, protocol v3 §I.2): a
+/// contact's disappearing timer changed, as `TimerChangedFn` documents.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn rchat_register_callbacks(
-    on_message: Option<extern "C" fn(*const c_char, *const c_char, u64, *const c_char, c_int)>,
+    on_message: Option<MessageFn>,
     on_state_change: Option<extern "C" fn(c_int)>,
     on_error: Option<extern "C" fn(*const c_char)>,
     on_circuit_established: Option<extern "C" fn(*const c_char, c_int)>,
     on_message_delivered: Option<extern "C" fn(*const c_char)>,
     on_reconnect: Option<extern "C" fn()>,
     on_peer_key_event: Option<extern "C" fn(*const c_char, c_int, *const c_char)>,
-    on_message_request: Option<
-        extern "C" fn(*const c_char, *const c_char, u64, *const c_char, *const c_char, u64, u32),
-    >,
+    on_message_request: Option<MessageRequestFn>,
     on_message_receipt: Option<extern "C" fn(*const c_char, *const c_char, c_int)>,
-    on_peer_rotated: Option<extern "C" fn(*const c_char, *const c_char, *const c_char, u32)>,
+    on_peer_rotated: Option<PeerRotatedFn>,
     on_status_event: Option<extern "C" fn(c_int, *const c_char, *const c_char, c_int)>,
+    on_file: Option<FileReceivedFn>,
+    on_timer_changed: Option<TimerChangedFn>,
 ) -> c_int {
     refuse_reentry!(-1);
     let (
@@ -1431,6 +2336,8 @@ pub extern "C" fn rchat_register_callbacks(
         Some(on_message_receipt),
         Some(on_peer_rotated),
         Some(on_status_event),
+        Some(on_file),
+        Some(on_timer_changed),
     ) = (
         on_message,
         on_state_change,
@@ -1443,6 +2350,8 @@ pub extern "C" fn rchat_register_callbacks(
         on_message_receipt,
         on_peer_rotated,
         on_status_event,
+        on_file,
+        on_timer_changed,
     )
     else {
         record_error(9, "A callback pointer is NULL".to_string());
@@ -1461,6 +2370,8 @@ pub extern "C" fn rchat_register_callbacks(
             on_message_receipt,
             on_peer_rotated,
             on_status_event,
+            on_file,
+            on_timer_changed,
         },
     };
     let client = {
@@ -1581,10 +2492,24 @@ fn pin_code(e: PinError) -> c_int {
     }
 }
 
-/// Pin (accept) a contact's agreement key. Works before `rchat_connect`
-/// once `rchat_initialize` has run (the pin is staged and moved into the
-/// client on connect). 0 ok, -1 invalid or blocked, -2 a different key is
-/// pinned, -3 not initialised, -4 the key is pinned for another contact.
+/// Pin (accept) a contact's agreement key and ML-KEM key (protocol v3
+/// §A.6). Works before `rchat_connect` once `rchat_initialize` has run (the
+/// pin is staged and moved into the client on connect).
+///
+/// `kem_hex`: the contact's ML-KEM-768 public key as 2368 hex digits, from
+/// their v3 card, an accepted request (`on_message_request`), a rotation
+/// (`on_peer_rotated`) or the app's stored copy of one; NULL when the app
+/// has none (the pinned one, if any, is kept). Without a KEM key no ask or
+/// request can be sent (code 27). The core keeps pins in memory only: the
+/// app stores the KEM key with the pin and passes it again at every launch.
+///
+/// Both keys are taken or neither. A different agreement key or a
+/// different KEM key than the pinned ones is never replaced here (-2):
+/// the app unpins first (the explicit re-pin from the contact's code).
+///
+/// 0 ok, -1 invalid (identity, agreement key, or a KEM key that is not a
+/// valid ML-KEM-768 key) or blocked, -2 a different key is pinned, -3 not
+/// initialised, -4 the agreement key is pinned for another contact.
 ///
 /// # Safety
 ///
@@ -1594,6 +2519,7 @@ fn pin_code(e: PinError) -> c_int {
 pub unsafe extern "C" fn rchat_pin_peer_key(
     identity_hex: *const c_char,
     agreement_hex: *const c_char,
+    kem_hex: *const c_char,
 ) -> c_int {
     refuse_reentry!(-1);
     let Some((ak_hex, ak)) = arg(agreement_hex).and_then(|h| key_from_hex(&h).map(|k| (h, k)))
@@ -1601,33 +2527,68 @@ pub unsafe extern "C" fn rchat_pin_peer_key(
         record_error(9, "Invalid agreement key".to_string());
         return -1;
     };
+    // The init check (-3) before the KEM key is read (fix round 1, minor 9).
     let (id, target) = match peer_target(identity_hex, true) {
         Ok(t) => t,
         Err(code) => return code,
     };
+    let kem = if kem_hex.is_null() {
+        None
+    } else {
+        match arg(kem_hex).and_then(|h| {
+            crate::circuits::parse_kem_hex(&h.to_lowercase()).map(|k| (h.to_lowercase(), k))
+        }) {
+            Some(k) => Some(k),
+            None => {
+                record_error(9, "Invalid ML-KEM key".to_string());
+                return -1;
+            }
+        }
+    };
     match target {
-        PeerTarget::Client(client) => match client.pin_peer_key(id, ak_hex) {
-            Ok(()) => 0,
-            Err(e @ RChatError::PinConflict) => {
-                record_rchat_error(&e, "Pin failed");
-                -2
+        PeerTarget::Client(client) => {
+            match client.pin_peer_key(id, ak_hex, kem.as_ref().map(|(h, _)| h.clone())) {
+                Ok(()) => 0,
+                Err(e @ RChatError::PinConflict) => {
+                    record_rchat_error(&e, "Pin failed");
+                    -2
+                }
+                Err(e @ RChatError::AgreementKeyInUse) => {
+                    record_rchat_error(&e, "Pin failed");
+                    -4
+                }
+                Err(e) => {
+                    record_rchat_error(&e, "Pin failed");
+                    -1
+                }
             }
-            Err(e @ RChatError::AgreementKeyInUse) => {
-                record_rchat_error(&e, "Pin failed");
-                -4
-            }
-            Err(e) => {
-                record_rchat_error(&e, "Pin failed");
-                -1
-            }
-        },
+        }
         PeerTarget::Staged(mut guard) => {
             if guard.staged.is_blocked(&id) {
                 record_rchat_error(&RChatError::PeerBlocked { identity: id }, "Pin failed");
                 return -1;
             }
+            // A connect is running with the book it took from here: a KEM
+            // key other than the one it holds for the same agreement key is
+            // refused now, as the live client would refuse it (R11). After
+            // an unpin here (the explicit re-pin) it is taken.
+            if let Some((_, k)) = &kem {
+                let clashes = guard.staged.kem_pk_for(&id).is_none()
+                    && !guard.staged.was_unpinned(&id)
+                    && guard.connecting_kems.iter().any(|(cid, cak, ck)| {
+                        cid == &id
+                            && constant_time_eq::constant_time_eq(cak, &ak)
+                            && !constant_time_eq::constant_time_eq(&ck[..], &k[..])
+                    });
+                if clashes {
+                    return pin_code(PinError::Conflict);
+                }
+            }
             let new_pin = guard.staged.pin_for(&id).is_none();
-            match guard.staged.pin(&id, ak) {
+            match guard
+                .staged
+                .pin_with_kem(&id, ak, kem.as_ref().map(|(_, k)| &**k))
+            {
                 Ok(()) => {
                     // As a live pin does: knocks no newer than this hour
                     // can't flag a mismatch (relay replay of an old key).
@@ -1818,16 +2779,56 @@ pub unsafe extern "C" fn rchat_set_intro_with_id(
 }
 
 /// Send a text message under a caller-chosen 32-hex id (an accepted
-/// intro's id). 0 ok, else an error code.
+/// intro's id): a first send, carrying the contact's current timer, which
+/// `expire_out` (when not NULL) receives. A retry of a message already
+/// sent uses `rchat_retry_message_using_id`. 0 ok, else an error code.
 ///
 /// # Safety
 ///
-/// Every non-NULL pointer argument must point to a NUL-terminated string
-/// that stays valid and unmodified for the duration of the call.
+/// Every non-NULL string argument must point to a NUL-terminated string
+/// that stays valid and unmodified for the duration of the call;
+/// `expire_out` must be NULL or valid for one `uint32_t` write.
 #[no_mangle]
 pub unsafe extern "C" fn rchat_send_message_using_id(
     recipient_hex: *const c_char,
     text: *const c_char,
+    message_id_hex: *const c_char,
+    expire_out: *mut u32,
+) -> c_int {
+    refuse_reentry!(8);
+    let (Some(recipient), Some(text), Some(id)) =
+        (arg(recipient_hex), arg(text), arg(message_id_hex))
+    else {
+        return record_error(9, "Invalid parameter".to_string());
+    };
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    match client.send_text(recipient, text, Some(id)) {
+        Ok(sent) => {
+            // SAFETY: per the contract.
+            unsafe { write_expire(expire_out, sent.expire_secs) };
+            0
+        }
+        Err(e) => record_rchat_error(&e, "Send failed"),
+    }
+}
+
+/// The app's same-id retry or manual resend of a text it already sent
+/// (spec §18.8; the D23 and D38 fallback Resend): `expire_secs` is the
+/// message's original disappearing timer (protocol v3 §I.2, ruling R32),
+/// one of the timer choices (9 otherwise). Not checked like
+/// `rchat_resend_message_using_id`. 0 ok, else an error code.
+///
+/// # Safety
+///
+/// As `rchat_send_message_using_id`.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_retry_message_using_id(
+    recipient_hex: *const c_char,
+    text: *const c_char,
+    expire_secs: u32,
     message_id_hex: *const c_char,
 ) -> c_int {
     refuse_reentry!(8);
@@ -1840,28 +2841,67 @@ pub unsafe extern "C" fn rchat_send_message_using_id(
         Ok(c) => c,
         Err(code) => return code,
     };
-    match client.send_text_message_using_id(recipient, text, id) {
+    match client.retry_text_message_using_id(recipient, text, expire_secs, id) {
         Ok(_) => 0,
         Err(e) => record_rchat_error(&e, "Send failed"),
     }
 }
 
 /// Send media (a body `rchat_send_binary_with_id` accepts) under a
-/// caller-chosen 32-hex id: the app's same-id resend (spec §18.6 D38).
-/// It takes the same path as every send (`send_payload`, where the sealed
-/// id is recorded as sent). Returns as `rchat_send_message_using_id`: 0 ok,
-/// else an error code (9 for a NULL argument, an empty or unknown body).
+/// caller-chosen 32-hex id: a first send, carrying the contact's current
+/// timer (`expire_out`, when not NULL, receives it). A resend of media
+/// already sent uses `rchat_retry_binary_using_id`. Returns as
+/// `rchat_send_message_using_id`: 0 ok, else an error code (9 for a NULL
+/// argument, an empty or unknown body).
 ///
 /// # Safety
 ///
 /// `recipient_hex` and `message_id_hex` must be NULL or NUL-terminated
 /// strings, and `data` NULL or valid for reads of `len` bytes; all stay
-/// valid and unmodified for the duration of the call.
+/// valid and unmodified for the duration of the call. `expire_out` must be
+/// NULL or valid for one `uint32_t` write.
 #[no_mangle]
 pub unsafe extern "C" fn rchat_send_binary_using_id(
     recipient_hex: *const c_char,
     data: *const u8,
     len: usize,
+    message_id_hex: *const c_char,
+    expire_out: *mut u32,
+) -> c_int {
+    refuse_reentry!(8);
+    let (Some(recipient), Some(id)) = (arg(recipient_hex), arg(message_id_hex)) else {
+        return record_error(9, "Invalid parameter".to_string());
+    };
+    let body = match unsafe { binary_body(data, len) } {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    match client.send_binary(recipient, body, Some(id)) {
+        Ok(sent) => {
+            // SAFETY: per the contract.
+            unsafe { write_expire(expire_out, sent.expire_secs) };
+            0
+        }
+        Err(e) => record_rchat_error(&e, "Send failed"),
+    }
+}
+
+/// `rchat_retry_message_using_id` for media: the app's same-id resend of
+/// media it already sent, with its original `expire_secs` (§I.2, R32).
+///
+/// # Safety
+///
+/// As `rchat_send_binary_using_id` (no `expire_out`).
+#[no_mangle]
+pub unsafe extern "C" fn rchat_retry_binary_using_id(
+    recipient_hex: *const c_char,
+    data: *const u8,
+    len: usize,
+    expire_secs: u32,
     message_id_hex: *const c_char,
 ) -> c_int {
     refuse_reentry!(8);
@@ -1876,7 +2916,7 @@ pub unsafe extern "C" fn rchat_send_binary_using_id(
         Ok(c) => c,
         Err(code) => return code,
     };
-    match client.send_binary_message_using_id(recipient, body, id) {
+    match client.retry_binary_message_using_id(recipient, body, expire_secs, id) {
         Ok(_) => 0,
         Err(e) => record_rchat_error(&e, "Send failed"),
     }
@@ -1887,6 +2927,9 @@ pub unsafe extern "C" fn rchat_send_binary_using_id(
 /// 26 unless the current session is the one that made the id eligible, the
 /// contact is still plainly pinned and the D38 guards on the sent entry
 /// still hold. On 26 the app offers its manual Resend row instead.
+/// `expire_secs` is the message's disappearing timer when it was first sent
+/// (protocol v3 §I.2), never the current one: one of the timer choices
+/// (code 9 otherwise).
 ///
 /// # Safety
 ///
@@ -1895,6 +2938,7 @@ pub unsafe extern "C" fn rchat_send_binary_using_id(
 pub unsafe extern "C" fn rchat_resend_message_using_id(
     recipient_hex: *const c_char,
     text: *const c_char,
+    expire_secs: u32,
     message_id_hex: *const c_char,
 ) -> c_int {
     refuse_reentry!(8);
@@ -1907,13 +2951,14 @@ pub unsafe extern "C" fn rchat_resend_message_using_id(
         Ok(c) => c,
         Err(code) => return code,
     };
-    match client.resend_text_message_using_id(recipient, text, id) {
+    match client.resend_text_message_using_id(recipient, text, expire_secs, id) {
         Ok(_) => 0,
         Err(e) => record_rchat_error(&e, "Resend failed"),
     }
 }
 
-/// `rchat_resend_message_using_id` for a binary (media) message.
+/// `rchat_resend_message_using_id` for a binary (media) message, with its
+/// original `expire_secs`.
 ///
 /// # Safety
 ///
@@ -1923,6 +2968,7 @@ pub unsafe extern "C" fn rchat_resend_binary_using_id(
     recipient_hex: *const c_char,
     data: *const u8,
     len: usize,
+    expire_secs: u32,
     message_id_hex: *const c_char,
 ) -> c_int {
     refuse_reentry!(8);
@@ -1937,7 +2983,7 @@ pub unsafe extern "C" fn rchat_resend_binary_using_id(
         Ok(c) => c,
         Err(code) => return code,
     };
-    match client.resend_binary_message_using_id(recipient, body, id) {
+    match client.resend_binary_message_using_id(recipient, body, expire_secs, id) {
         Ok(_) => 0,
         Err(e) => record_rchat_error(&e, "Resend failed"),
     }
@@ -1971,6 +3017,158 @@ pub unsafe extern "C" fn rchat_mark_message_seen(
     match client.mark_message_seen(sender, id) {
         Ok(()) => 0,
         Err(e) => record_rchat_error(&e, "Mark seen failed"),
+    }
+}
+
+/// Change the disappearing timer for a contact (protocol v3 §I.2). `secs`
+/// must be one of 0 (off), 300, 3600, 86400, 604800 or 2419200 (code 9
+/// otherwise, nothing changes), and the contact one we may send to (10-13
+/// as for a send). The change applies on this device at once (persisted
+/// with the peer record; `on_timer_changed` reports it with `by_me` = 1)
+/// and goes to the contact inside the session, padded and ack-tracked like
+/// a message: now when the session can send, otherwise when it can. The
+/// core owns its delivery (ruling R32): until the contact's phone
+/// acknowledges it, it is re-sent when reported lost and after each new
+/// session install; the app tracks nothing. New sends carry it. 0 ok.
+///
+/// On 0, `applied_out` (when not NULL) is 1 when our change is in force
+/// and 0 when it lost to a later change, and `current_out` (when not NULL)
+/// is the timer in force now (R33 I-1): show that, never the requested
+/// value.
+///
+/// # Safety
+///
+/// `peer_hex` must be NULL or a NUL-terminated string that stays valid and
+/// unmodified for the duration of the call; `current_out` and
+/// `applied_out` must be NULL or valid for one write each.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_set_disappearing_timer(
+    peer_hex: *const c_char,
+    secs: u32,
+    current_out: *mut u32,
+    applied_out: *mut i32,
+) -> c_int {
+    // SAFETY: the caller's contract is this function's, with no intro out.
+    unsafe {
+        rchat_set_disappearing_timer_ex(
+            peer_hex,
+            secs,
+            current_out,
+            applied_out,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// `rchat_set_disappearing_timer`, also reporting a dropped intro (final
+/// review M-1). An intro carries no timer, so a change that turns the
+/// timer on (applied, timer in force non-zero) drops the intro queued for
+/// the contact, and `rchat_set_intro*` refuses a new one while the timer
+/// is on. On 0, `intro_dropped_out` (when not NULL) receives the dropped
+/// intro's 32-hex id (free with `rchat_free_string`), or NULL when no
+/// intro was dropped. The message itself is unaffected: it waits for the
+/// circuit and goes as an ordinary message carrying the timer. On any
+/// other code it is set to NULL.
+///
+/// # Safety
+///
+/// As `rchat_set_disappearing_timer`; `intro_dropped_out` must be NULL or
+/// valid for one pointer write.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_set_disappearing_timer_ex(
+    peer_hex: *const c_char,
+    secs: u32,
+    current_out: *mut u32,
+    applied_out: *mut i32,
+    intro_dropped_out: *mut *mut c_char,
+) -> c_int {
+    if !intro_dropped_out.is_null() {
+        // SAFETY: NULL or valid for one write, per the contract.
+        unsafe { intro_dropped_out.write(std::ptr::null_mut()) };
+    }
+    refuse_reentry!(8);
+    let Some(peer) = arg(peer_hex) else {
+        return record_error(9, "Invalid parameter".to_string());
+    };
+    if !crate::disappearing::valid_timer(secs) {
+        return record_error(9, "Unknown timer value".to_string());
+    }
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    match client.set_disappearing_timer(peer, secs) {
+        Ok(outcome) => {
+            // SAFETY: NULL or valid for one write, per the contract.
+            unsafe {
+                write_expire(current_out, outcome.secs);
+                if !applied_out.is_null() {
+                    applied_out.write(i32::from(outcome.applied));
+                }
+                if !intro_dropped_out.is_null() {
+                    if let Some(id) = outcome.intro_dropped.and_then(|i| CString::new(i).ok()) {
+                        intro_dropped_out.write(id.into_raw());
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => record_rchat_error(&e, "Timer change failed"),
+    }
+}
+
+/// The disappearing timer new sends to `peer_hex` carry (0 = off), or -1
+/// with the code recorded (9 bad identity, 7 not connected, 8 busy).
+///
+/// # Safety
+///
+/// As `rchat_set_disappearing_timer`.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_disappearing_timer(peer_hex: *const c_char) -> i64 {
+    refuse_reentry!(-1);
+    let Some(peer) = arg(peer_hex) else {
+        record_error(9, "Invalid parameter".to_string());
+        return -1;
+    };
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    match client.disappearing_timer(peer) {
+        Ok(secs) => i64::from(secs),
+        Err(e) => {
+            record_rchat_error(&e, "Timer read failed");
+            -1
+        }
+    }
+}
+
+/// A message expired on this device (protocol v3 §I.2): the core drops any
+/// copy of its plaintext it still holds (the ack tracker's copy kept for a
+/// re-seal, a copy still queued for a session). Nothing is sent. 0 ok
+/// (also when the core held nothing for it), 9 for a malformed id, 7 when
+/// not connected (the core then holds no such copies).
+///
+/// # Safety
+///
+/// `message_id_hex` must be NULL or a NUL-terminated string that stays
+/// valid and unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_forget_message(message_id_hex: *const c_char) -> c_int {
+    refuse_reentry!(8);
+    let Some(id) = arg(message_id_hex) else {
+        return record_error(9, "Invalid parameter".to_string());
+    };
+    if crate::message_id_from_hex(&id).is_err() {
+        return record_error(9, "Message id must be 32 hex characters".to_string());
+    }
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    match client.forget_message(id) {
+        Ok(()) => 0,
+        Err(e) => record_rchat_error(&e, "Forget failed"),
     }
 }
 
@@ -2277,6 +3475,89 @@ pub unsafe extern "C" fn rchat_canonical_origin(server_url: *const c_char) -> *m
     }
 }
 
+fn invite_json(parsed: Result<crate::invite::Invite, crate::invite::InviteError>) -> *mut c_char {
+    let json = parsed.map(|i| serde_json::json!({ "url": i.url, "pin": i.pin }).to_string());
+    match json.map(CString::new) {
+        Ok(Ok(s)) => s.into_raw(),
+        Ok(Err(_)) => {
+            record_error(9, "Invalid relay invite".into());
+            std::ptr::null_mut()
+        }
+        Err(e) => {
+            record_error(9, format!("Invalid relay invite: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Parse a relay invite (protocol v3 Part J, `rchat://relay?u=…&pin=…`).
+/// Pure: needs neither `rchat_initialize` nor a client. Returns JSON
+/// `{"url":…,"pin":…}` (free with `rchat_free_string`), or NULL with last
+/// error 9 for anything `invite::parse_invite` refuses: only `wss://`.
+///
+/// # Safety
+///
+/// `link` must be NULL or point to a NUL-terminated string that stays valid
+/// and unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_parse_relay_invite(link: *const c_char) -> *mut c_char {
+    let Some(link) = (unsafe { arg(link) }) else {
+        record_error(9, "Invalid parameter".into());
+        return std::ptr::null_mut();
+    };
+    invite_json(crate::invite::parse_invite(&link))
+}
+
+/// `rchat_parse_relay_invite` that also accepts `ws://` to this device
+/// (`127.0.0.1`, `::1`, `localhost`): for the app's debug builds and a local
+/// test relay only. Exported only with the `dev-invite` feature, which
+/// `ios/build_rust.sh` sets for Debug builds: a release library has no
+/// such symbol.
+///
+/// # Safety
+///
+/// As `rchat_parse_relay_invite`.
+#[cfg(feature = "dev-invite")]
+#[no_mangle]
+pub unsafe extern "C" fn rchat_parse_relay_invite_dev(link: *const c_char) -> *mut c_char {
+    let Some(link) = (unsafe { arg(link) }) else {
+        record_error(9, "Invalid parameter".into());
+        return std::ptr::null_mut();
+    };
+    invite_json(crate::invite::parse_invite_allowing_loopback_ws(&link))
+}
+
+/// The invite link for a `wss://` relay URL and its pin (the relay's
+/// `--print-invite` uses the same formatter), for sharing from the app.
+/// Free with `rchat_free_string`; NULL with last error 9 if either is
+/// refused.
+///
+/// # Safety
+///
+/// Every non-NULL pointer argument must point to a NUL-terminated string
+/// that stays valid and unmodified for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_format_relay_invite(
+    url: *const c_char,
+    pin: *const c_char,
+) -> *mut c_char {
+    let (Some(url), Some(pin)) = (unsafe { arg(url) }, unsafe { arg(pin) }) else {
+        record_error(9, "Invalid parameter".into());
+        return std::ptr::null_mut();
+    };
+    match crate::invite::format_invite(&url, &pin).map(CString::new) {
+        Ok(Ok(s)) => s.into_raw(),
+        Ok(Err(_)) => {
+            record_error(9, "Invalid relay invite".into());
+            std::ptr::null_mut()
+        }
+        Err(e) => {
+            record_error(9, format!("Invalid relay invite: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Send the rotation notice over every live circuit (spec §4.8). `links_hex`
 /// is the `links` from `rchat_prepare_rotation`. Notices sent (>= 0), or the
 /// negated error code.
@@ -2329,6 +3610,40 @@ pub extern "C" fn rchat_set_cover_traffic(enabled: c_int, foreground: c_int) -> 
     };
     if let Some(client) = client {
         client.set_cover_traffic(on, fg);
+    }
+    0
+}
+
+/// Steady traffic on/off (`enabled` nonzero), its slot length and whether
+/// the app is in the foreground (`foreground` nonzero), protocol v3 §B.
+/// While on and in the foreground the core sends one same-size packet
+/// every slot to a random open conversation, in place of the random cover
+/// of `rchat_set_cover_traffic`. Kept until
+/// `rchat_connect` when there is no client. Never waits for a busy client.
+/// Returns 0, or 9 when `slot_ms` is not 500, 1000 or 2000 (nothing changes).
+#[no_mangle]
+pub extern "C" fn rchat_set_steady_traffic(
+    enabled: c_int,
+    slot_ms: u32,
+    foreground: c_int,
+) -> c_int {
+    refuse_reentry!(8);
+    let (enabled, foreground) = (enabled != 0, foreground != 0);
+    if !crate::steady::valid_slot_ms(slot_ms) {
+        return record_error(
+            9,
+            format!("steady slot must be 500, 1000 or 2000 ms (got {slot_ms})"),
+        );
+    }
+    let client = {
+        let mut guard = lock_state();
+        guard.steady = (enabled, slot_ms, foreground);
+        guard.client.clone()
+    };
+    if let Some(client) = client {
+        if let Err(e) = client.set_steady_traffic(enabled, slot_ms, foreground) {
+            return record_rchat_error(&e, "Steady traffic");
+        }
     }
     0
 }
@@ -2677,14 +3992,18 @@ mod tests {
         ts: u64,
         id: *const c_char,
         kind: c_int,
+        expire_secs: u32,
     ) {
         record(format!(
-            "msg {} {} {} {} k{kind}",
+            "msg {} {} {} {} k{kind} e{expire_secs}",
             s(sender),
             s(text),
             ts,
             s(id)
         ));
+    }
+    extern "C" fn t_on_timer(peer: *const c_char, secs: u32, at: u64, by_me: c_int) {
+        record(format!("timer {} {secs} {at} {by_me}", s(peer)));
     }
     static STATE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     extern "C" fn t_on_state(_: c_int) {
@@ -2697,9 +4016,11 @@ mod tests {
     extern "C" fn t_on_key(id: *const c_char, code: c_int, ak: *const c_char) {
         record(format!("key {} {} {}", s(id), code, s(ak)));
     }
+    #[allow(clippy::too_many_arguments)]
     extern "C" fn t_on_request(
         id: *const c_char,
         ak: *const c_char,
+        kem: *const c_char,
         hour: u64,
         iid: *const c_char,
         text: *const c_char,
@@ -2707,9 +4028,10 @@ mod tests {
         kv: u32,
     ) {
         record(format!(
-            "req {} {} {} [{}] [{}] {} kv{}",
+            "req {} {} kem={} {} [{}] [{}] {} kv{}",
             s(id),
             s(ak),
+            s(kem),
             hour,
             s(iid),
             s(text),
@@ -2717,13 +4039,54 @@ mod tests {
             kv
         ));
     }
-    extern "C" fn t_on_rotated(old: *const c_char, new: *const c_char, ak: *const c_char, v: u32) {
-        record(format!("rot {} {} {} {}", s(old), s(new), s(ak), v));
+    extern "C" fn t_on_rotated(
+        old: *const c_char,
+        new: *const c_char,
+        ak: *const c_char,
+        kem: *const c_char,
+        v: u32,
+    ) {
+        record(format!(
+            "rot {} {} {} {} {}",
+            s(old),
+            s(new),
+            s(ak),
+            s(kem),
+            v
+        ));
     }
     extern "C" fn t_on_receipt(sender: *const c_char, id: *const c_char, kind: c_int) {
         record(format!("rcpt {} {} {}", s(sender), s(id), kind));
     }
     extern "C" fn t_on_status(_: c_int, _: *const c_char, _: *const c_char, _: c_int) {}
+    #[allow(clippy::too_many_arguments)]
+    extern "C" fn t_on_file(
+        peer: *const c_char,
+        id: *const c_char,
+        name: *const c_char,
+        mime: *const c_char,
+        expire_secs: u32,
+        bytes: *const u8,
+        len: usize,
+        ts: u64,
+    ) {
+        let body = if bytes.is_null() {
+            assert_eq!(len, 0, "NULL bytes only for an empty file");
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
+        };
+        record(format!(
+            "file {} {} [{}] [{}] e{} {} {}",
+            s(peer),
+            s(id),
+            s(name),
+            s(mime),
+            expire_secs,
+            hex::encode(body),
+            ts
+        ));
+    }
 
     fn bridge() -> CCallbackBridge {
         CCallbackBridge {
@@ -2739,6 +4102,8 @@ mod tests {
                 on_message_receipt: t_on_receipt,
                 on_peer_rotated: t_on_rotated,
                 on_status_event: t_on_status,
+                on_file: t_on_file,
+                on_timer_changed: t_on_timer,
             },
         }
     }
@@ -2762,22 +4127,24 @@ mod tests {
         let saved = lock_state().callbacks.take();
         let all = || {
             (
-                Some(t_on_message as extern "C" fn(_, _, _, _, _)),
+                Some(t_on_message as MessageFn),
                 Some(t_on_state as extern "C" fn(_)),
                 Some(t_on_error as extern "C" fn(_)),
                 Some(t_on_circuit as extern "C" fn(_, _)),
                 Some(t_on_delivered as extern "C" fn(_)),
                 Some(t_on_reconnect as extern "C" fn()),
                 Some(t_on_key as extern "C" fn(_, _, _)),
-                Some(t_on_request as extern "C" fn(_, _, _, _, _, _, _)),
+                Some(t_on_request as MessageRequestFn),
                 Some(t_on_receipt as extern "C" fn(_, _, _)),
-                Some(t_on_rotated as extern "C" fn(_, _, _, _)),
+                Some(t_on_rotated as PeerRotatedFn),
                 Some(t_on_status as extern "C" fn(_, _, _, _)),
+                Some(t_on_file as FileReceivedFn),
+                Some(t_on_timer as TimerChangedFn),
             )
         };
-        let (m, st, e, ci, d, r, k, rq, rc, ro, se) = all();
+        let (m, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc) = all();
         // Each position NULL in turn.
-        for null_at in 0..11 {
+        for null_at in 0..13 {
             let code = rchat_register_callbacks(
                 m.filter(|_| null_at != 0),
                 st.filter(|_| null_at != 1),
@@ -2790,18 +4157,20 @@ mod tests {
                 rc.filter(|_| null_at != 8),
                 ro.filter(|_| null_at != 9),
                 se.filter(|_| null_at != 10),
+                fi.filter(|_| null_at != 11),
+                tc.filter(|_| null_at != 12),
             );
             assert_eq!(code, -1, "NULL at {null_at} refused");
             assert_eq!(rchat_last_error_code(), 9);
             assert!(lock_state().callbacks.is_none(), "nothing registered");
         }
         assert_eq!(
-            rchat_register_callbacks(m, st, e, ci, d, r, k, rq, rc, ro, se),
+            rchat_register_callbacks(m, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc),
             0
         );
         assert!(lock_state().callbacks.is_some());
         assert_eq!(
-            rchat_register_callbacks(None, st, e, ci, d, r, k, rq, rc, ro, se),
+            rchat_register_callbacks(None, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc),
             -1
         );
         assert!(
@@ -2858,25 +4227,451 @@ mod tests {
 
     /// Backlog (media type): media go as binary only with a known magic;
     /// a NULL, empty or unknown body is refused before any client lookup.
+    /// Task 13: `rchat_send_file` validates every pointer and length, and
+    /// refuses an oversize file (28) or a bad MIME (9) before copying the
+    /// bytes or needing a client.
+    #[test]
+    fn send_file_checks_its_arguments() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        let (to, name, mime) = (c(ID_A), c("a.txt"), c("text/plain"));
+        let send = |r: *const c_char, n: *const c_char, m: *const c_char, d: *const u8, len| {
+            let p = unsafe { rchat_send_file(r, n, m, d, len, std::ptr::null_mut()) };
+            assert!(p.is_null());
+            rchat_last_error_code()
+        };
+        let body = b"hi";
+        let null = std::ptr::null::<c_char>();
+        let no_bytes = std::ptr::null::<u8>();
+        assert_eq!(
+            send(null, name.as_ptr(), mime.as_ptr(), body.as_ptr(), 2),
+            9
+        );
+        assert_eq!(send(to.as_ptr(), null, mime.as_ptr(), body.as_ptr(), 2), 9);
+        assert_eq!(send(to.as_ptr(), name.as_ptr(), null, body.as_ptr(), 2), 9);
+        assert_eq!(
+            send(to.as_ptr(), name.as_ptr(), mime.as_ptr(), no_bytes, 2),
+            9
+        );
+        let bad_utf8 = [0xffu8, 0];
+        assert_eq!(
+            send(
+                to.as_ptr(),
+                bad_utf8.as_ptr().cast(),
+                mime.as_ptr(),
+                body.as_ptr(),
+                2
+            ),
+            9
+        );
+        let bad_mime = c("text/plain\u{7f}");
+        assert_eq!(
+            send(
+                to.as_ptr(),
+                name.as_ptr(),
+                bad_mime.as_ptr(),
+                body.as_ptr(),
+                2
+            ),
+            9
+        );
+        let big = vec![0u8; crate::file_msg::MAX_FILE_PLAINTEXT];
+        assert_eq!(
+            send(
+                to.as_ptr(),
+                name.as_ptr(),
+                mime.as_ptr(),
+                big.as_ptr(),
+                big.len()
+            ),
+            28,
+            "oversize"
+        );
+        // A good file (also an empty one, NULL with 0) reaches the client.
+        assert_eq!(
+            send(to.as_ptr(), name.as_ptr(), mime.as_ptr(), body.as_ptr(), 2),
+            7
+        );
+        assert_eq!(
+            send(to.as_ptr(), name.as_ptr(), mime.as_ptr(), no_bytes, 0),
+            7
+        );
+        let empty = c("");
+        assert_eq!(
+            send(
+                to.as_ptr(),
+                empty.as_ptr(),
+                empty.as_ptr(),
+                body.as_ptr(),
+                2
+            ),
+            7
+        );
+    }
+
+    /// Task 14: the app shows and saves a sent file under the same cleaned
+    /// name the receiver gets (`file_msg::sanitise_name`); NULL refused.
+    #[test]
+    fn sanitise_file_name_matches_the_core() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for raw in [
+            "../etc/passwd",
+            "CON.txt",
+            "",
+            "  .hidden. ",
+            "a\u{202e}b.pdf",
+            "ok.pdf",
+        ] {
+            let input = c(raw);
+            let p = unsafe { rchat_sanitise_file_name(input.as_ptr()) };
+            assert!(!p.is_null(), "{raw:?}");
+            let got = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
+            unsafe { rchat_free_string(p) };
+            assert_eq!(
+                got,
+                crate::file_msg::sanitise_name(raw.as_bytes()),
+                "{raw:?}"
+            );
+        }
+        assert!(unsafe { rchat_sanitise_file_name(std::ptr::null()) }.is_null());
+        assert_eq!(rchat_last_error_code(), 9);
+    }
+
+    /// Task 14: the same-id file send (Retry) and the checked automatic
+    /// resend validate like `rchat_send_file` (9, 28 before any copy), then
+    /// the id (9), and report "not connected" (7) without a client.
+    #[test]
+    fn file_using_id_checks_its_arguments() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        type Entry = unsafe fn(
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const u8,
+            usize,
+            *const c_char,
+        ) -> c_int;
+        // The Retry takes the current timer; the checked resend the
+        // original one (60 here is not a choice, but the arguments are
+        // checked first).
+        unsafe fn retry(
+            r: *const c_char,
+            n: *const c_char,
+            m: *const c_char,
+            d: *const u8,
+            len: usize,
+            i: *const c_char,
+        ) -> c_int {
+            unsafe { rchat_send_file_using_id(r, n, m, d, len, i, std::ptr::null_mut()) }
+        }
+        unsafe fn checked(
+            r: *const c_char,
+            n: *const c_char,
+            m: *const c_char,
+            d: *const u8,
+            len: usize,
+            i: *const c_char,
+        ) -> c_int {
+            unsafe { rchat_resend_file_using_id(r, n, m, d, len, 300, i) }
+        }
+        let entries: [Entry; 2] = [retry, checked];
+        let (to, name, mime, id) = (c(ID_A), c("a.txt"), c("text/plain"), c(&"ab".repeat(16)));
+        let null = std::ptr::null::<c_char>();
+        let no_bytes = std::ptr::null::<u8>();
+        let body = b"hi";
+        let big = vec![0u8; crate::file_msg::MAX_FILE_PLAINTEXT];
+        let bad_mime = c("text/plain\u{7f}");
+        let bad_id = c("zz");
+        for f in entries {
+            let call = |r, n, m, d, len, i| unsafe { f(r, n, m, d, len, i) };
+            assert_eq!(
+                call(
+                    null,
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    id.as_ptr()
+                ),
+                9
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    null,
+                    mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    id.as_ptr()
+                ),
+                9
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    null,
+                    body.as_ptr(),
+                    2,
+                    id.as_ptr()
+                ),
+                9
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    null
+                ),
+                9
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    no_bytes,
+                    2,
+                    id.as_ptr()
+                ),
+                9
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    bad_mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    id.as_ptr()
+                ),
+                9
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    big.as_ptr(),
+                    big.len(),
+                    id.as_ptr()
+                ),
+                28,
+                "oversize"
+            );
+            assert_eq!(rchat_last_error_code(), 28);
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    bad_id.as_ptr()
+                ),
+                9,
+                "bad id"
+            );
+            // The id is checked first: an oversize file with a bad id is a
+            // bad argument (9), not too large.
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    big.as_ptr(),
+                    big.len(),
+                    bad_id.as_ptr()
+                ),
+                9,
+                "id first"
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    id.as_ptr()
+                ),
+                7
+            );
+            assert_eq!(
+                call(
+                    to.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    no_bytes,
+                    0,
+                    id.as_ptr()
+                ),
+                7
+            );
+        }
+    }
+
+    /// Final review L4: a file send refused for want of a client (or a
+    /// runtime) wipes the bridge's copy of the bytes, as a send does.
+    #[test]
+    fn send_file_without_a_client_wipes_its_copy() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        let needle: [u8; 32] = rand::random();
+        let (a, name, mime) = (c(ID_A), c("f.bin"), c(""));
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let hits = crate::alloc_probe::freed_containing(needle, || {
+            out = unsafe {
+                rchat_send_file(
+                    a.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    needle.as_ptr(),
+                    needle.len(),
+                    std::ptr::null_mut(),
+                )
+            };
+        });
+        assert!(out.is_null());
+        assert_eq!(rchat_last_error_code(), 7);
+        assert_eq!(hits, 0, "the copy was wiped");
+        let id = c("0123456789abcdef0123456789abcdef");
+        let hits = crate::alloc_probe::freed_containing(needle, || {
+            let code = unsafe {
+                rchat_send_file_using_id(
+                    a.as_ptr(),
+                    name.as_ptr(),
+                    mime.as_ptr(),
+                    needle.as_ptr(),
+                    needle.len(),
+                    id.as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(code, 7);
+        });
+        assert_eq!(hits, 0, "the same-id copy was wiped");
+    }
+
+    /// R30 M-4: the bridge wipes a received file's bytes after `on_file`.
+    #[test]
+    fn the_bridge_wipes_file_bytes() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // An `on_file` that only reads the bytes (the app's copy is its own).
+        #[allow(clippy::too_many_arguments)]
+        extern "C" fn read_only(
+            _: *const c_char,
+            _: *const c_char,
+            _: *const c_char,
+            _: *const c_char,
+            _: u32,
+            bytes: *const u8,
+            len: usize,
+            _: u64,
+        ) {
+            assert_eq!(len, 32);
+            assert!(!bytes.is_null());
+        }
+        let needle: [u8; 32] = rand::random();
+        let b = CCallbackBridge {
+            ptrs: CCallbackPointers {
+                on_file: read_only,
+                ..noop_pointers()
+            },
+        };
+        let hits = crate::alloc_probe::freed_containing(needle, || {
+            b.on_file_received(crate::ReceivedFile {
+                id: "cd".repeat(16),
+                sender_identity: "ab".into(),
+                name: "x".into(),
+                mime: String::new(),
+                expire_secs: 0,
+                bytes: needle.to_vec(),
+                timestamp_ms: 1,
+            });
+        });
+        assert_eq!(hits, 0);
+    }
+
+    /// Task 13: a received file crosses `on_file` with every field and its
+    /// raw bytes (NUL bytes included); an empty file crosses as NULL, 0.
+    #[test]
+    fn files_cross_the_file_callback() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        CALLS.lock().unwrap().clear();
+        let b = bridge();
+        b.on_file_received(crate::ReceivedFile {
+            id: "cd".repeat(16),
+            sender_identity: "ab".into(),
+            name: "_notes.txt".into(),
+            mime: "text/plain".into(),
+            expire_secs: 86_400,
+            bytes: vec![0x00, 0x41, 0x00],
+            timestamp_ms: 1234,
+        });
+        b.on_file_received(crate::ReceivedFile {
+            id: "ef".repeat(16),
+            sender_identity: "ab".into(),
+            name: "file".into(),
+            mime: String::new(),
+            expire_secs: 0,
+            bytes: Vec::new(),
+            timestamp_ms: 5,
+        });
+        let calls = CALLS.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                format!(
+                    "file ab {} [_notes.txt] [text/plain] e86400 004100 1234",
+                    "cd".repeat(16)
+                ),
+                format!("file ab {} [file] [] e0  5", "ef".repeat(16)),
+            ]
+        );
+        assert!(
+            calls.iter().all(|l| !l.starts_with("msg")),
+            "never on_message"
+        );
+    }
+
     #[test]
     fn send_binary_checks_its_body() {
         let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         rchat_disconnect();
         let to = c(ID_A);
         let send = |data: &[u8]| unsafe {
-            let p = rchat_send_binary_with_id(to.as_ptr(), data.as_ptr(), data.len());
+            let p = rchat_send_binary_with_id(
+                to.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null_mut(),
+            );
             assert!(p.is_null());
             rchat_last_error_code()
         };
         assert_eq!(send(b"BSTPx"), 9, "unknown magic");
         assert_eq!(send(b"IMG"), 9, "too short for a magic");
         assert_eq!(
-            unsafe { rchat_send_binary_with_id(to.as_ptr(), std::ptr::null(), 4) },
+            unsafe {
+                rchat_send_binary_with_id(to.as_ptr(), std::ptr::null(), 4, std::ptr::null_mut())
+            },
             std::ptr::null_mut()
         );
         assert_eq!(rchat_last_error_code(), 9);
         assert_eq!(
-            unsafe { rchat_send_binary_with_id(std::ptr::null(), b"IMG1".as_ptr(), 4) },
+            unsafe {
+                rchat_send_binary_with_id(
+                    std::ptr::null(),
+                    b"IMG1".as_ptr(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            },
             std::ptr::null_mut()
         );
         assert_eq!(rchat_last_error_code(), 9);
@@ -2893,7 +4688,7 @@ mod tests {
         rchat_disconnect(); // no runtime, no client
         let (a, b, ak1, ak2) = (c(ID_A), c(ID_B), c(AK_1), c(AK_2));
         assert_eq!(
-            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) },
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
             -3,
             "uninitialised"
         );
@@ -2901,35 +4696,38 @@ mod tests {
         assert_eq!(unsafe { rchat_set_peer_blocked(a.as_ptr(), 1) }, -3);
         assert_eq!(rchat_initialize(), 0);
         assert_eq!(
-            unsafe { rchat_pin_peer_key(c("nothex").as_ptr(), ak1.as_ptr()) },
+            unsafe { rchat_pin_peer_key(c("nothex").as_ptr(), ak1.as_ptr(), std::ptr::null()) },
             -1
         );
         assert_eq!(
-            unsafe { rchat_pin_peer_key(std::ptr::null(), ak1.as_ptr()) },
+            unsafe { rchat_pin_peer_key(std::ptr::null(), ak1.as_ptr(), std::ptr::null()) },
             -1
         );
         assert_eq!(
-            unsafe { rchat_pin_peer_key(a.as_ptr(), c("nothex").as_ptr()) },
+            unsafe { rchat_pin_peer_key(a.as_ptr(), c("nothex").as_ptr(), std::ptr::null()) },
             -1
         );
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert!(
             lock_state().staged.pin_hour(ID_A).is_some(),
             "a staged pin records its hour, as a live pin does"
         );
         assert_eq!(
-            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) },
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
             0,
             "same value: no-op"
         );
         assert_eq!(
-            unsafe { rchat_pin_peer_key(a.as_ptr(), ak2.as_ptr()) },
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
             -2,
             "conflict"
         );
         assert_eq!(rchat_last_error_code(), 17);
         assert_eq!(
-            unsafe { rchat_pin_peer_key(b.as_ptr(), ak1.as_ptr()) },
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
             -4,
             "agreement key in use"
         );
@@ -2940,7 +4738,7 @@ mod tests {
         assert_eq!(unsafe { rchat_set_peer_blocked(b.as_ptr(), 1) }, 0);
         assert_eq!(unsafe { rchat_peer_key_state(b.as_ptr()) }, 4);
         assert_eq!(
-            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr()) },
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
             -1,
             "blocked"
         );
@@ -3239,6 +5037,232 @@ mod tests {
         rchat_disconnect();
     }
 
+    /// §A.7: the identity's ML-KEM key comes from the one seed (identity
+    /// export and backup stay the seed alone): `rchat_get_kem_pubkey` on a
+    /// generated identity equals the key `IdentityKeyPair::from_seed`
+    /// derives from the seed handed out, as 2368 hex digits.
+    #[test]
+    fn kem_pubkey_comes_from_the_one_seed() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert!(rchat_get_kem_pubkey().is_null(), "no identity yet");
+        assert_eq!(rchat_last_error_code(), 8);
+        assert_eq!(rchat_initialize(), 0);
+        let mut out = [0u8; 64];
+        assert_eq!(
+            unsafe { rchat_generate_identity_seed(out.as_mut_ptr(), out.len()) },
+            1
+        );
+        let rebuilt = IdentityKeyPair::from_seed(&out).unwrap();
+        let p = rchat_get_kem_pubkey();
+        assert!(!p.is_null());
+        let kem = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
+        unsafe { rchat_free_string(p) };
+        assert_eq!(kem.len(), 2 * crate::kem::KEM_PK_LEN);
+        assert_eq!(kem, hex::encode(rebuilt.kem_public()));
+        // The seed alone gives it, with no identity loaded (offline card).
+        rchat_disconnect();
+        let p = unsafe { rchat_kem_pubkey_from_seed(out.as_ptr(), out.len()) };
+        assert!(!p.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(p) }.to_str().unwrap(),
+            kem,
+            "deterministic"
+        );
+        unsafe { rchat_free_string(p) };
+        assert!(unsafe { rchat_kem_pubkey_from_seed(out.as_ptr(), 63) }.is_null());
+        assert_eq!(rchat_last_error_code(), 9);
+        assert!(
+            unsafe { rchat_kem_pubkey_from_seed(out.as_ptr(), 32) }.is_null(),
+            "64 bytes only"
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+        assert!(unsafe { rchat_kem_pubkey_from_seed(std::ptr::null(), 64) }.is_null());
+    }
+
+    /// R13: our card's bundle signature verifies with our keys (from the
+    /// loaded identity and from the seed alone, the same bytes); a card
+    /// whose ML-KEM key or agreement key was changed is refused (0), as is
+    /// one with a key failing the FIPS 203 check; malformed input is -1.
+    #[test]
+    fn card_bundle_signature_round_trip_and_tampering() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert!(rchat_get_bundle_signature().is_null());
+        assert_eq!(rchat_initialize(), 0);
+        let mut seed = [0u8; 64];
+        assert_eq!(
+            unsafe { rchat_generate_identity_seed(seed.as_mut_ptr(), seed.len()) },
+            1
+        );
+        let take = |p: *mut c_char| {
+            assert!(!p.is_null());
+            let v = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
+            unsafe { rchat_free_string(p) };
+            v
+        };
+        let sig = take(rchat_get_bundle_signature());
+        assert_eq!(sig.len(), 128);
+        assert_eq!(
+            take(unsafe { rchat_bundle_signature_from_seed(seed.as_ptr(), 64) }),
+            sig,
+            "deterministic, from the seed alone"
+        );
+        let id = IdentityKeyPair::from_seed(&seed).unwrap();
+        let (ik, ak, kem) = (
+            id.public_key_hex(),
+            id.agreement_key_hex(),
+            hex::encode(id.kem_public()),
+        );
+        let verify = |ik: &str, ak: &str, kem: &str, sig: &str| unsafe {
+            rchat_verify_card_bundle(
+                c(ik).as_ptr(),
+                c(ak).as_ptr(),
+                c(kem).as_ptr(),
+                c(sig).as_ptr(),
+            )
+        };
+        assert_eq!(verify(&ik, &ak, &kem, &sig), 1);
+        assert_eq!(verify(&ik, &ak, &kem.to_uppercase(), &sig), 1, "hex case");
+        let other = IdentityKeyPair::from_seed(&[0x5a; 64]).unwrap();
+        assert_eq!(
+            verify(&ik, &ak, &hex::encode(other.kem_public()), &sig),
+            0,
+            "tampered kem"
+        );
+        assert_eq!(
+            verify(&ik, &other.agreement_key_hex(), &kem, &sig),
+            0,
+            "tampered ak"
+        );
+        assert_eq!(
+            verify(&other.public_key_hex(), &ak, &kem, &sig),
+            0,
+            "another identity"
+        );
+        assert_eq!(
+            verify(&ik, &ak, &"ff".repeat(1184), &sig),
+            0,
+            "FIPS 203 check"
+        );
+        assert_eq!(verify(&ik, &ak, &kem, &"00".repeat(64)), 0);
+        assert_eq!(verify(&ik, &ak, &kem[2..], &sig), -1);
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(verify(&ik, &ak, &kem, &sig[2..]), -1);
+        assert!(unsafe { rchat_bundle_signature_from_seed(seed.as_ptr(), 32) }.is_null());
+        rchat_disconnect();
+    }
+
+    /// Fix round 1 minor 6: while a connect runs with the book it took from
+    /// the staged one, a staged pin naming another ML-KEM key for the same
+    /// agreement key is refused (-2, code 17) as the live client would
+    /// refuse it; the same key, or one after an unpin, is taken.
+    #[test]
+    fn staged_pin_during_a_connect_refuses_another_kem_key() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        let (a, ak1) = (c(ID_A), c(AK_1));
+        let k1 = *crate::kem::KemKeyPair::generate().public();
+        let k2 = *crate::kem::KemKeyPair::generate().public();
+        let (h1, h2) = (c(&hex::encode(k1)), c(&hex::encode(k2)));
+        lock_state().connecting_kems =
+            vec![(ID_A.to_string(), key_from_hex(AK_1).unwrap(), Box::new(k1))];
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h2.as_ptr()) },
+            -2
+        );
+        assert_eq!(rchat_last_error_code(), 17);
+        assert_eq!(
+            unsafe { rchat_peer_key_state(a.as_ptr()) },
+            0,
+            "nothing staged"
+        );
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h1.as_ptr()) },
+            0
+        );
+        assert_eq!(unsafe { rchat_unpin_peer_key(a.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h2.as_ptr()) },
+            0,
+            "the explicit re-pin"
+        );
+        rchat_disconnect();
+        assert!(lock_state().connecting_kems.is_empty());
+    }
+
+    /// Fix round 1 minor 9: not initialised (-3) wins over a bad KEM key.
+    #[test]
+    fn pin_init_check_comes_before_the_kem_key() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        let (a, ak1) = (c(ID_A), c(AK_1));
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), c("abcd").as_ptr()) },
+            -3
+        );
+    }
+
+    /// §A.6, R11: the pin call takes the KEM key with the agreement key
+    /// (staged before a connect here). The same key again is accepted; a
+    /// different one is a conflict (-2, code 17) and changes nothing; a
+    /// malformed one is invalid (-1, code 9) and pins nothing; NULL keeps
+    /// the pinned one; after an unpin (the explicit re-pin) a new one is
+    /// taken.
+    #[test]
+    fn pin_peer_key_takes_the_kem_key_and_never_replaces_it() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        let (a, b, ak1, ak2) = (c(ID_A), c(ID_B), c(AK_1), c(AK_2));
+        let k1 = *crate::kem::KemKeyPair::generate().public();
+        let k2 = *crate::kem::KemKeyPair::generate().public();
+        let (h1, h2) = (c(&hex::encode(k1)), c(&hex::encode(k2)));
+        let staged_kem = || lock_state().staged.kem_pk_for(ID_A).map(|k| k.to_vec());
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h1.as_ptr()) },
+            0
+        );
+        assert_eq!(staged_kem(), Some(k1.to_vec()));
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h1.as_ptr()) },
+            0,
+            "same keys"
+        );
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h2.as_ptr()) },
+            -2
+        );
+        assert_eq!(rchat_last_error_code(), 17);
+        assert_eq!(staged_kem(), Some(k1.to_vec()), "not replaced");
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
+        assert_eq!(staged_kem(), Some(k1.to_vec()), "NULL keeps it");
+        for bad in ["abcd".to_string(), "ff".repeat(1184), "zz".repeat(1184)] {
+            assert_eq!(
+                unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr(), c(&bad).as_ptr()) },
+                -1
+            );
+            assert_eq!(rchat_last_error_code(), 9);
+            assert_eq!(
+                unsafe { rchat_peer_key_state(b.as_ptr()) },
+                0,
+                "nothing pinned"
+            );
+        }
+        assert_eq!(unsafe { rchat_unpin_peer_key(a.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), h2.as_ptr()) },
+            0,
+            "the explicit re-pin"
+        );
+        assert_eq!(staged_kem(), Some(k2.to_vec()));
+        rchat_disconnect();
+    }
+
     /// C-6: a disconnect (logout, Reset Identity) while a connect is still
     /// running wins: the connect's client is never installed and its book
     /// is not staged for the next account.
@@ -3248,7 +5272,10 @@ mod tests {
         rchat_disconnect();
         assert_eq!(rchat_initialize(), 0);
         let (a, ak1) = (c(ID_A), c(AK_1));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -3293,7 +5320,10 @@ mod tests {
         rchat_disconnect();
         assert_eq!(rchat_initialize(), 0);
         let (a, b, ak1) = (c(ID_A), c(ID_B), c(AK_1));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(unsafe { rchat_set_peer_blocked(b.as_ptr(), 1) }, 0);
         let client = RChatClient::new(ClientConfig::default()).unwrap();
         adopt_staged(&client);
@@ -3321,7 +5351,10 @@ mod tests {
         rchat_disconnect();
         assert_eq!(rchat_initialize(), 0);
         let (a, b, ak1) = (c(ID_A), c(ID_B), c(AK_1));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(unsafe { rchat_set_peer_blocked(b.as_ptr(), 1) }, 0);
         // A bad seed fails inside `connect()`, after the book was adopted,
         // without touching the network.
@@ -3358,11 +5391,17 @@ mod tests {
         rchat_disconnect();
         assert_eq!(rchat_initialize(), 0);
         let (a, b, ak1, ak2) = (c(ID_A), c(ID_B), c(AK_1), c(AK_2));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         let client = RChatClient::new(ClientConfig::default()).unwrap();
         adopt_staged(&client);
         // Staged while the (failing) connect ran.
-        assert_eq!(unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
+            0
+        );
         restore_staged(&client);
         assert_eq!(unsafe { rchat_peer_key_state(a.as_ptr()) }, 1);
         assert_eq!(unsafe { rchat_peer_key_state(b.as_ptr()) }, 1);
@@ -3392,7 +5431,10 @@ mod tests {
         rchat_disconnect();
         assert_eq!(rchat_initialize(), 0);
         let (a, b, ak1, ak2) = (c(ID_A), c(ID_B), c(AK_1), c(AK_2));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(unsafe { rchat_set_peer_blocked(b.as_ptr(), 1) }, 0);
         let client = RChatClient::new(ClientConfig::default()).unwrap();
         adopt_staged(&client);
@@ -3411,7 +5453,10 @@ mod tests {
             0,
             "unblock survives too"
         );
-        assert_eq!(unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
+            0
+        );
         rchat_disconnect();
     }
 
@@ -3423,7 +5468,10 @@ mod tests {
         let old = RChatClient::new(ClientConfig::default()).unwrap();
         lock_state().client = Some(old.clone());
         let (a, b, ak1) = (c(ID_A), c(ID_B), c(AK_1));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(unsafe { rchat_set_peer_blocked(b.as_ptr(), 1) }, 0);
         assert_eq!(
             lock_state().staged.pin_for(ID_A),
@@ -3484,7 +5532,10 @@ mod tests {
         let old = RChatClient::new(ClientConfig::default()).unwrap();
         lock_state().client = Some(old.clone());
         let (a, ak1) = (c(ID_A), c(AK_1));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         let config = bad_seed_config();
         assert_ne!(
             unsafe { rchat_connect(config.as_ptr()) },
@@ -3509,13 +5560,22 @@ mod tests {
         rchat_disconnect();
         assert_eq!(rchat_initialize(), 0);
         let (a, b, cc, ak1, ak2, ak3) = (c(ID_A), c(ID_B), c(ID_C), c(AK_1), c(AK_2), c(AK_3));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
-        assert_eq!(unsafe { rchat_pin_peer_key(cc.as_ptr(), ak3.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(cc.as_ptr(), ak3.as_ptr(), std::ptr::null()) },
+            0
+        );
         let client = RChatClient::new(ClientConfig::default()).unwrap();
         adopt_staged(&client);
         // While connecting (no client in the state yet): a delete, an add, a block.
         assert_eq!(unsafe { rchat_unpin_peer_key(a.as_ptr()) }, 0);
-        assert_eq!(unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(unsafe { rchat_set_peer_blocked(cc.as_ptr(), 1) }, 0);
         install_client(client.clone());
         assert_eq!(
@@ -3545,20 +5605,29 @@ mod tests {
         let client = RChatClient::new(ClientConfig::default()).unwrap();
         lock_state().client = Some(client.clone());
         let (a, b, ak1, ak2) = (c(ID_A), c(ID_B), c(AK_1), c(AK_2));
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(
             client.peer_key_state(ID_A.to_string()),
             1,
             "acts on the client"
         );
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak2.as_ptr()) }, -2);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
+            -2
+        );
         assert_eq!(rchat_last_error_code(), 17);
-        assert_eq!(unsafe { rchat_pin_peer_key(b.as_ptr(), ak1.as_ptr()) }, -4);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            -4
+        );
         assert_eq!(rchat_last_error_code(), 18);
         assert_eq!(unsafe { rchat_set_peer_blocked(b.as_ptr(), 1) }, 0);
         assert_eq!(unsafe { rchat_peer_key_state(b.as_ptr()) }, 4);
         assert_eq!(
-            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr()) },
+            unsafe { rchat_pin_peer_key(b.as_ptr(), ak2.as_ptr(), std::ptr::null()) },
             -1,
             "blocked"
         );
@@ -3594,8 +5663,30 @@ mod tests {
                 .is_null()
         );
         assert_eq!(rchat_last_error_code(), 9);
+        // M-1: the intro out is NULL on any failure.
+        let mut dropped: *mut c_char = std::ptr::dangling_mut::<c_char>();
         assert_eq!(
-            unsafe { rchat_send_message_using_id(a.as_ptr(), c("hi").as_ptr(), id.as_ptr()) },
+            unsafe {
+                rchat_set_disappearing_timer_ex(
+                    a.as_ptr(),
+                    300,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dropped,
+                )
+            },
+            7
+        );
+        assert!(dropped.is_null());
+        assert_eq!(
+            unsafe {
+                rchat_send_message_using_id(
+                    a.as_ptr(),
+                    c("hi").as_ptr(),
+                    id.as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
             7
         );
         assert_eq!(
@@ -3607,7 +5698,14 @@ mod tests {
             7
         );
         assert_eq!(
-            unsafe { rchat_send_message_using_id(std::ptr::null(), c("hi").as_ptr(), id.as_ptr()) },
+            unsafe {
+                rchat_send_message_using_id(
+                    std::ptr::null(),
+                    c("hi").as_ptr(),
+                    id.as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
             9
         );
         assert_eq!(rchat_last_error_code(), 9);
@@ -3615,16 +5713,20 @@ mod tests {
         // The code is never stale: after a key-rejected failure (10), a later
         // NULL from rchat_send_message_with_id reports its own cause.
         record_error(10, String::new());
-        assert!(unsafe { rchat_send_message_with_id(a.as_ptr(), c("hi").as_ptr()) }.is_null());
+        assert!(unsafe {
+            rchat_send_message_with_id(a.as_ptr(), c("hi").as_ptr(), std::ptr::null_mut())
+        }
+        .is_null());
         assert_eq!(
             rchat_last_error_code(),
             7,
             "not connected, not the stale 10"
         );
         record_error(10, String::new());
-        assert!(
-            unsafe { rchat_send_message_with_id(std::ptr::null(), c("hi").as_ptr()) }.is_null()
-        );
+        assert!(unsafe {
+            rchat_send_message_with_id(std::ptr::null(), c("hi").as_ptr(), std::ptr::null_mut())
+        }
+        .is_null());
         assert_eq!(
             rchat_last_error_code(),
             9,
@@ -3640,7 +5742,7 @@ mod tests {
             ),
             (
                 "send_message",
-                Box::new(|| unsafe { rchat_send_message(null, null) }),
+                Box::new(|| unsafe { rchat_send_message(null, null, std::ptr::null_mut()) }),
             ),
             (
                 "has_session",
@@ -3700,6 +5802,7 @@ mod tests {
             content: b"hi".to_vec(),
             timestamp_ms: 5,
             is_text: true,
+            expire_secs: 0,
         });
         b.on_message_received(ReceivedMessage {
             id: "00000000000000000000000000000001".into(),
@@ -3707,11 +5810,13 @@ mod tests {
             content: b"IMG1\x00".to_vec(),
             timestamp_ms: 6,
             is_text: false,
+            expire_secs: 86400,
         });
         b.on_peer_key_event(ID_A.into(), 2, AK_2.into());
         b.on_message_request(crate::MessageRequest {
             identity_hex: ID_B.into(),
             agreement_hex: AK_1.into(),
+            kem_hex: "abcd".into(),
             issued_hour: 486_000,
             intro_message_id_hex: String::new(),
             intro_text: String::new(),
@@ -3721,6 +5826,7 @@ mod tests {
         b.on_message_request(crate::MessageRequest {
             identity_hex: ID_B.into(),
             agreement_hex: AK_1.into(),
+            kem_hex: "ef01".into(),
             issued_hour: 486_001,
             intro_message_id_hex: "00112233445566778899aabbccddeeff".into(),
             intro_text: "hello there".into(),
@@ -3728,18 +5834,22 @@ mod tests {
             key_version: 0,
         });
         b.on_message_receipt(ID_B.into(), "ffeeddccbbaa99887766554433221100".into(), 2);
+        b.on_timer_changed(ID_B.into(), 3600, 1_760_000_000_000, true);
+        b.on_timer_changed(ID_A.into(), 0, 7, false);
         let calls = CALLS.lock().unwrap().clone();
         assert_eq!(
             calls,
             vec![
-                format!("msg {ID_A} 6869 5 0123456789abcdef0123456789abcdef k1"),
-                format!("msg {ID_A} 494d473100 6 00000000000000000000000000000001 k2"),
+                format!("msg {ID_A} 6869 5 0123456789abcdef0123456789abcdef k1 e0"),
+                format!("msg {ID_A} 494d473100 6 00000000000000000000000000000001 k2 e86400"),
                 format!("key {ID_A} 2 {AK_2}"),
-                format!("req {ID_B} {AK_1} 486000 [] [] 0 kv0"),
+                format!("req {ID_B} {AK_1} kem=abcd 486000 [] [] 0 kv0"),
                 format!(
-                    "req {ID_B} {AK_1} 486001 [00112233445566778899aabbccddeeff] [hello there] 1700000000000 kv0"
+                    "req {ID_B} {AK_1} kem=ef01 486001 [00112233445566778899aabbccddeeff] [hello there] 1700000000000 kv0"
                 ),
                 format!("rcpt {ID_B} ffeeddccbbaa99887766554433221100 2"),
+                format!("timer {ID_B} 3600 1760000000000 1"),
+                format!("timer {ID_A} 0 7 0"),
             ]
         );
     }
@@ -3758,7 +5868,10 @@ mod tests {
         );
         assert_eq!(rchat_last_error_code(), 19, "no pinned keys");
         let ak = c(&hex::encode([0x44u8; 32]));
-        assert_eq!(unsafe { rchat_pin_peer_key(peer.as_ptr(), ak.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(peer.as_ptr(), ak.as_ptr(), std::ptr::null()) },
+            0
+        );
         let p = unsafe { rchat_safety_number(peer.as_ptr(), my_ik.as_ptr(), my_ak.as_ptr()) };
         let n = s(p);
         unsafe { rchat_free_string(p) };
@@ -4069,7 +6182,10 @@ mod tests {
         );
         assert_eq!(rchat_last_error_code(), 19);
         let ak = c(&hex::encode([0x44u8; 32]));
-        assert_eq!(unsafe { rchat_pin_peer_key(peer.as_ptr(), ak.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(peer.as_ptr(), ak.as_ptr(), std::ptr::null()) },
+            0
+        );
         let p = unsafe { rchat_safety_number(peer.as_ptr(), my_ik.as_ptr(), my_ak.as_ptr()) };
         let n = s(p);
         unsafe { rchat_free_string(p) };
@@ -4118,6 +6234,65 @@ mod tests {
         assert_eq!(unsafe { rchat_set_peer_key_version(peer.as_ptr(), 2) }, 0);
         lock_state().client = None;
         rchat_disconnect();
+    }
+
+    /// Task 10: an unknown slot length is refused with 9 and changes
+    /// nothing; a staged setting reaches the client when it is installed;
+    /// the call never waits for a busy client (as the cover setter).
+    #[test]
+    fn steady_traffic_ffi_checks_the_slot_and_never_blocks() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        for ms in [0, 250, 750, 1500, 5000] {
+            assert_eq!(rchat_set_steady_traffic(1, ms, 1), 9, "{ms}");
+            assert_eq!(rchat_last_error_code(), 9);
+        }
+        assert_eq!(
+            lock_state().steady,
+            (false, crate::steady::STEADY_DEFAULT_SLOT_MS, false),
+            "a refused call changes nothing"
+        );
+        assert_eq!(rchat_set_steady_traffic(1, 1000, 0), 0, "staged");
+        let client = RChatClient::new(ClientConfig::default()).unwrap();
+        install_client(client.clone());
+        let steady = |c: &RChatClient| {
+            let i = c.inner.try_read().unwrap();
+            (i.steady_enabled, i.steady_slot_ms, i.steady_foreground)
+        };
+        assert_eq!(steady(&client), (true, 1000, false), "applied on install");
+        // A busy client (a connect holds its lock): the call returns at once.
+        let lock = client.inner.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _w = lock.blocking_write();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        held_rx.recv().unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(rchat_set_steady_traffic(1, 500, 1), 0);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while client
+            .inner
+            .try_read()
+            .map(|i| (i.steady_enabled, i.steady_slot_ms, i.steady_foreground))
+            .ok()
+            != Some((true, 500, true))
+        {
+            assert!(std::time::Instant::now() < deadline, "never applied");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        rchat_disconnect();
+        assert_eq!(
+            lock_state().steady,
+            (false, crate::steady::STEADY_DEFAULT_SLOT_MS, false),
+            "a full disconnect resets it, as it does cover"
+        );
     }
 
     /// A cover setting reported while a connect is in flight reaches the
@@ -4172,7 +6347,10 @@ mod tests {
         install_client(client.clone());
         let a = c(ID_A);
         let ak1 = c(AK_1);
-        assert_eq!(unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
         // Staged directly: a change that reached no client.
         lock_state()
             .staged
@@ -4215,6 +6393,53 @@ mod tests {
         assert_eq!(out("wss://bücher.example"), None, "punycode only");
     }
 
+    /// Part J: invites through the C API. JSON `{url,pin}`, or NULL with
+    /// code 9; the dev parse alone takes ws:// to this device.
+    #[test]
+    fn relay_invite_ffi() {
+        let call = |f: unsafe extern "C" fn(*const c_char) -> *mut c_char, l: &str| {
+            let cl = c(l);
+            let p = unsafe { f(cl.as_ptr()) };
+            if p.is_null() {
+                assert_eq!(rchat_last_error_code(), 9);
+                None
+            } else {
+                let v = s(p);
+                unsafe { rchat_free_string(p) };
+                Some(v)
+            }
+        };
+        let pin = "rk:1:mc7qpreivliy7wrttxyh4t54i62pac7hc4izg3yy2bgtkkwqdcia";
+        let url = "wss://relay.example.com/secret-path";
+        let (cu, cp) = (c(url), c(pin));
+        let made = unsafe { rchat_format_relay_invite(cu.as_ptr(), cp.as_ptr()) };
+        assert!(!made.is_null());
+        let link = s(made);
+        unsafe { rchat_free_string(made) };
+        assert_eq!(link, crate::invite::format_invite(url, pin).unwrap());
+        let json = call(rchat_parse_relay_invite, &link).expect("parses");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, serde_json::json!({"url": url, "pin": pin}));
+        assert_eq!(
+            call(rchat_parse_relay_invite, "https://relay.example.com"),
+            None
+        );
+        assert_eq!(
+            call(rchat_parse_relay_invite, &format!("{link}&pin={pin}")),
+            None
+        );
+
+        let dev = format!("rchat://relay?u=ws%3A%2F%2F127.0.0.1%3A18443&pin={pin}");
+        assert_eq!(call(rchat_parse_relay_invite, &dev), None);
+        #[cfg(feature = "dev-invite")]
+        assert!(call(rchat_parse_relay_invite_dev, &dev).is_some());
+
+        assert!(unsafe { rchat_parse_relay_invite(std::ptr::null()) }.is_null());
+        let ws = c("ws://relay.example.com/p");
+        assert!(unsafe { rchat_format_relay_invite(ws.as_ptr(), cp.as_ptr()) }.is_null());
+        assert_eq!(rchat_last_error_code(), 9);
+    }
+
     /// Codes 19–24 map from the new errors.
     #[test]
     fn new_error_codes() {
@@ -4238,10 +6463,11 @@ mod tests {
         let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         CALLS.lock().unwrap().clear();
         let b = bridge();
-        b.on_peer_rotated("aa".into(), "bb".into(), "cc".into(), 2);
+        b.on_peer_rotated("aa".into(), "bb".into(), "cc".into(), "ff".into(), 2);
         b.on_message_request(crate::MessageRequest {
             identity_hex: "dd".into(),
             agreement_hex: "ee".into(),
+            kem_hex: "12".into(),
             issued_hour: 5,
             intro_message_id_hex: String::new(),
             intro_text: String::new(),
@@ -4249,11 +6475,14 @@ mod tests {
             key_version: 4,
         });
         let calls = CALLS.lock().unwrap().clone();
-        assert!(calls.contains(&"rot aa bb cc 2".to_string()), "{calls:?}");
+        assert!(
+            calls.contains(&"rot aa bb cc ff 2".to_string()),
+            "{calls:?}"
+        );
         assert!(
             calls
                 .iter()
-                .any(|l| l.starts_with("req dd ee 5") && l.ends_with("kv4")),
+                .any(|l| l.starts_with("req dd ee kem=12 5") && l.ends_with("kv4")),
             "{calls:?}"
         );
     }
@@ -4455,7 +6684,10 @@ mod tests {
         );
         assert_eq!(rchat_last_error_code(), 12);
         let ak = c(&hex::encode(peer.bundle.identity_agreement_key));
-        assert_eq!(unsafe { rchat_pin_peer_key(i.as_ptr(), ak.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(i.as_ptr(), ak.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(
             unsafe { rchat_pin_device_key(i.as_ptr(), d.as_ptr(), 0, bad.as_ptr()) },
             -1,
@@ -4607,7 +6839,10 @@ mod tests {
             c(&hex::encode(dks)),
             c(&hex::encode(peer.bundle.identity_agreement_key)),
         );
-        assert_eq!(unsafe { rchat_pin_peer_key(i.as_ptr(), ak.as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(i.as_ptr(), ak.as_ptr(), std::ptr::null()) },
+            0
+        );
         assert_eq!(
             unsafe { rchat_pin_device_key(i.as_ptr(), d.as_ptr(), 1, s_.as_ptr()) },
             0
@@ -4680,7 +6915,7 @@ mod tests {
         let (r, id) = (c(ID_A), c(&"ab".repeat(16)));
         let img = b"IMG1abc";
         let call = |r: *const c_char, d: *const u8, n: usize, m: *const c_char| unsafe {
-            rchat_send_binary_using_id(r, d, n, m)
+            rchat_send_binary_using_id(r, d, n, m, std::ptr::null_mut())
         };
         assert_eq!(call(std::ptr::null(), img.as_ptr(), 7, id.as_ptr()), 9);
         assert_eq!(call(r.as_ptr(), img.as_ptr(), 7, std::ptr::null()), 9);
@@ -4700,7 +6935,7 @@ mod tests {
         rchat_disconnect();
         let (r, t, id) = (c(ID_A), c("hi"), c(&"ab".repeat(16)));
         let text = |r: *const c_char, t: *const c_char, m: *const c_char| unsafe {
-            rchat_resend_message_using_id(r, t, m)
+            rchat_resend_message_using_id(r, t, 300, m)
         };
         assert_eq!(text(std::ptr::null(), t.as_ptr(), id.as_ptr()), 9);
         assert_eq!(text(r.as_ptr(), std::ptr::null(), id.as_ptr()), 9);
@@ -4708,7 +6943,7 @@ mod tests {
         assert_eq!(text(r.as_ptr(), t.as_ptr(), id.as_ptr()), 7);
         let img = b"IMG1abc";
         let bin = |r: *const c_char, d: *const u8, n: usize, m: *const c_char| unsafe {
-            rchat_resend_binary_using_id(r, d, n, m)
+            rchat_resend_binary_using_id(r, d, n, 300, m)
         };
         assert_eq!(bin(std::ptr::null(), img.as_ptr(), 7, id.as_ptr()), 9);
         assert_eq!(bin(r.as_ptr(), std::ptr::null(), 7, id.as_ptr()), 9);
@@ -4719,6 +6954,12 @@ mod tests {
                 identity: String::new()
             }),
             26
+        );
+        assert_eq!(
+            error_code_from_err(&RChatError::NoKemKey {
+                identity: String::new()
+            }),
+            27
         );
     }
 
@@ -4855,7 +7096,7 @@ mod tests {
         let results = [
             rchat_initialize(),
             unsafe { rchat_has_session(id.as_ptr()) },
-            unsafe { rchat_pin_peer_key(id.as_ptr(), c(AK_1).as_ptr()) },
+            unsafe { rchat_pin_peer_key(id.as_ptr(), c(AK_1).as_ptr(), std::ptr::null()) },
             rchat_clear_state(),
             c_int::from(rchat_generate_identity().is_null()),
             rchat_last_error_code(),
@@ -4925,5 +7166,257 @@ mod tests {
         set(&live, generation);
         assert!(!stored(&live));
         live.retire();
+    }
+
+    const DRAIN_CONFIG: &str = r#"{"server_url":"ws://127.0.0.1:9","identity_key_seed":null,
+            "connection_timeout_secs":1,"reconnect_max_attempts":1,"message_retry_count":0,
+            "enable_delivery_confirmation":false,"keepalive_interval_secs":30,
+            "tls_fingerprint":"None"}"#;
+
+    /// §H.1, ruling 1: a drain never runs next to a connected client (the
+    /// foreground's, or one still finishing in the background). It answers
+    /// -29 and touches nothing: the same client stays installed and connected.
+    #[test]
+    fn background_drain_is_refused_while_a_client_is_connected() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        let live = RChatClient::new(ClientConfig::default()).unwrap();
+        live.connected_mirror.store(true, Ordering::SeqCst);
+        install_client(live.clone());
+        let config = c(DRAIN_CONFIG);
+        let seed = [0xcdu8; 64];
+        let r = unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 5_000) };
+        assert_eq!(r, -29);
+        assert_eq!(rchat_last_error_code(), 29);
+        let installed = lock_state().client.clone().expect("still installed");
+        assert!(Arc::ptr_eq(&installed, &live), "the same client");
+        assert!(live.connected_now(), "still connected");
+        live.connected_mirror.store(false, Ordering::SeqCst);
+        rchat_disconnect();
+    }
+
+    #[test]
+    fn background_drain_checks_its_arguments() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        let config = c(DRAIN_CONFIG);
+        let seed = [0xcdu8; 64];
+        // Before rchat_initialize: no runtime.
+        assert_eq!(
+            unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 5_000) },
+            -8
+        );
+        assert_eq!(rchat_initialize(), 0);
+        assert_eq!(
+            unsafe { rchat_background_drain(config.as_ptr(), std::ptr::null(), 64, 5_000) },
+            -9
+        );
+        assert_eq!(
+            unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 48, 5_000) },
+            -9
+        );
+        assert_eq!(
+            unsafe { rchat_background_drain(std::ptr::null(), seed.as_ptr(), 64, 5_000) },
+            -9
+        );
+        let bad = c(r#"{"server_url":1}"#);
+        assert_eq!(
+            unsafe { rchat_background_drain(bad.as_ptr(), seed.as_ptr(), 64, 5_000) },
+            -1
+        );
+        rchat_disconnect();
+    }
+
+    /// An unreachable relay: a negative code, no client installed, and the
+    /// staged pins kept for the next connect (as a failed connect).
+    #[test]
+    fn a_background_drain_that_cannot_connect_fails_and_installs_nothing() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        let (a, ak1) = (c(ID_A), c(AK_1));
+        assert_eq!(
+            unsafe { rchat_pin_peer_key(a.as_ptr(), ak1.as_ptr(), std::ptr::null()) },
+            0
+        );
+        let config = c(DRAIN_CONFIG);
+        let seed = [0xcdu8; 64];
+        let r = unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 3_000) };
+        assert!(r < 0, "{r}");
+        assert!(lock_state().client.is_none(), "nothing installed");
+        assert_eq!(
+            unsafe { rchat_peer_key_state(a.as_ptr()) },
+            1,
+            "the staged pin is kept"
+        );
+        rchat_disconnect();
+    }
+
+    #[test]
+    fn cancel_background_drain_needs_no_lock() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Callable with the state lock held elsewhere (the expiration
+        // handler may run during anything).
+        let held = lock_state();
+        assert_eq!(rchat_cancel_background_drain(), 0);
+        drop(held);
+        assert!(drain_cancel_requested(drain_millis_now()));
+        DRAIN_CANCEL_AT.store(0, Ordering::SeqCst);
+    }
+
+    /// A config whose relay never answers (a black-hole address): the
+    /// connect can only end by its timeout, the deadline or a cancel.
+    const BLACK_HOLE_CONFIG: &str = r#"{"server_url":"ws://10.255.255.1:9","identity_key_seed":null,
+            "connection_timeout_secs":30,"reconnect_max_attempts":5,"message_retry_count":0,
+            "enable_delivery_confirmation":false,"keepalive_interval_secs":30,
+            "tls_fingerprint":"None"}"#;
+
+    fn drain_lock_is_free() -> bool {
+        CONNECT_LOCK.try_lock().is_ok()
+    }
+
+    /// R34 I-2: a cancel during the connect ends the drain promptly (not
+    /// after the 30 s connect timeout the config asks for), nothing stays
+    /// installed, the lock is free, and the cancel is spent (M-1).
+    #[test]
+    fn a_cancelled_drain_connect_returns_promptly_and_frees_the_lock() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        DRAIN_CANCEL_AT.store(0, Ordering::SeqCst);
+        let config = c(BLACK_HOLE_CONFIG);
+        let seed = [0xcdu8; 64];
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            rchat_cancel_background_drain();
+        });
+        let started = std::time::Instant::now();
+        let r = unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 20_000) };
+        assert!(r < 0, "{r}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cancel ends the connect phase: {:?}",
+            started.elapsed()
+        );
+        assert!(drain_lock_is_free(), "CONNECT_LOCK free after the drain");
+        assert!(
+            lock_state().client.is_none(),
+            "the given-up client is not kept"
+        );
+        // Round 2 N-3: given up while connecting, a kept client goes too.
+        let kept = RChatClient::new(ClientConfig {
+            server_url: "ws://10.255.255.1:9".into(),
+            connection_timeout_secs: 30,
+            ..ClientConfig::default()
+        })
+        .unwrap();
+        kept.generate_identity_from_seed(&[4; 32]).unwrap();
+        install_client(kept.clone());
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            rchat_cancel_background_drain();
+        });
+        let r = unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 20_000) };
+        assert!(r < 0);
+        assert!(
+            lock_state().client.is_none(),
+            "a given-up kept client is uninstalled"
+        );
+        assert!(kept.connect().is_err(), "and retired");
+        assert!(drain_lock_is_free());
+        assert!(
+            !drain_cancel_requested(drain_millis_now()),
+            "the cancel was spent"
+        );
+        rchat_disconnect();
+    }
+
+    /// R34 I-2: the connect phase takes at most 40% of the budget and one
+    /// attempt (20 s scaled down to 3 s: about 1 s), never the config's.
+    #[test]
+    fn the_drain_connect_is_bounded_by_the_budget() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        DRAIN_CANCEL_AT.store(0, Ordering::SeqCst);
+        let config = c(BLACK_HOLE_CONFIG);
+        let seed = [0xcdu8; 64];
+        let started = std::time::Instant::now();
+        let r = unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 3_000) };
+        assert!(r < 0, "{r}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3_500),
+            "within the budget: {:?}",
+            started.elapsed()
+        );
+        assert!(drain_lock_is_free());
+        rchat_disconnect();
+    }
+
+    /// R34 M-1: a cancel issued just before the drain starts (the
+    /// expiration handler racing the start) is not wiped; a stale one
+    /// (older than `DRAIN_CANCEL_FRESH`) never cancels a later run.
+    #[test]
+    fn a_cancel_just_before_the_start_counts_and_a_stale_one_does_not() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        let config = c(BLACK_HOLE_CONFIG);
+        let seed = [0xcdu8; 64];
+        rchat_cancel_background_drain();
+        let started = std::time::Instant::now();
+        let r = unsafe { rchat_background_drain(config.as_ptr(), seed.as_ptr(), 64, 20_000) };
+        assert!(r < 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cancelled at once: {:?}",
+            started.elapsed()
+        );
+        // A cancel at t = 1 s, a drain starting more than 5 s later.
+        DRAIN_CANCEL_AT.store(1_000, Ordering::SeqCst);
+        let fresh = DRAIN_CANCEL_FRESH.as_millis() as u64;
+        assert!(drain_cancel_requested(1_000 + fresh), "still fresh");
+        assert!(
+            !drain_cancel_requested(1_000 + fresh + 1),
+            "a stale cancel doesn't apply"
+        );
+        DRAIN_CANCEL_AT.store(0, Ordering::SeqCst);
+        rchat_disconnect();
+    }
+
+    /// R34 M-2: a kept (disconnected) client drains itself: the drain
+    /// doesn't build a new one, and records staged for a new client are
+    /// dropped instead of piling up (the kept client restored them).
+    #[test]
+    fn a_kept_client_drains_itself() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        DRAIN_CANCEL_AT.store(0, Ordering::SeqCst);
+        let config = ClientConfig {
+            server_url: "ws://127.0.0.1:9".into(),
+            connection_timeout_secs: 1,
+            ..ClientConfig::default()
+        };
+        let kept = RChatClient::new(config).unwrap();
+        kept.generate_identity_from_seed(&[3; 32]).unwrap();
+        install_client(kept.clone());
+        lock_state().staged_records.push(("x".into(), vec![1]));
+        let json = c(DRAIN_CONFIG);
+        let seed = [0xcdu8; 64];
+        // The relay port is closed: the kept client's own connect fails.
+        let r = unsafe { rchat_background_drain(json.as_ptr(), seed.as_ptr(), 64, 3_000) };
+        assert!(r < 0);
+        assert!(lock_state().staged_records.is_empty(), "no pile-up");
+        // Round 2 N-3: its own connect failed (not given up): still installed.
+        let installed = lock_state().client.clone().expect("the kept client stays");
+        assert!(Arc::ptr_eq(&installed, &kept));
+        assert!(
+            kept.inner.try_read().unwrap().drain.is_none(),
+            "the kept client ran the drain and left drain mode"
+        );
+        assert!(drain_lock_is_free());
+        rchat_disconnect();
     }
 }

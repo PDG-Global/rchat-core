@@ -1,6 +1,6 @@
 [package]
 name = "rchat-core"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
@@ -25,6 +25,13 @@ overflow-checks = true
 [features]
 default = []
 uniffi = ["dep:uniffi", "dep:uniffi_macros"]
+# Integration tests only (the relay's dev-dependency): lets a test trust its
+# own TLS certificate (`RChatClient::set_test_trust_pem`). Never in an app.
+test-hooks = []
+# Debug app builds only (ios/build_rust.sh sets it when CONFIGURATION is
+# Debug): exports `rchat_parse_relay_invite_dev`, which also accepts a ws://
+# invite to this device. A release library must not export it (Part J).
+dev-invite = []
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli", "tokio"], optional = true }
@@ -47,15 +54,23 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
+base64 = "0.22"
 sha2 = "0.10"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 hkdf = "0.12"
 hmac = "0.12"
 constant_time_eq = "0.3"
 zeroize = "1.7"
+# ML-KEM-768 (FIPS 203) for the v3 hybrid handshake. Pinned exactly; `deterministic`
+# provides FIPS 203 KeyGen_internal(d, z) for seeded keys (spec §A.1).
+ml-kem = { version = "=0.2.3", features = ["zeroize", "deterministic"] }
 uuid = { version = "1.0", features = ["v4"] }
 log = "0.4"
 boring = "5.1.0"
+# Direct use of the same BoringSSL bindings `boring` builds on, for the calls
+# it has no safe wrapper for (early data off, spec §D.1).
+boring-sys = "5.1.0"
+foreign-types = "0.5"
 tokio-boring = "5.0.0"
 
 # Platform-specific dependencies for blake3

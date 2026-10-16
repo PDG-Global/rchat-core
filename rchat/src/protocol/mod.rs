@@ -26,6 +26,10 @@ pub use signaling::{
     MSG_TYPE_PUBLISH_KEY_BUNDLE_RESPONSE, MSG_TYPE_RELAY_REQUEST, MSG_TYPE_RELAY_RESPONSE,
 };
 
+/// The only protocol version the relay speaks (v3, hard cutover): a hello
+/// that does not offer it gets `VersionMismatch` and is closed.
+pub const PROTOCOL_VERSION: u32 = 3;
+
 /// Generate a timestamp in seconds since Unix epoch
 pub fn timestamp() -> u64 {
     SystemTime::now()

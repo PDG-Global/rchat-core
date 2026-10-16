@@ -416,6 +416,25 @@ impl RelayIdentity {
         self.signing.verifying_key().to_bytes()
     }
 
+    /// Seed for this relay's decoy site (built-in page and `--render-decoy`
+    /// alike): `HKDF-SHA256(ikm = identity secret key, salt = normalised
+    /// host bytes (empty with no host), info = "rchat/decoy-seed/v3")`
+    /// (R27a, final review M2). Derived from the secret, never from public
+    /// data alone (the host, the public key or the pin), so nobody can
+    /// compute the design and use it to confirm the relay. The host still
+    /// picks among one relay's designs; an empty salt is HKDF's default
+    /// salt, so a relay without a host keeps the seed R27a gave it.
+    pub(crate) fn decoy_seed(&self, host: Option<&str>) -> [u8; 32] {
+        let salt = host
+            .map(crate::decoy_render::normalize_host)
+            .unwrap_or_default();
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt.as_bytes()), self.signing.as_bytes());
+        let mut out = [0u8; 32];
+        hk.expand(b"rchat/decoy-seed/v3", &mut out)
+            .expect("32 bytes is a valid HKDF-SHA256 length");
+        out
+    }
+
     pub(crate) fn version(&self) -> u32 {
         self.version
     }
@@ -731,5 +750,104 @@ mod tests {
         assert_eq!(after, vec![0u8; 32], "old seed erased");
         // The path holds the new key.
         assert_eq!(RelayIdentity::load(&path).unwrap().key(), new.key());
+    }
+
+    /// R27a, final review M2: the decoy seed comes from the secret, with or
+    /// without a host, is stable per identity and host, differs between
+    /// identities and between hosts, and cannot be recomputed from public
+    /// data (the host, the pin or the public key).
+    #[test]
+    fn decoy_seed_is_secret_derived_and_not_public() {
+        use sha2::{Digest, Sha256};
+        let (a, b) = (RelayIdentity::ephemeral(), RelayIdentity::ephemeral());
+        let host = Some("chat.example.com");
+        for h in [None, host] {
+            assert_eq!(a.decoy_seed(h), a.decoy_seed(h));
+            assert_ne!(a.decoy_seed(h), b.decoy_seed(h));
+        }
+        assert_ne!(a.decoy_seed(None), a.decoy_seed(host));
+        assert_ne!(a.decoy_seed(host), a.decoy_seed(Some("other.example.com")));
+        // The host is normalised as everywhere else.
+        assert_eq!(
+            a.decoy_seed(host),
+            a.decoy_seed(Some(" Chat.Example.COM. "))
+        );
+        // An empty host is no host.
+        assert_eq!(a.decoy_seed(None), a.decoy_seed(Some(" . ")));
+        let seed = a.decoy_seed(host);
+        let public = a.key();
+        assert_ne!(seed, public);
+        assert_ne!(seed, <[u8; 32]>::from(Sha256::digest(public)));
+        // Not the old public seed SHA-256(host), nor anything over the pin.
+        assert_ne!(seed, <[u8; 32]>::from(Sha256::digest(b"chat.example.com")));
+        assert_ne!(seed, <[u8; 32]>::from(Sha256::digest(a.pin().as_bytes())));
+        // HKDF over the public key with the same salt and info is not it either.
+        let hk = hkdf::Hkdf::<Sha256>::new(Some(b"chat.example.com"), &public);
+        let mut guess = [0u8; 32];
+        hk.expand(b"rchat/decoy-seed/v3", &mut guess).unwrap();
+        assert_ne!(seed, guess);
+        // The same key file gives the same seed across loads.
+        let dir = crate::ScratchDir::new("decoy-seed-id");
+        let path = dir.join("relay_identity.key");
+        let first = RelayIdentity::load_or_create(&path)
+            .unwrap()
+            .decoy_seed(host);
+        assert_eq!(first, RelayIdentity::load(&path).unwrap().decoy_seed(host));
+    }
+
+    /// Final review M2: a relay's built-in page is the site of its identity's
+    /// decoy seed for its configured host (the site `--render-decoy` writes),
+    /// not a site anyone could compute from the host.
+    #[tokio::test]
+    async fn the_built_in_page_uses_the_identity_seed_for_the_host() {
+        use super::super::test_support::{start, test_config};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = crate::ScratchDir::new("decoy-built-in");
+        let path = dir.join("relay_identity.key");
+        RelayIdentity::load_or_create(&path).unwrap();
+        let mut config = test_config();
+        config.relay_identity_path = Some(path.to_string_lossy().into_owned());
+        config.decoy.host = Some("chat.example.com".into());
+        let (addr, _state) = start(config).await;
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(b"GET / HTTP/1.1\r\nHost: chat.example.com\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tcp.read_to_end(&mut resp).await.unwrap();
+        let body_at = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let seed = RelayIdentity::load(&path)
+            .unwrap()
+            .decoy_seed(Some("chat.example.com"));
+        let want = crate::decoy_render::render_site_for_seed(seed);
+        assert_eq!(&resp[body_at..], want.get("index.html").unwrap());
+    }
+
+    /// Known answers: secret key 00 01 .. 1f gives these seeds, without a
+    /// host and with host `chat.example.com`. The expected values were
+    /// computed independently with Python's stdlib (`hmac`/`hashlib`:
+    /// PRK = HMAC(salt or 0^32, ikm); T1 = HMAC(PRK, info || 01)), which pins
+    /// the info string, the salt and the derivation. The no-host value is
+    /// the one R27a shipped: an empty salt is HKDF's default salt.
+    #[test]
+    fn decoy_seed_known_answer() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let id = RelayIdentity {
+            signing: SigningKey::from_bytes(&key),
+            version: 0,
+            chain: Vec::new(),
+        };
+        let hex = |s: [u8; 32]| s.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            hex(id.decoy_seed(None)),
+            "e69de924d6c3eb185992e8c09105cd314cc393dac7acc1b4f976bb0501026775"
+        );
+        assert_eq!(
+            hex(id.decoy_seed(Some("Chat.Example.com."))),
+            "c4a19becec148b51230a5a634d0c41609c8d0cae481e6bbf65beb0fdf34c59ce"
+        );
     }
 }

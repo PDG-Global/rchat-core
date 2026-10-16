@@ -48,8 +48,45 @@ impl<'a> MakeWriter<'a> for Capture {
 }
 
 impl Capture {
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+    }
+}
+
+/// A TRACE-capable capture installed as this thread's default subscriber,
+/// with a second live dispatcher held for its lifetime. tracing-core treats
+/// a lone registered dispatcher as the only one and then caches a
+/// callsite's interest from whichever thread registers it first (often a
+/// parallel test with no subscriber: never), so lines would be dropped; a
+/// second dispatcher makes registration ask every dispatcher, and the
+/// interest of callsites already cached is rebuilt.
+pub(super) struct TraceCapture {
+    capture: Capture,
+    _guard: tracing::subscriber::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
+impl TraceCapture {
+    pub(super) fn text(&self) -> String {
+        self.capture.text()
+    }
+}
+
+/// Install a capture at `level` for the current thread (see `TraceCapture`).
+pub(super) fn capture_trace(level: tracing::Level) -> TraceCapture {
+    let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    TraceCapture {
+        capture,
+        _guard: guard,
+        _second: second,
     }
 }
 
@@ -80,14 +117,14 @@ async fn until_created<S>(ws: &mut WebSocketStream<S>) -> (CircuitId, Vec<u8>, C
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    match until_control(ws, |m| matches!(m, ControlMessage::CircuitCreatedV2 { .. })).await {
-        Some(ControlMessage::CircuitCreatedV2 {
+    match until_control(ws, |m| matches!(m, ControlMessage::CircuitCreatedV3 { .. })).await {
+        Some(ControlMessage::CircuitCreatedV3 {
             circuit_id,
             token,
             target_circuit_id,
             ..
         }) => (circuit_id, token, target_circuit_id),
-        other => panic!("expected CircuitCreatedV2, got {other:?}"),
+        other => panic!("expected CircuitCreatedV3, got {other:?}"),
     }
 }
 
@@ -140,17 +177,11 @@ struct Secrets {
 }
 
 /// `privacy::set_log_client_ips` is process-global; serialize scenarios.
-static SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn run_scenario(capture_level: tracing::Level, log_ips: bool) -> (String, Secrets) {
     let _serial = SCENARIO_LOCK.lock().await;
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(capture_level)
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let capture = capture_trace(capture_level);
     crate::privacy::set_log_client_ips(log_ips);
 
     let (server_addr, state) = start(test_config()).await;
@@ -282,6 +313,26 @@ async fn run_scenario(capture_level: tracing::Level, log_ips: bool) -> (String, 
     (capture.text(), secrets)
 }
 
+/// The TRACE lines whose formatting the full scenario puts under test; each
+/// must have been captured, or the leak assertions would pass vacuously.
+const SCENARIO_TRACE_LINES: &[&str] = &[
+    "Knock delivered live",
+    "Created circuit pair",
+    "Relayed packet via circuit",
+    "(msg_id: ",
+    "Relay packet failed authentication",
+    "Relay packet for unknown circuit",
+    "Stored an offline message",
+    "Circuit pair closed by a member",
+];
+
+/// Every line in `expected` was captured.
+pub(super) fn assert_lines(logs: &str, expected: &[&str]) {
+    for line in expected {
+        assert!(logs.contains(line), "{line:?} not captured:\n{logs}");
+    }
+}
+
 fn assert_clean(logs: &str, secrets: &Secrets, skip: &[&str]) {
     for (name, needle) in &secrets.needles {
         if skip.contains(name) {
@@ -302,7 +353,7 @@ fn assert_clean(logs: &str, secrets: &Secrets, skip: &[&str]) {
 /// Every identity-derived value the relay could print for these identities
 /// (R6): log tags of the hex and the bytes, the keyed id tags (raw and
 /// log-tagged), and the pair tags of every pair among them.
-fn identity_needles(ids: &[TestIdentity]) -> Vec<String> {
+pub(super) fn identity_needles(ids: &[TestIdentity]) -> Vec<String> {
     let mut out = Vec::new();
     for id in ids {
         let t = tags::id_tag(&id.bytes);
@@ -384,6 +435,7 @@ async fn relay_logs_no_metadata_or_content_at_any_level() {
         trace_logs.lines().count() > 10,
         "scenario produced suspiciously few log lines (did it run?):\n{trace_logs}"
     );
+    assert_lines(&trace_logs, SCENARIO_TRACE_LINES);
     assert_clean(&trace_logs, &secrets, &[]);
 
     let (info_logs, secrets) = run_scenario(tracing::Level::INFO, false).await;
@@ -419,6 +471,7 @@ async fn relay_logs_no_metadata_or_content_at_any_level() {
 async fn l1_no_log_line_carries_two_identity_derived_values() {
     let (trace_logs, secrets) = run_scenario(tracing::Level::TRACE, false).await;
     assert!(trace_logs.lines().count() > 10, "scenario ran");
+    assert_lines(&trace_logs, SCENARIO_TRACE_LINES);
     assert_no_line_links_two_identity_values(&trace_logs, &secrets.ids);
 }
 
@@ -453,13 +506,7 @@ async fn client_ips_only_when_opted_in_and_never_at_info() {
 #[tokio::test]
 async fn l1_tls_path_logs_no_metadata_and_links_no_two_identities() {
     let _serial = SCENARIO_LOCK.lock().await;
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let capture = capture_trace(tracing::Level::TRACE);
 
     let (addr, state) = tls_relay().await;
     let (a, b) = (TestIdentity::from_seed(0xA4), TestIdentity::from_seed(0xB5));
@@ -499,6 +546,15 @@ async fn l1_tls_path_logs_no_metadata_and_links_no_two_identities() {
         logs.contains("(TLS 1.3)"),
         "the TLS relay did not log under this capture:\n{logs}"
     );
+    assert_lines(
+        &logs,
+        &[
+            "Created circuit pair",
+            "Relayed packet via circuit",
+            "(msg_id: ",
+            "Circuit pair closed by a member",
+        ],
+    );
     let enc = |b: &[u8]| hex::encode(b);
     let secrets = Secrets {
         needles: vec![
@@ -530,17 +586,7 @@ async fn l1_tls_path_logs_no_metadata_and_links_no_two_identities() {
 #[tokio::test]
 async fn rq5_forwarding_logs_one_identity_value_per_line() {
     let _serial = SCENARIO_LOCK.lock().await;
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    // Callsites first hit by a parallel test without a subscriber are cached
-    // as "never" process-wide; recompute their interest with this capture
-    // registered so its lines are not dropped.
-    tracing::callsite::rebuild_interest_cache();
+    let capture = capture_trace(tracing::Level::TRACE);
 
     let (addr, state) = start(test_config()).await;
     let (a, b) = (TestIdentity::from_seed(0xA6), TestIdentity::from_seed(0xB7));
@@ -612,13 +658,7 @@ async fn rq5_forwarding_logs_one_identity_value_per_line() {
 /// and R6 assertions.
 #[tokio::test]
 async fn offline_queue_with_hostile_message_ids_does_not_panic_or_leak() {
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let capture = capture_trace(tracing::Level::TRACE);
 
     let state = RelayState::new(Arc::new(ServerConfig::default()));
     let connections = state.connections.clone();
@@ -647,7 +687,14 @@ async fn offline_queue_with_hostile_message_ids_does_not_panic_or_leak() {
                 closing: false,
                 auth_budget: crate::limits::AuthBudget::new(Instant::now()),
                 source: None,
-                protocol_version: if proof_ready { 2 } else { 0 },
+                has_asked: false,
+                blind_ask_bucket: None,
+                peer_bundle: None,
+                protocol_version: if proof_ready {
+                    crate::protocol::PROTOCOL_VERSION
+                } else {
+                    0
+                },
                 auth_nonce: proof_ready.then_some([0x4e; 32]),
                 channel_binding: [0x42; 32],
                 proven_identity: None,
@@ -675,7 +722,7 @@ async fn offline_queue_with_hostile_message_ids_does_not_panic_or_leak() {
             tag_b: tags::id_tag(&recip.bytes),
             token_a: tok_s.clone(),
             token_b: tok_r,
-            pair: tags::pair_tag(&sender_identity.bytes, &recip.bytes),
+            pair: PairKey::Identity(tags::pair_tag(&sender_identity.bytes, &recip.bytes)),
             peer_circuit: circuit,
         },
     );
@@ -733,10 +780,58 @@ async fn offline_queue_with_hostile_message_ids_does_not_panic_or_leak() {
         );
     }
 
+    // Live leg: the recipient is back, so packets on a circuit to its live
+    // connection are forwarded and their message id is formatted in the
+    // trace line (`privacy::tag_str(&message_id)`, which replaced the old
+    // `&message_id[..8]` slice). One payload is sealed-v2 shaped, so its id
+    // is the attacker-chosen bytes (hex); the others get a random id.
+    let live = CircuitId::generate();
+    let tok_live = CircuitToken::generate(live, Duration::from_secs(60));
+    circuits.insert(
+        live,
+        CircuitRoutingInfo {
+            client_a: sender,
+            client_b: back,
+            tag_a: tags::id_tag(&sender_identity.bytes),
+            tag_b: tags::id_tag(&recip.bytes),
+            token_a: tok_live.clone(),
+            token_b: CircuitToken::generate(live, Duration::from_secs(60)),
+            pair: PairKey::Identity(tags::pair_tag(&sender_identity.bytes, &recip.bytes)),
+            peer_circuit: live,
+        },
+    );
+    let mut sealed_like = vec![0u8; MIN_SEALED_LEN];
+    sealed_like[0] = validate::SEALED_V2;
+    sealed_like[1..17].copy_from_slice(b"HOSTILE-MSGID-16");
+    let hostile_hex = hex::encode(b"HOSTILE-MSGID-16");
+    for p in bodies.iter().chain(std::iter::once(&sealed_like)) {
+        let mut pkt = RelayPacket::new(live, p.clone());
+        pkt.auth_tag = tok_live.authenticate(&live, p);
+        handle_relay_packet(sender, pkt, &state)
+            .await
+            .expect("relay to a live recipient succeeds");
+    }
+
     let logs = capture.text();
-    assert!(logs.lines().count() > 5, "trace output captured:\n{logs}");
+    // The lines whose formatting is under test were emitted: the three
+    // offline stores, and the message-id line once per live forward.
+    assert_eq!(
+        logs.matches("Stored an offline message").count(),
+        3,
+        "offline store lines:\n{logs}"
+    );
+    assert_eq!(
+        logs.matches("(msg_id: ").count(),
+        4,
+        "message-id trace lines:\n{logs}"
+    );
     let secrets = Secrets {
         needles: vec![
+            ("hostile sealed message id (hex)", hostile_hex.clone()),
+            (
+                "hostile sealed message id prefix",
+                hostile_hex[..16].to_string(),
+            ),
             ("circuit id", hex::encode(circuit.as_ref())),
             ("sender identity", id_sender),
             ("recipient identity", id_recip.clone()),
@@ -777,6 +872,7 @@ const SCANNED: &[&str] = &[
     "src/signaling/relay_identity.rs",
     "src/signaling/fair_share.rs",
     "src/proxy_protocol.rs",
+    "src/invite.rs",
 ];
 
 /// Source-level guard: no logging macro in the server sources may format a
@@ -804,13 +900,30 @@ fn logging_macros_never_reference_sensitive_expressions() {
         "auth_nonce",
         "channel_binding",
         "{:?}\", frame",
+        // The WebSocket path is a secret (it is in every relay invite, Part
+        // J): no log line may carry it, nor the invite or the URL with it.
+        ".websocket_path",
+        "ws_path",
+        "invite",
+        "relay_url",
     ];
     let raw_hex = ["hex::encode(", "[..16"];
+    // The one place the invite reaches an output: `--print-invite` prints
+    // it to stdout, which is that command's whole job (Part J).
+    const INVITE_STDOUT: (&str, &str) = (
+        "src/main.rs",
+        "print!(\"{}\", run_print_invite(&config, &identity_path, ansi)?)",
+    );
+    let mut invite_prints = 0;
     let mut offenders = Vec::new();
     for rel in SCANNED {
         let src = std::fs::read_to_string(format!("{root}/{rel}")).unwrap();
         let src = strip_cfg_test_items(&src);
         for (line_no, call) in log_calls(&src) {
+            if (*rel, call.as_str()) == INVITE_STDOUT {
+                invite_prints += 1;
+                continue;
+            }
             let sans_tag = strip_tag_calls(&call);
             for b in banned.iter().chain(raw_hex.iter()) {
                 if sans_tag.contains(b) {
@@ -826,6 +939,10 @@ fn logging_macros_never_reference_sensitive_expressions() {
             }
         }
     }
+    assert_eq!(
+        invite_prints, 1,
+        "the invite is printed by --print-invite only"
+    );
     assert!(
         offenders.is_empty(),
         "sensitive logging:\n{}",
@@ -849,6 +966,10 @@ const IDENTITY_MARKERS: &[&str] = &[
     "tag_a",
     "tag_b",
     "slot_a",
+    // A blinded pairing token's tag is pair-derived (protocol v3 §C.2).
+    "blind_tag(",
+    "BlindTag",
+    "pair_token",
 ];
 
 /// `privacy::tag(..)` calls in `call` whose argument is not a circuit id.
@@ -1045,4 +1166,54 @@ fn strip_tag_calls(call: &str) -> String {
         }
     }
     s
+}
+
+/// Part J: the WebSocket path is a secret (every relay invite carries it).
+/// A relay serving a secret path, with an upgrade and a publish on it, a
+/// plain request to it and upgrades and requests to other paths, logs it
+/// nowhere, at any level.
+#[tokio::test]
+async fn websocket_path_is_never_logged() {
+    const SECRET: &str = "Zk3qA9-invite-secret-path";
+    let _serial = SCENARIO_LOCK.lock().await;
+    let capture = capture_trace(tracing::Level::TRACE);
+    let mut config = test_config();
+    config.websocket_path = format!("/{SECRET}");
+    let (addr, _state) = start(config).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/{SECRET}"))
+        .await
+        .expect("the secret path upgrades");
+    publish(&mut ws, &TestIdentity::from_seed(0xA1)).await;
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/{SECRET}x"))
+            .await
+            .is_err(),
+        "another path gets the decoy"
+    );
+    for req in [
+        format!("GET /{SECRET} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        format!("GET /{SECRET}?q=1 HTTP/1.1\r\nHost: x\r\n\r\n"),
+        format!("GET /other HTTP/1.1\r\nHost: x\r\nReferer: /{SECRET}\r\n\r\n"),
+    ] {
+        let mut raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+        raw.write_all(req.as_bytes()).await.unwrap();
+        let mut sink = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut raw, &mut sink),
+        )
+        .await;
+    }
+    let _ = ws.close(None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let logs = capture.text();
+    assert!(logs.contains("listening"), "capture not wired up: {logs}");
+    assert!(logs.lines().count() > 3, "suspiciously few lines:\n{logs}");
+    assert!(
+        !logs.contains(SECRET),
+        "the WebSocket path was logged:\n{logs}"
+    );
+    assert!(!logs.contains("rchat://"), "{logs}");
 }

@@ -8,6 +8,7 @@
 //! - Double Ratchet algorithm
 //! - X3DH key agreement
 
+use crate::kem::{KemKeyPair, KEM_PK_LEN, KEM_SEED_LEN};
 use crate::RChatError;
 use chacha20poly1305::{
     aead::{Aead as ChaChaAead, KeyInit as ChaChaKeyInit, Payload},
@@ -23,57 +24,88 @@ use std::collections::{BTreeMap, HashMap};
 pub use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 use zeroize::{Zeroize, Zeroizing};
 
-/// Identity key pair (Ed25519 for signatures, X25519 for key agreement)
+/// Identity key pair: Ed25519 for signatures, X25519 for key agreement and
+/// ML-KEM-768 (protocol v3 §A.1). The KEM key is derived from the 64-byte
+/// identity seed and never stored on its own.
 #[derive(Clone)]
 pub struct IdentityKeyPair {
     signing_key: SigningKey,
     agreement_key: X25519SecretKey,
+    /// Shared on clone; the secret is wiped when the last holder drops it.
+    kem: std::sync::Arc<KemKeyPair>,
+}
+
+/// HKDF info for the identity KEM seed (protocol v3 §A.1).
+pub const KEM_SEED_INFO: &[u8] = b"rchat/kem-seed/v3";
+
+/// `HKDF-SHA256(salt = None, ikm = identity_seed, info = "rchat/kem-seed/v3")`,
+/// 64 bytes: the identity's ML-KEM-768 seed (`d || z`).
+pub fn identity_kem_seed(identity_seed: &[u8; 64]) -> Zeroizing<[u8; KEM_SEED_LEN]> {
+    let mut out = Zeroizing::new([0u8; KEM_SEED_LEN]);
+    hkdf::Hkdf::<Sha256>::new(None, identity_seed)
+        .expand(KEM_SEED_INFO, &mut out[..])
+        .expect("64-byte HKDF output");
+    out
 }
 
 impl IdentityKeyPair {
-    /// Generate a new random identity
+    /// Generate a new random identity. It goes through a random 64-byte seed,
+    /// so the KEM key is derived exactly as on a reload (§A.1).
     pub fn generate() -> Self {
-        let mut csprng = OsRng;
-        let signing_key = SigningKey::generate(&mut csprng);
-        let agreement_key = X25519SecretKey::random_from_rng(&mut csprng);
+        let mut seed = Zeroizing::new([0u8; 64]);
+        OsRng.fill_bytes(&mut seed[..]);
+        Self::from_canonical_seed(&seed)
+    }
+
+    /// Derive identity from a seed (the first 64 bytes are used).
+    pub fn from_seed(seed: &[u8]) -> Result<Self, RChatError> {
+        let canonical: &[u8; 64] =
+            seed.get(..64)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| RChatError::EncryptionFailed {
+                    message: "Seed must be at least 64 bytes".to_string(),
+                })?;
+        Ok(Self::from_canonical_seed(canonical))
+    }
+
+    /// `seed = signing_secret(32) || agreement_secret(32)`; the KEM key comes
+    /// from `identity_kem_seed(seed)`. The buffers this function owns are
+    /// wiped (`Zeroizing`). Known limits of that wipe:
+    /// - `X25519SecretKey::from([u8; 32])` takes its array by value, so the
+    ///   argument copy made for that call (a stack temporary) is not wiped by
+    ///   us. The resulting `StaticSecret` zeroizes itself on drop.
+    /// - `identity_kem_seed`'s HKDF keeps the PRK inside `hkdf`'s HMAC state,
+    ///   which the `hkdf` crate does not zeroize; it is dropped (not wiped)
+    ///   when the function returns. The 64-byte KEM seed output is wiped.
+    fn from_canonical_seed(seed: &[u8; 64]) -> Self {
+        let mut signing_bytes = Zeroizing::new([0u8; 32]);
+        signing_bytes.copy_from_slice(&seed[0..32]);
+        let signing_key = SigningKey::from_bytes(&signing_bytes);
+
+        // Use raw agreement key bytes directly (must match seed_bytes() output)
+        let mut agreement_bytes = Zeroizing::new([0u8; 32]);
+        agreement_bytes.copy_from_slice(&seed[32..64]);
+        let agreement_key = X25519SecretKey::from(*agreement_bytes);
+
+        let kem_seed = identity_kem_seed(seed);
+        let kem = std::sync::Arc::new(KemKeyPair::from_seed(&kem_seed));
 
         Self {
             signing_key,
             agreement_key,
+            kem,
         }
     }
 
-    /// Derive identity from a seed
-    pub fn from_seed(seed: &[u8]) -> Result<Self, RChatError> {
-        if seed.len() < 64 {
-            return Err(RChatError::EncryptionFailed {
-                message: "Seed must be at least 64 bytes".to_string(),
-            });
-        }
+    /// The identity's ML-KEM-768 public key (signed in the v3 bundle).
+    pub fn kem_public(&self) -> &[u8; KEM_PK_LEN] {
+        self.kem.public()
+    }
 
-        // Use first 32 bytes for signing key, next 32 for agreement key
-        let signing_bytes: [u8; 32] =
-            seed[0..32]
-                .try_into()
-                .map_err(|_| RChatError::EncryptionFailed {
-                    message: "Invalid seed".to_string(),
-                })?;
-
-        let signing_key = SigningKey::from_bytes(&signing_bytes);
-
-        // Use raw agreement key bytes directly (must match seed_bytes() output)
-        let agreement_bytes: [u8; 32] =
-            seed[32..64]
-                .try_into()
-                .map_err(|_| RChatError::EncryptionFailed {
-                    message: "Invalid seed".to_string(),
-                })?;
-        let agreement_key = X25519SecretKey::from(agreement_bytes);
-
-        Ok(Self {
-            signing_key,
-            agreement_key,
-        })
+    /// The identity's static ML-KEM-768 key pair: knocks are encapsulated
+    /// to it (§A.5), and only knock parsing decapsulates with it.
+    pub(crate) fn kem(&self) -> &KemKeyPair {
+        &self.kem
     }
 
     /// Get the public signing key (identity)
@@ -167,84 +199,109 @@ impl EphemeralKeyPair {
     }
 }
 
-/// X3DH v2 (spec §4.4), initiator side (role 0).
-/// DH1 = IK_i × SPK_r, DH2 = EK_i × IK_r, DH3 = EK_i × SPK_r, DH4 = EK_i × EK_r.
-/// Every DH must be contributory (L1).
-pub fn x3dh_v2_initiator(
+/// HKDF info prefix of X3DH v3 (protocol v3 §A.3).
+pub const X3DH_V3_INFO: &[u8] = b"rchat/x3dh/v3";
+
+/// X3DH v3 (protocol v3 §A.3), initiator side (role 0): v2's four DHs,
+/// unchanged, plus the ML-KEM-768 shared secret.
+///
+/// v2 had no separate signed pre-key (it always equalled the identity
+/// agreement key `ak`), so with `ak_r = ik_r_agree`:
+/// DH1 = IK_i × ak_r, DH2 = EK_i × ak_r, DH3 = EK_i × ak_r (computed
+/// twice, as v2 did, to keep the KDF input layout), DH4 = EK_i × EK_r.
+/// Every DH must be contributory (L1). `kem_ss` is the secret the
+/// initiator encapsulated to the responder's ask KEM key `kem_ek_pub_r`,
+/// and `ct` the ciphertext sent in session-init (§A.4).
+// Documented exception (Global Constraints, X30): the brief's signature.
+#[allow(clippy::too_many_arguments)]
+pub fn x3dh_v3_initiator(
     ik_i_agree: &X25519SecretKey,
     ek_i: &X25519SecretKey,
     ik_r_agree: &[u8; 32],
-    spk_r: &[u8; 32],
     ek_r: &[u8; 32],
+    kem_ss: &[u8; 32],
+    kem_ek_pub_r: &[u8; KEM_PK_LEN],
+    ct: &[u8; crate::kem::KEM_CT_LEN],
     ik_initiator: &[u8; 32],
     ik_responder: &[u8; 32],
-) -> Result<[u8; 32], crate::keyauth::KeyAuthError> {
+) -> Result<Zeroizing<[u8; 32]>, crate::keyauth::KeyAuthError> {
     use crate::keyauth::dh_checked;
     // Each DH output is wiped on every return path, including an early `?`.
-    let dh1 = dh_checked(ik_i_agree, spk_r)?;
+    let dh1 = dh_checked(ik_i_agree, ik_r_agree)?;
     let dh2 = dh_checked(ek_i, ik_r_agree)?;
-    let dh3 = dh_checked(ek_i, spk_r)?;
+    let dh3 = dh_checked(ek_i, ik_r_agree)?;
     let dh4 = dh_checked(ek_i, ek_r)?;
-    Ok(x3dh_v2_kdf(
-        &dh1,
-        &dh2,
-        &dh3,
-        &dh4,
+    Ok(x3dh_v3_kdf(
+        [&dh1, &dh2, &dh3, &dh4],
+        kem_ss,
+        kem_ek_pub_r,
+        ct,
         ik_initiator,
         ik_responder,
     ))
 }
 
-/// X3DH v2 (spec §4.4), responder side (role 1). SPK_r is the identity
-/// agreement key in v2, so callers pass the same secret twice.
-pub fn x3dh_v2_responder(
-    spk_r: &X25519SecretKey,
+/// X3DH v3 (protocol v3 §A.3), responder side (role 1): the mirror of
+/// [`x3dh_v3_initiator`]. `ik_r_agree` is our identity agreement secret
+/// (v2's SPK too), `ek_r` our ask's X25519 ephemeral; `kem_ss` comes from
+/// decapsulating `ct` with our ask's KEM ephemeral, whose public key is
+/// `kem_ek_pub_r`.
+// Documented exception (Global Constraints, X30): the brief's signature.
+#[allow(clippy::too_many_arguments)]
+pub fn x3dh_v3_responder(
     ik_r_agree: &X25519SecretKey,
     ek_r: &X25519SecretKey,
     ik_i_agree: &[u8; 32],
     ek_i: &[u8; 32],
+    kem_ss: &[u8; 32],
+    kem_ek_pub_r: &[u8; KEM_PK_LEN],
+    ct: &[u8; crate::kem::KEM_CT_LEN],
     ik_initiator: &[u8; 32],
     ik_responder: &[u8; 32],
-) -> Result<[u8; 32], crate::keyauth::KeyAuthError> {
+) -> Result<Zeroizing<[u8; 32]>, crate::keyauth::KeyAuthError> {
     use crate::keyauth::dh_checked;
-    let dh1 = dh_checked(spk_r, ik_i_agree)?;
+    let dh1 = dh_checked(ik_r_agree, ik_i_agree)?;
     let dh2 = dh_checked(ik_r_agree, ek_i)?;
-    let dh3 = dh_checked(spk_r, ek_i)?;
+    let dh3 = dh_checked(ik_r_agree, ek_i)?;
     let dh4 = dh_checked(ek_r, ek_i)?;
-    Ok(x3dh_v2_kdf(
-        &dh1,
-        &dh2,
-        &dh3,
-        &dh4,
+    Ok(x3dh_v3_kdf(
+        [&dh1, &dh2, &dh3, &dh4],
+        kem_ss,
+        kem_ek_pub_r,
+        ct,
         ik_initiator,
         ik_responder,
     ))
 }
 
-/// SK = HKDF-SHA256(salt = 0^32, ikm = DH1||DH2||DH3||DH4,
-///                  info = "rchat/x3dh/v2" || IK_initiator || IK_responder).
-fn x3dh_v2_kdf(
-    dh1: &[u8; 32],
-    dh2: &[u8; 32],
-    dh3: &[u8; 32],
-    dh4: &[u8; 32],
+/// SK = HKDF-SHA256(salt = 0^32, ikm = DH1||DH2||DH3||DH4||kem_ss,
+///                  info = "rchat/x3dh/v3" || IK_i || IK_r || SHA-256(kem_ek_pub_r || ct)).
+fn x3dh_v3_kdf(
+    dhs: [&[u8; 32]; 4],
+    kem_ss: &[u8; 32],
+    kem_ek_pub_r: &[u8; KEM_PK_LEN],
+    ct: &[u8; crate::kem::KEM_CT_LEN],
     ik_initiator: &[u8; 32],
     ik_responder: &[u8; 32],
-) -> [u8; 32] {
-    let mut ikm = [0u8; 128];
-    ikm[..32].copy_from_slice(dh1);
-    ikm[32..64].copy_from_slice(dh2);
-    ikm[64..96].copy_from_slice(dh3);
-    ikm[96..].copy_from_slice(dh4);
-    let mut info = Vec::with_capacity(13 + 64);
-    info.extend_from_slice(b"rchat/x3dh/v2");
+) -> Zeroizing<[u8; 32]> {
+    use sha2::Digest;
+    let mut ikm = Zeroizing::new([0u8; 160]);
+    for (i, dh) in dhs.iter().enumerate() {
+        ikm[32 * i..32 * (i + 1)].copy_from_slice(&dh[..]);
+    }
+    ikm[128..].copy_from_slice(kem_ss);
+    let mut transcript = Sha256::new();
+    transcript.update(kem_ek_pub_r);
+    transcript.update(ct);
+    let mut info = Vec::with_capacity(X3DH_V3_INFO.len() + 96);
+    info.extend_from_slice(X3DH_V3_INFO);
     info.extend_from_slice(ik_initiator);
     info.extend_from_slice(ik_responder);
-    let mut out = [0u8; 32];
-    crate::keyauth::with_hkdf(Some(&[0u8; 32]), &ikm, |hk| {
-        hk.expand(&info, &mut out).expect("32-byte HKDF output")
+    info.extend_from_slice(&transcript.finalize());
+    let mut out = Zeroizing::new([0u8; 32]);
+    crate::keyauth::with_hkdf(Some(&[0u8; 32]), &ikm[..], |hk| {
+        hk.expand(&info, &mut out[..]).expect("32-byte HKDF output")
     });
-    zeroize::Zeroize::zeroize(&mut ikm);
     out
 }
 
@@ -409,6 +466,10 @@ pub const MAX_OLD_RECEIVING_CHAINS: usize = 5;
 /// chain's lowest message numbers, the current chain's last.
 pub const MAX_SKIPPED_KEYS: usize = 1000;
 
+/// Most message keys one receiving chain may skip in a single decrypt: a
+/// message more than this far ahead of the last one received fails.
+pub const MAX_SKIP: u32 = 100;
+
 /// Skipped message keys expire after this (spec §18.2.1, D31): the relay's
 /// default retention; a later message on that key cannot arrive.
 pub const SKIPPED_KEY_MAX_AGE_SECS: u64 = 72 * 3600;
@@ -526,7 +587,7 @@ impl DoubleRatchet {
             identity_key_pair: None,
             is_responder: false,
             skipped_message_keys: BTreeMap::new(),
-            max_skip: 100,
+            max_skip: MAX_SKIP,
             old_receiving_chains: HashMap::new(),
             next_old_chain_seq: 0,
         }
@@ -1186,7 +1247,7 @@ pub fn decrypt_xchacha20poly1305(
 mod tests {
     use super::*;
 
-    use crate::keyauth::{golden, sign_bundle, KeyAuthError};
+    use crate::keyauth::{golden, KeyAuthError};
 
     #[test]
     fn write_seed_matches_seed_bytes() {
@@ -1203,107 +1264,257 @@ mod tests {
         )
     }
 
-    /// K11: fixed IK/SPK/EK_i/EK_r give the exact SK on both roles.
-    #[test]
-    fn k11_x3dh_v2_vector_both_roles() {
-        let (a, b) = golden_pair();
-        let (ba, bb) = (sign_bundle(&a).unwrap(), sign_bundle(&b).unwrap());
-        let ek_i = X25519SecretKey::from([0x61u8; 32]);
-        let ek_r = X25519SecretKey::from([0x62u8; 32]);
-        let eki_pub = X25519PublicKey::from(&ek_i).to_bytes();
-        let ekr_pub = X25519PublicKey::from(&ek_r).to_bytes();
-        let ski = x3dh_v2_initiator(
-            a.agreement_secret(),
-            &ek_i,
-            &bb.identity_agreement_key,
-            &bb.signed_pre_key,
-            &ekr_pub,
-            &ba.identity_key,
-            &bb.identity_key,
-        )
-        .unwrap();
-        let skr = x3dh_v2_responder(
-            b.agreement_secret(),
-            b.agreement_secret(),
-            &ek_r,
-            &ba.identity_agreement_key,
-            &eki_pub,
-            &ba.identity_key,
-            &bb.identity_key,
-        )
-        .unwrap();
-        assert_eq!(
-            hex::encode(ski),
-            "011596c022151670a5cf7a1e7de44b76f4cbc6c32a0fc3e82b9e1044c82b07d3"
-        );
-        assert_eq!(ski, skr);
+    /// Fixed X3DH v3 inputs: golden identities A (initiator) and B
+    /// (responder), EK_i = 0x61.., EK_r = 0x62.., kem_ss = 0x71..,
+    /// kem_ek_pub_r = the KEM key of seed 0x73.., ct = 0x72...
+    struct V3Inputs {
+        a: IdentityKeyPair,
+        b: IdentityKeyPair,
+        ek_i: X25519SecretKey,
+        ek_r: X25519SecretKey,
+        kem_ss: [u8; 32],
+        kem_pk: [u8; KEM_PK_LEN],
+        ct: [u8; crate::kem::KEM_CT_LEN],
     }
 
-    /// K11: changing EK_r changes SK; swapping the IK order in `info` changes SK.
-    #[test]
-    fn k11_x3dh_v2_binds_responder_ek_and_identity_order() {
+    fn v3_inputs() -> V3Inputs {
         let (a, b) = golden_pair();
-        let (ba, bb) = (sign_bundle(&a).unwrap(), sign_bundle(&b).unwrap());
-        let ek_i = X25519SecretKey::from([0x61u8; 32]);
-        let ekr = X25519PublicKey::from(&X25519SecretKey::from([0x62u8; 32])).to_bytes();
-        let ekr2 = X25519PublicKey::from(&X25519SecretKey::from([0x63u8; 32])).to_bytes();
-        let sk = |ekr: &[u8; 32], i: &[u8; 32], r: &[u8; 32]| {
-            x3dh_v2_initiator(
-                a.agreement_secret(),
-                &ek_i,
-                &bb.identity_agreement_key,
-                &bb.signed_pre_key,
-                ekr,
-                i,
-                r,
+        V3Inputs {
+            a,
+            b,
+            ek_i: X25519SecretKey::from([0x61u8; 32]),
+            ek_r: X25519SecretKey::from([0x62u8; 32]),
+            kem_ss: [0x71; 32],
+            kem_pk: *KemKeyPair::from_seed(&[0x73; 64]).public(),
+            ct: [0x72; crate::kem::KEM_CT_LEN],
+        }
+    }
+
+    impl V3Inputs {
+        fn ik_a(&self) -> [u8; 32] {
+            self.a.public_signing_key().to_bytes()
+        }
+        fn ik_b(&self) -> [u8; 32] {
+            self.b.public_signing_key().to_bytes()
+        }
+        fn initiator(&self) -> Zeroizing<[u8; 32]> {
+            x3dh_v3_initiator(
+                self.a.agreement_secret(),
+                &self.ek_i,
+                &self.b.public_agreement_key().to_bytes(),
+                &X25519PublicKey::from(&self.ek_r).to_bytes(),
+                &self.kem_ss,
+                &self.kem_pk,
+                &self.ct,
+                &self.ik_a(),
+                &self.ik_b(),
             )
             .unwrap()
-        };
-        let base = sk(&ekr, &ba.identity_key, &bb.identity_key);
-        assert_ne!(
-            base,
-            sk(&ekr2, &ba.identity_key, &bb.identity_key),
-            "EK_r is mixed in (DH4)"
-        );
-        assert_ne!(
-            base,
-            sk(&ekr, &bb.identity_key, &ba.identity_key),
-            "IK order is bound in info"
-        );
+        }
+        fn responder(&self) -> Zeroizing<[u8; 32]> {
+            x3dh_v3_responder(
+                self.b.agreement_secret(),
+                &self.ek_r,
+                &self.a.public_agreement_key().to_bytes(),
+                &X25519PublicKey::from(&self.ek_i).to_bytes(),
+                &self.kem_ss,
+                &self.kem_pk,
+                &self.ct,
+                &self.ik_a(),
+                &self.ik_b(),
+            )
+            .unwrap()
+        }
     }
 
-    /// K11 / K17: an all-zero (or other low-order) DH output is refused on either role.
+    /// §F.1: fixed inputs give the exact SK, the same on both roles. The
+    /// vector was reproduced independently in Python stdlib: a pure-Python
+    /// RFC 7748 X25519 for the four DHs (from the golden seeds' agreement
+    /// halves and the fixed EKs), then RFC 5869 HKDF-SHA256 with salt 0^32
+    /// and info "rchat/x3dh/v3" || IK_A || IK_B || SHA-256(kem_pk || ct).
     #[test]
-    fn k17_x3dh_v2_refuses_non_contributory_relay_ek() {
-        let (a, b) = golden_pair();
-        let (ba, bb) = (sign_bundle(&a).unwrap(), sign_bundle(&b).unwrap());
-        let ek = X25519SecretKey::from([0x61u8; 32]);
+    fn x3dh_v3_vector_both_roles() {
+        let v = v3_inputs();
+        let (ski, skr) = (v.initiator(), v.responder());
+        assert_eq!(
+            hex::encode(*ski),
+            "f46d359c092626543b55ac15acb1f632b56d3b8e7e714eadcc8e2e752e341f13"
+        );
+        assert_eq!(*ski, *skr);
+    }
+
+    /// §F.1: each input changes SK: every DH (through IK_i, EK_i, ak_r and
+    /// EK_r), kem_ss, the IK order, kem_ek_pub_r and ct.
+    #[test]
+    fn x3dh_v3_each_input_changes_sk() {
+        let base = *v3_inputs().initiator();
+        let mut seen = vec![base];
+        let mut check = |sk: [u8; 32], what: &str| {
+            assert!(!seen.contains(&sk), "{what} must change SK");
+            seen.push(sk);
+        };
+        // DH1 (and only DH1) through the initiator's identity agreement key.
+        let mut v = v3_inputs();
+        v.a = IdentityKeyPair::from_seed(&[0x44; 64]).unwrap();
+        let ik_a = golden_pair().0.public_signing_key().to_bytes();
+        let dh1_only = x3dh_v3_initiator(
+            v.a.agreement_secret(),
+            &v.ek_i,
+            &v.b.public_agreement_key().to_bytes(),
+            &X25519PublicKey::from(&v.ek_r).to_bytes(),
+            &v.kem_ss,
+            &v.kem_pk,
+            &v.ct,
+            &ik_a,
+            &v.ik_b(),
+        )
+        .unwrap();
+        check(*dh1_only, "DH1 (IK_i agreement key)");
+        // DH2, DH3 and DH4 through EK_i.
+        let mut v = v3_inputs();
+        v.ek_i = X25519SecretKey::from([0x65u8; 32]);
+        check(*v.initiator(), "EK_i (DH2-DH4)");
+        // DH1-DH3 through the responder's agreement key, keeping IK_r.
+        let v = v3_inputs();
+        let other_ak = IdentityKeyPair::from_seed(&[0x45; 64])
+            .unwrap()
+            .public_agreement_key()
+            .to_bytes();
+        let ak_changed = x3dh_v3_initiator(
+            v.a.agreement_secret(),
+            &v.ek_i,
+            &other_ak,
+            &X25519PublicKey::from(&v.ek_r).to_bytes(),
+            &v.kem_ss,
+            &v.kem_pk,
+            &v.ct,
+            &v.ik_a(),
+            &v.ik_b(),
+        )
+        .unwrap();
+        check(*ak_changed, "ak_r (DH1-DH3)");
+        // DH4 through EK_r.
+        let mut v = v3_inputs();
+        v.ek_r = X25519SecretKey::from([0x63u8; 32]);
+        check(*v.initiator(), "EK_r (DH4)");
+        let mut v = v3_inputs();
+        v.kem_ss[31] ^= 1;
+        check(*v.initiator(), "kem_ss");
+        let mut v = v3_inputs();
+        v.kem_pk = *KemKeyPair::from_seed(&[0x74; 64]).public();
+        check(*v.initiator(), "kem_ek_pub_r");
+        let mut v = v3_inputs();
+        v.ct[0] ^= 1;
+        check(*v.initiator(), "ct");
+        // The IK order in info (the DHs are unchanged).
+        let v = v3_inputs();
+        let swapped = x3dh_v3_initiator(
+            v.a.agreement_secret(),
+            &v.ek_i,
+            &v.b.public_agreement_key().to_bytes(),
+            &X25519PublicKey::from(&v.ek_r).to_bytes(),
+            &v.kem_ss,
+            &v.kem_pk,
+            &v.ct,
+            &v.ik_b(),
+            &v.ik_a(),
+        )
+        .unwrap();
+        check(*swapped, "IK order");
+        // IK_i and IK_r themselves.
+        let v = v3_inputs();
+        let other_ik = [0x99u8; 32];
+        for (i, r, what) in [(other_ik, v.ik_b(), "IK_i"), (v.ik_a(), other_ik, "IK_r")] {
+            let sk = x3dh_v3_initiator(
+                v.a.agreement_secret(),
+                &v.ek_i,
+                &v.b.public_agreement_key().to_bytes(),
+                &X25519PublicKey::from(&v.ek_r).to_bytes(),
+                &v.kem_ss,
+                &v.kem_pk,
+                &v.ct,
+                &i,
+                &r,
+            )
+            .unwrap();
+            check(*sk, what);
+        }
+    }
+
+    /// A real ML-KEM round trip: the initiator encapsulates to the
+    /// responder's ephemeral, the responder decapsulates; both get one SK.
+    #[test]
+    fn x3dh_v3_real_kem_round_trip() {
+        let v = v3_inputs();
+        let kem_eph = KemKeyPair::generate();
+        let (ct, ss_i) = crate::kem::encapsulate(kem_eph.public()).unwrap();
+        let ss_r = kem_eph.decapsulate(&ct).unwrap();
+        let ek_r_pub = X25519PublicKey::from(&v.ek_r).to_bytes();
+        let ek_i_pub = X25519PublicKey::from(&v.ek_i).to_bytes();
+        let ski = x3dh_v3_initiator(
+            v.a.agreement_secret(),
+            &v.ek_i,
+            &v.b.public_agreement_key().to_bytes(),
+            &ek_r_pub,
+            &ss_i,
+            kem_eph.public(),
+            &ct,
+            &v.ik_a(),
+            &v.ik_b(),
+        )
+        .unwrap();
+        let skr = x3dh_v3_responder(
+            v.b.agreement_secret(),
+            &v.ek_r,
+            &v.a.public_agreement_key().to_bytes(),
+            &ek_i_pub,
+            &ss_r,
+            kem_eph.public(),
+            &ct,
+            &v.ik_a(),
+            &v.ik_b(),
+        )
+        .unwrap();
+        assert_eq!(*ski, *skr);
+    }
+
+    /// K17 / L1: an all-zero (or other low-order) relay-supplied EK is
+    /// refused on either role (`dh_checked`).
+    #[test]
+    fn x3dh_v3_refuses_non_contributory() {
+        let v = v3_inputs();
         let zero = [0u8; 32];
         let mut one = [0u8; 32];
         one[0] = 1; // the point of order 1
         for bad in [zero, one] {
             assert_eq!(
-                x3dh_v2_initiator(
-                    a.agreement_secret(),
-                    &ek,
-                    &bb.identity_agreement_key,
-                    &bb.signed_pre_key,
+                x3dh_v3_initiator(
+                    v.a.agreement_secret(),
+                    &v.ek_i,
+                    &v.b.public_agreement_key().to_bytes(),
                     &bad,
-                    &ba.identity_key,
-                    &bb.identity_key
-                ),
+                    &v.kem_ss,
+                    &v.kem_pk,
+                    &v.ct,
+                    &v.ik_a(),
+                    &v.ik_b(),
+                )
+                .map(|_| ()),
                 Err(KeyAuthError::NonContributory)
             );
             assert_eq!(
-                x3dh_v2_responder(
-                    b.agreement_secret(),
-                    b.agreement_secret(),
-                    &ek,
-                    &ba.identity_agreement_key,
+                x3dh_v3_responder(
+                    v.b.agreement_secret(),
+                    &v.ek_r,
+                    &v.a.public_agreement_key().to_bytes(),
                     &bad,
-                    &ba.identity_key,
-                    &bb.identity_key
-                ),
+                    &v.kem_ss,
+                    &v.kem_pk,
+                    &v.ct,
+                    &v.ik_a(),
+                    &v.ik_b(),
+                )
+                .map(|_| ()),
                 Err(KeyAuthError::NonContributory)
             );
         }

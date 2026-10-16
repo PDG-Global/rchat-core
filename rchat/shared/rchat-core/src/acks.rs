@@ -17,8 +17,24 @@ pub(crate) const ACK_MAX_ATTEMPTS: u8 = 3;
 pub(crate) const ACK_UNKNOWN_AFTER: Duration = Duration::from_secs(120);
 /// Most ids tracked; beyond it the oldest leave as ack unknown.
 pub(crate) const MAX_TRACKED_ACKS: usize = 1024;
-/// Most payload bytes tracked; beyond it the oldest leave as ack unknown.
+/// Most bytes (payload plus kept plaintext) of small entries tracked;
+/// beyond it the oldest small entries leave as ack unknown.
 pub(crate) const MAX_TRACKED_ACK_BYTES: usize = 8 * 1024 * 1024;
+/// An entry whose sealed payload is at least this large (files, images,
+/// voice notes) counts toward the separate large budget (ruling R29), so a
+/// file never pushes texts out of the tracker, nor texts a file.
+pub(crate) const LARGE_ACK_PAYLOAD: usize = 64 * 1024;
+/// What a sealed payload can add over its plaintext: the relay message
+/// bounds the payload, so this is the relay's 4 MiB less the largest file
+/// plaintext (padding steps, ratchet header and tag, envelope).
+pub(crate) const LARGE_ACK_ENTRY_OVERHEAD: usize =
+    crate::file_msg::RELAY_MAX_MESSAGE_BYTES - crate::file_msg::MAX_FILE_PLAINTEXT;
+/// Bytes of large entries tracked: three maximum-size files, each its
+/// payload plus the plaintext kept for a re-seal (R19). Beyond it the
+/// oldest large entries leave as ack unknown; small entries are never
+/// touched (R29).
+pub(crate) const MAX_TRACKED_LARGE_ACK_BYTES: usize =
+    3 * (2 * crate::file_msg::MAX_FILE_PLAINTEXT + LARGE_ACK_ENTRY_OVERHEAD);
 /// Times a notice or a receipt id that left the tracker without an ack is
 /// owed (sealed) again in one session before it is given up silently, as
 /// app messages give up after `ACK_MAX_ATTEMPTS` (review N-1). A relay
@@ -78,6 +94,19 @@ pub(crate) struct Tracked {
     /// doubled for each time an internal entry was already owed again
     /// (backoff between re-seals, review N-1).
     pub expire_after: Duration,
+    /// An app message's plaintext (type byte first), kept so it can be
+    /// re-sealed under a later session of the same pair-secret lineage
+    /// (R19). Memory only, like the tracker; wiped when the entry goes.
+    pub plaintext: Option<zeroize::Zeroizing<Vec<u8>>>,
+    /// `ChatSession::pair_lineage` of the session it was sealed under.
+    pub lineage: Option<[u8; 32]>,
+}
+
+impl Tracked {
+    /// Bytes it counts toward `MAX_TRACKED_ACK_BYTES`.
+    fn size(&self) -> usize {
+        self.payload.len() + self.plaintext.as_ref().map_or(0, |p| p.len())
+    }
 }
 
 /// What an internal entry carries, so it can be owed again rather than
@@ -93,6 +122,10 @@ pub(crate) enum Internal {
     },
     /// A receipt batch of `kind` for `ids`.
     Receipt { kind: u8, ids: Vec<[u8; 16]> },
+    /// A session-init (§A.4) carrying the invisible first message. Never
+    /// owed again: the session keeps the init and re-sends it until the
+    /// peer's first reply (`ChatSession::init_out`).
+    SessionInit,
 }
 
 /// Unacked sends by message id (lowercase hex), oldest first.
@@ -101,7 +134,12 @@ pub(crate) struct AckTracker {
     entries: HashMap<String, Tracked>,
     /// Ids in tracking order; may hold ids already gone (skipped lazily).
     order: VecDeque<String>,
+    /// Bytes of small entries (`MAX_TRACKED_ACK_BYTES`).
     bytes: usize,
+    /// Ids of large entries (payload at least `LARGE_ACK_PAYLOAD` when
+    /// tracked), and their bytes (`MAX_TRACKED_LARGE_ACK_BYTES`).
+    large: std::collections::HashSet<String>,
+    large_bytes: usize,
     /// Internal entries that left without an ack (evicted, expired,
     /// exhausted), for the client to owe again (`settle_departed`).
     departed: Vec<(String, Tracked)>,
@@ -130,17 +168,46 @@ fn unknown(
 
 impl AckTracker {
     /// Track `id_hex`; returns the entries evicted to stay within the bounds.
+    /// Only entries of the new one's class (small or large, R29) are
+    /// evicted: that is the only budget it grew.
     pub fn track(&mut self, id_hex: String, t: Tracked) -> Vec<(String, String, u8)> {
-        self.bytes += t.payload.len();
-        if let Some(old) = self.entries.insert(id_hex.clone(), t) {
-            self.bytes -= old.payload.len();
+        self.remove(&id_hex);
+        let large = t.payload.len() >= LARGE_ACK_PAYLOAD;
+        if large {
+            self.large_bytes += t.size();
+            self.large.insert(id_hex.clone());
+        } else {
+            self.bytes += t.size();
         }
+        self.entries.insert(id_hex.clone(), t);
         // Never twice in `order`, even if a lazily left copy remains.
         self.order.retain(|id| *id != id_hex);
         self.order.push_back(id_hex);
         let mut evicted = Vec::new();
-        while self.len() > MAX_TRACKED_ACKS || self.bytes() > MAX_TRACKED_ACK_BYTES {
-            let Some(id) = self.order.pop_front() else {
+        let over = |a: &Self| {
+            a.len() > MAX_TRACKED_ACKS
+                || if large {
+                    a.large_bytes > MAX_TRACKED_LARGE_ACK_BYTES
+                } else {
+                    a.bytes > MAX_TRACKED_ACK_BYTES
+                }
+        };
+        // Accepted outage behaviour (fix round 2 N-2): the count limit is
+        // shared, but eviction stays within the new entry's class. With
+        // `MAX_TRACKED_ACKS` small entries tracked (a long outage of acks),
+        // a new large entry is its class's only candidate, so it is
+        // evicted at once and reported as AckUnknown; the small entries,
+        // and the large budget, are untouched.
+        while over(self) {
+            // The oldest live entry of the same class.
+            let Some(pos) = self
+                .order
+                .iter()
+                .position(|id| self.entries.contains_key(id) && self.large.contains(id) == large)
+            else {
+                break;
+            };
+            let Some(id) = self.order.remove(pos) else {
                 break;
             };
             if let Some(t) = self.remove(&id) {
@@ -157,8 +224,68 @@ impl AckTracker {
 
     fn remove(&mut self, id_hex: &str) -> Option<Tracked> {
         let t = self.entries.remove(id_hex)?;
-        self.bytes -= t.payload.len();
+        *self.budget_of(id_hex) -= t.size();
+        self.large.remove(id_hex);
         Some(t)
+    }
+
+    /// The byte count `id_hex` is charged to.
+    fn budget_of(&mut self, id_hex: &str) -> &mut usize {
+        if self.large.contains(id_hex) {
+            &mut self.large_bytes
+        } else {
+            &mut self.bytes
+        }
+    }
+
+    /// Ids tracked for `peer`, in send order.
+    pub fn ids_for(&self, peer: &str) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|id| self.entries.get(*id).is_some_and(|t| t.peer == peer))
+            .cloned()
+            .collect()
+    }
+
+    /// The peer's app entries sealed under another session than `binding`
+    /// of the same pair-secret `lineage`, with their plaintext, in send
+    /// order (R19).
+    pub fn to_reseal(
+        &self,
+        peer: &str,
+        binding: &[u8; 32],
+        lineage: &[u8; 32],
+    ) -> Vec<(String, zeroize::Zeroizing<Vec<u8>>)> {
+        self.order
+            .iter()
+            .filter_map(|id| {
+                let t = self.entries.get(id)?;
+                let same_lineage = t
+                    .lineage
+                    .as_ref()
+                    .is_some_and(|l| constant_time_eq::constant_time_eq(l, lineage));
+                (t.peer == peer && t.internal.is_none() && t.binding != *binding && same_lineage)
+                    .then(|| Some((id.clone(), t.plaintext.clone()?)))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// `id_hex` was re-sealed under the session `binding`: these bytes go
+    /// out from now on.
+    pub fn resealed(&mut self, id_hex: &str, payload: Vec<u8>, binding: [u8; 32]) {
+        let large = self.large.contains(id_hex);
+        if let Some(t) = self.entries.get_mut(id_hex) {
+            let counter = if large {
+                &mut self.large_bytes
+            } else {
+                &mut self.bytes
+            };
+            *counter -= t.payload.len();
+            *counter += payload.len();
+            t.payload = payload;
+            t.binding = binding;
+        }
     }
 
     /// Stop tracking `id_hex` (its send failed and the caller reports it).
@@ -294,19 +421,41 @@ impl AckTracker {
 
     /// Forget every id tracked for `peer`, silently: its payloads are
     /// sealed to keys that are no longer trusted (unpin, block, re-pin).
-    pub fn drop_peer(&mut self, peer: &str) {
-        let mut freed = 0;
-        self.entries.retain(|_, t| {
-            let keep = t.peer != peer;
-            if !keep {
-                freed += t.payload.len();
+    /// M-4: the peer's plaintexts kept for a re-seal under `lineage` only;
+    /// every other one (an identity install changed the pair secret) is
+    /// wiped now: it can never be re-sealed (R19).
+    pub fn drop_plaintexts(&mut self, peer: &str, lineage: Option<[u8; 32]>) {
+        for (id, t) in self.entries.iter_mut().filter(|(_, t)| t.peer == peer) {
+            if t.plaintext.is_some() && (lineage.is_none() || t.lineage != lineage) {
+                let freed = t.plaintext.take().map_or(0, |p| p.len());
+                if self.large.contains(id) {
+                    self.large_bytes -= freed;
+                } else {
+                    self.bytes -= freed;
+                }
             }
-            keep
-        });
-        self.bytes -= freed;
+        }
+    }
+
+    pub fn drop_peer(&mut self, peer: &str) {
+        let ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, t)| t.peer == peer)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.remove(&id);
+        }
         let entries = &self.entries;
         self.order.retain(|id| entries.contains_key(id));
         self.departed.retain(|(_, t)| t.peer != peer);
+    }
+
+    /// Whether `id_hex` still keeps its plaintext for a re-seal (tests).
+    #[cfg(test)]
+    pub fn has_plaintext(&self, id_hex: &str) -> Option<bool> {
+        self.entries.get(id_hex).map(|t| t.plaintext.is_some())
     }
 
     /// Attempts recorded for `id_hex` (tests).
@@ -319,8 +468,16 @@ impl AckTracker {
         self.entries.len()
     }
 
+    /// Bytes of small entries (tests).
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Bytes of large entries (tests).
+    #[cfg(test)]
+    pub fn large_bytes(&self) -> usize {
+        self.large_bytes
     }
 }
 
@@ -331,14 +488,24 @@ impl ClientInner {
 
     /// Track a sealed message the transport accepted (delivery confirmation
     /// on); evicted ids are reported as ack unknown.
+    /// `plaintext` (type byte first) is kept with it for a re-seal under a
+    /// later session of the same pair-secret lineage (R19).
     pub(crate) fn track_sent(
         &self,
         peer_hex: &str,
         id_hex: &str,
         circuit: CircuitId,
         payload: Vec<u8>,
+        plaintext: &[u8],
     ) {
-        self.track(peer_hex, id_hex, circuit, payload, None);
+        self.track(
+            peer_hex,
+            id_hex,
+            circuit,
+            payload,
+            None,
+            Some(zeroize::Zeroizing::new(plaintext.to_vec())),
+        );
     }
 
     /// Track a session notice or receipt the transport accepted, so a
@@ -356,7 +523,7 @@ impl ClientInner {
         payload: Vec<u8>,
         what: Internal,
     ) -> bool {
-        self.track(peer_hex, id_hex, circuit, payload, Some(what))
+        self.track(peer_hex, id_hex, circuit, payload, Some(what), None)
     }
 
     fn track(
@@ -366,15 +533,18 @@ impl ClientInner {
         circuit: CircuitId,
         payload: Vec<u8>,
         internal: Option<Internal>,
+        plaintext: Option<zeroize::Zeroizing<Vec<u8>>>,
     ) -> bool {
-        let binding = match internal {
-            Some(_) => self
-                .session_manager
-                .get(peer_hex)
-                .map(|s| s.session_binding)
-                .unwrap_or_default(),
-            None => [0; 32],
-        };
+        // The session it was sealed under (app messages too: R19 re-seals
+        // those sealed under an earlier session of the same lineage).
+        let (binding, lineage) = self
+            .session_manager
+            .get(peer_hex)
+            .map(|s| (s.session_binding, s.pair_lineage()))
+            .unwrap_or_default();
+        // M-4: a plaintext is kept only while a later blind session of the
+        // same pair secret could re-seal it.
+        let plaintext = plaintext.filter(|_| lineage.is_some());
         let level = match &internal {
             None => 0,
             Some(Internal::Notice { reason, ids, .. }) => {
@@ -385,6 +555,7 @@ impl ClientInner {
                 .map(|id| self.reowe_count(peer_hex, ReoweKey::Receipt(*kind, *id), &binding))
                 .max()
                 .unwrap_or(0),
+            Some(Internal::SessionInit) => 0,
         };
         let expire_after = ACK_UNKNOWN_AFTER * (1u32 << level.min(8));
         if !self.config.enable_delivery_confirmation {
@@ -403,6 +574,8 @@ impl ClientInner {
                 internal,
                 binding,
                 expire_after,
+                plaintext,
+                lineage,
             },
         );
         for (peer, message_id, attempts) in evicted {
@@ -415,6 +588,11 @@ impl ClientInner {
         true
     }
 
+    /// `AckTracker::drop_plaintexts` under the tracker's own lock (M-4).
+    pub(crate) fn ack_tracker_drop_plaintexts(&self, peer_hex: &str, lineage: Option<[u8; 32]>) {
+        self.ack_tracker().drop_plaintexts(peer_hex, lineage);
+    }
+
     /// `AckTracker::untrack` under the tracker's own lock.
     pub(crate) fn untrack_sent(&self, id_hex: &str) {
         self.ack_tracker().untrack(id_hex);
@@ -423,9 +601,45 @@ impl ClientInner {
     /// Re-send every tracked payload for `peer_hex` on its live circuit
     /// (spec §18.7 D35): identical bytes, re-wrapped for the current circuit.
     pub(crate) fn resend_tracked(&mut self, peer_hex: &str) {
+        self.resend_tracked_among(peer_hex, None);
+    }
+
+    /// Ids tracked for `peer_hex`, in send order.
+    pub(crate) fn tracked_ids_for(&self, peer_hex: &str) -> std::collections::HashSet<String> {
+        self.ack_tracker().ids_for(peer_hex).into_iter().collect()
+    }
+
+    /// `resend_tracked`, limited to the ids in `among` when given. App
+    /// messages sealed under an earlier session of the current session's
+    /// pair-secret lineage (a blind re-pair since, §C.3) are first re-sealed
+    /// under the current session with the same message id (R19): the peer
+    /// keeps one retired session only, so after two re-pairs the old bytes
+    /// would no longer decrypt; the peer drops a second copy of an id it
+    /// already decrypted (`received_ids`). After an identity install the
+    /// lineage differs and the old bytes are re-sent as before (AK4): only
+    /// a holder of the old session can read them.
+    pub(crate) fn resend_tracked_among(
+        &mut self,
+        peer_hex: &str,
+        among: Option<&std::collections::HashSet<String>>,
+    ) {
         if !self.has_live_circuit(peer_hex) {
             return;
         }
+        // §A.4 (review M-3): the session-init is the first packet on a new
+        // circuit. While ours is not out yet (its seal failed), nothing
+        // tracked is re-sent; the tick re-sends once it is
+        // (`redrive_owed_sends`).
+        let init_pending = self.session_manager.get(peer_hex).is_some_and(|s| {
+            s.init_out
+                .as_ref()
+                .is_some_and(|i| !matches!(&i.sent, Some(x) if !x.payload.is_empty()))
+        });
+        if init_pending {
+            self.resend_after_init.insert(peer_hex.to_string());
+            return;
+        }
+        self.resend_after_init.remove(peer_hex);
         let exhausted = self.ack_tracker().take_exhausted(peer_hex);
         for (peer, message_id, attempts) in exhausted {
             self.emit_status(StatusEvent::AckUnknown {
@@ -452,8 +666,54 @@ impl ClientInner {
         for t in stale {
             self.settle_internal(peer_hex, t, false);
         }
+        // §A.4: a session-init the peer has not answered goes first, as its
+        // first bytes, once per new transport, until the peer's first reply
+        // or `ASK_TTL` (after which the peer can no longer open it).
+        let epoch = self.transport_epoch;
+        let init = self.session_manager.get(peer_hex).and_then(|s| {
+            let sent = s.init_out.as_ref()?.sent.as_ref()?;
+            // The peer may wait for it as long as the offline queue keeps
+            // it (ruling R8: its wait counts online time, capped at 72 h).
+            let fresh = crate::unix_now_secs().saturating_sub(s.created_at_unix)
+                <= crate::circuits::PENDING_INIT_MAX_AGE_SECS;
+            Some((
+                hex::encode(sent.id),
+                sent.payload.clone(),
+                sent.epoch < epoch && fresh,
+            ))
+        });
+        if let Some((init_id, payload, due)) = &init {
+            if *due {
+                let packet = RelayPacket::with_auth(
+                    target.clone(),
+                    payload.clone(),
+                    PacketFlags {
+                        encrypted: true,
+                        ..Default::default()
+                    },
+                    &token,
+                );
+                if self.send_now(packet.encode_with_frame_type()).is_err() {
+                    return; // nothing may overtake it
+                }
+                self.ack_tracker().note_attempt(init_id, target.clone());
+                if let Some(mut s) = self.session_manager.get_mut(peer_hex) {
+                    if let Some(sent) = s.init_out.as_mut().and_then(|i| i.sent.as_mut()) {
+                        sent.epoch = epoch;
+                    }
+                }
+            }
+        }
+        let init_id = init.map(|(id, _, _)| id);
+        self.reseal_tracked(peer_hex, &binding);
         let todo = self.ack_tracker().payloads_for(peer_hex);
         for (id, payload) in todo {
+            if init_id.as_ref() == Some(&id) {
+                continue; // handled above, once per transport
+            }
+            if among.is_some_and(|a| !a.contains(&id)) {
+                continue; // tracked under the new session: not sent twice
+            }
             let packet = RelayPacket::with_auth(
                 target.clone(),
                 payload,
@@ -469,6 +729,37 @@ impl ClientInner {
                 break;
             }
             self.ack_tracker().note_attempt(&id, target.clone());
+        }
+    }
+
+    /// R19: re-seal, under the current session (`binding`) and in send
+    /// order, the peer's tracked app messages sealed under an earlier
+    /// session of the same pair-secret lineage. Same message ids. A message
+    /// that cannot be sealed now keeps its old bytes (and so does the rest,
+    /// in order).
+    fn reseal_tracked(&mut self, peer_hex: &str, binding: &[u8; 32]) {
+        let Some(lineage) = self
+            .session_manager
+            .get(peer_hex)
+            .filter(|s| s.can_send())
+            .and_then(|s| s.pair_lineage())
+        else {
+            return;
+        };
+        let todo = self.ack_tracker().to_reseal(peer_hex, binding, &lineage);
+        for (id_hex, plaintext) in todo {
+            let Some(id) = crate::circuits::message_id_from_hex(&id_hex) else {
+                continue;
+            };
+            match self.seal_ratchet(peer_hex, id, &plaintext) {
+                Ok(packet) => self
+                    .ack_tracker()
+                    .resealed(&id_hex, packet.payload, *binding),
+                Err(_) => {
+                    log::debug!("[RUST] tracked message not re-sealed; old bytes kept");
+                    break;
+                }
+            }
         }
     }
 
@@ -544,7 +835,7 @@ impl ClientInner {
                 Some(Internal::Notice { reason, ids, .. }) => {
                     live.insert((t.peer.clone(), notice_key(*reason, ids)));
                 }
-                None => {}
+                Some(Internal::SessionInit) | None => {}
             }
         }
         let due = &self.notice_due;
@@ -566,7 +857,7 @@ impl ClientInner {
                 self.reowes
                     .remove(&(t.peer.clone(), notice_key(*reason, ids)));
             }
-            None => {}
+            Some(Internal::SessionInit) | None => {}
         }
     }
 
@@ -626,7 +917,7 @@ impl ClientInner {
                 }
                 self.relist_notice_ids(peer_hex, reason, &ids);
             }
-            None => return,
+            Some(Internal::SessionInit) | None => return,
         }
         let _ = self.persist_peer(peer_hex);
     }
@@ -705,7 +996,13 @@ impl ClientInner {
     ) -> Result<(), RChatError> {
         let packet = self.seal_ratchet(peer, id, pt)?;
         self.send_now(packet.encode_with_frame_type())?;
-        self.track_sent(peer, &hex::encode(id), packet.circuit_id, packet.payload);
+        self.track_sent(
+            peer,
+            &hex::encode(id),
+            packet.circuit_id,
+            packet.payload,
+            pt,
+        );
         Ok(())
     }
 }
@@ -727,6 +1024,8 @@ mod tests {
             internal: None,
             binding: [0; 32],
             expire_after: ACK_UNKNOWN_AFTER,
+            plaintext: None,
+            lineage: None,
         }
     }
 
@@ -768,6 +1067,76 @@ mod tests {
             1,
             "past 120 s connected"
         );
+    }
+
+    /// A maximum-size file's entry at its worst: the payload as large as
+    /// the relay message, plus the kept plaintext (R19).
+    fn max_file(peer: &str) -> Tracked {
+        Tracked {
+            payload: vec![0; crate::file_msg::RELAY_MAX_MESSAGE_BYTES],
+            plaintext: Some(zeroize::Zeroizing::new(vec![
+                0;
+                crate::file_msg::MAX_FILE_PLAINTEXT
+            ])),
+            lineage: Some([1; 32]),
+            ..t(peer, 0)
+        }
+    }
+
+    /// R29: two maximum files and a text all stay tracked.
+    #[test]
+    fn r29_two_max_files_and_a_text_are_kept() {
+        let mut a = AckTracker::default();
+        assert!(a.track("f1".into(), max_file("p")).is_empty());
+        assert!(a.track("t1".into(), t("p", 300)).is_empty());
+        assert!(a.track("f2".into(), max_file("p")).is_empty());
+        assert_eq!(a.len(), 3);
+        assert_eq!(
+            a.bytes(),
+            300,
+            "the text alone counts toward the small budget"
+        );
+    }
+
+    /// R29: a 4th maximum file evicts only the oldest large entry; the
+    /// text, older than all of them, survives.
+    #[test]
+    fn r29_fourth_max_file_evicts_only_the_oldest_large_entry() {
+        let mut a = AckTracker::default();
+        a.track("t1".into(), t("p", 300));
+        for f in ["f1", "f2", "f3"] {
+            assert!(a.track(f.into(), max_file("p")).is_empty(), "{f}");
+        }
+        let evicted = a.track("f4".into(), max_file("p"));
+        assert_eq!(evicted, vec![("p".to_string(), "f1".to_string(), 1)]);
+        assert_eq!(a.ids_for("p"), vec!["t1", "f2", "f3", "f4"]);
+        assert!(a.large_bytes() <= MAX_TRACKED_LARGE_ACK_BYTES);
+    }
+
+    /// R29: filling the small budget never evicts a large entry.
+    #[test]
+    fn r29_small_eviction_never_touches_large_entries() {
+        let mut a = AckTracker::default();
+        a.track("f1".into(), max_file("p"));
+        let mut evicted = Vec::new();
+        for i in 0..1000 {
+            evicted.extend(a.track(format!("s{i}"), t("p", 10_000)));
+        }
+        assert!(!evicted.is_empty(), "the small budget overflowed");
+        assert!(evicted.iter().all(|(_, id, _)| id != "f1"));
+        assert!(a.ids_for("p").contains(&"f1".to_string()));
+        assert!(a.bytes() <= MAX_TRACKED_ACK_BYTES);
+    }
+
+    /// R29: the large budget is derived from the file limit.
+    #[test]
+    fn r29_large_budget_is_three_max_files() {
+        use crate::file_msg::{MAX_FILE_PLAINTEXT, RELAY_MAX_MESSAGE_BYTES};
+        assert_eq!(
+            MAX_TRACKED_LARGE_ACK_BYTES,
+            3 * (MAX_FILE_PLAINTEXT + RELAY_MAX_MESSAGE_BYTES)
+        );
+        assert_eq!(LARGE_ACK_PAYLOAD, 64 * 1024);
     }
 
     /// AK5: bounded by count and bytes; evictions are reported.

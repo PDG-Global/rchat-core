@@ -79,6 +79,15 @@ struct Args {
     /// Chat: success means the circuit never forms and nothing arrives.
     #[arg(long)]
     expect_refusal: bool,
+    /// Chat with --offline-secs: go offline as soon as the circuit forms,
+    /// before the peer's first packet (an initiator's session-init still
+    /// unanswered), instead of waiting for it.
+    #[arg(long)]
+    offline_before_reply: bool,
+    /// Test only (E27, never the app): every disappearing countdown is this
+    /// many seconds instead of the message's `expire_secs`.
+    #[arg(long)]
+    timer_override_secs: Option<f64>,
 }
 
 /// Wait before disconnecting so our last delivered receipts leave: the
@@ -103,13 +112,19 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<bool, String> {
-    let me = Peer::new(
+    let timer_override = match args.timer_override_secs {
+        Some(t) if t.is_finite() && t > 0.0 => Some(Duration::from_secs_f64(t)),
+        Some(_) => return Err("--timer-override-secs must be positive".into()),
+        None => None,
+    };
+    let me = Peer::with_timer_override(
         &args.name,
         &args.server,
         args.origin.as_deref(),
         &args.identity_seed,
         args.state_dir.clone(),
         args.device_key_seed.clone(),
+        timer_override,
     )?;
     if args.print_card {
         println!("{}", me.card.to_json());
@@ -188,6 +203,15 @@ fn chat(me: &Peer, cards: &[Card], args: &Args, timeout: Duration) -> Result<boo
         return Ok(false);
     }
     if args.offline_secs > 0 {
+        // Stay until the peer's first packet on the new session has come
+        // (its session notice leaves 0.5-3.25 s after the session forms):
+        // an initiator whose session-init is still unanswered keeps the
+        // identity circuit open on its reconnect, so the peer only re-pairs
+        // after the relay's unresumed-pair grace (up to ~3 min), past this
+        // client's wait (protocol v3 §C.3; `after_publish_ok`).
+        if !args.offline_before_reply {
+            std::thread::sleep(RECEIPT_DRAIN);
+        }
         me.client
             .disconnect_transport_only()
             .map_err(|e| e.to_string())?;
@@ -197,10 +221,15 @@ fn chat(me: &Peer, cards: &[Card], args: &Args, timeout: Duration) -> Result<boo
         // resume ask (Task 14 `after_publish_ok`). A second, resume-less ask
         // racing the relay's `CircuitExists` would make the relay tear the
         // pair down (spec §6.2 step 2). Wait for the resumed session instead.
+        let back = std::time::Instant::now();
         if !harness::wait_until(timeout, || me.client.has_session(peer.ik.clone())) {
             result("resumed", false);
             return Ok(false);
         }
+        // Until the pair has a live circuit with a session again
+        // (`has_session`), not until a message arrives: the messages queued
+        // for us may already have been decrypted from the offline queue.
+        result("live_session_secs", back.elapsed().as_secs());
     }
     let ids = send_n(me, peer, args.send)?;
     result("sent", ids.len());
@@ -282,7 +311,11 @@ fn accept(me: &Peer, cards: &[Card], args: &Args, timeout: Duration) -> Result<b
     });
     result("intro_received", 1);
     me.client
-        .pin_peer_key(req.identity_hex.clone(), req.agreement_hex.clone())
+        .pin_peer_key(
+            req.identity_hex.clone(),
+            req.agreement_hex.clone(),
+            Some(req.kem_hex.clone()),
+        )
         .map_err(|e| e.to_string())?;
     me.client
         .mark_message_seen(req.identity_hex.clone(), req.intro_message_id_hex.clone())
@@ -391,6 +424,38 @@ fn expect_none(me: &Peer, timeout: Duration) -> Result<bool, String> {
 /// - `expectacks <n> <secs>`: until n of our messages have the relay's ack;
 ///   an ack for an id we never sent (another spelling) fails
 /// - `nokeyevents`: no key event (held to the end)
+/// - `expectcircuits <n> <secs>`: until n `on_circuit_established` for the
+///   peer (more fails)
+/// - `stamp <label>`: prints `STAMP <label> <unix seconds>` (the script
+///   lines the delay proxy's frame log up with it)
+/// - `steady <500|1000|2000|off>`: steady traffic (§B), in the foreground
+/// - `sendlong <bytes> <label>`: a text of exactly that many UTF-8 bytes,
+///   starting with the label
+/// - `sendfile <bytes> <%-escaped name> [mime]`: a file of `file_bytes`
+/// - `sendmaxfile <0|1>`: a file whose plaintext is exactly
+///   `MAX_FILE_PLAINTEXT` (0, must be accepted) or one byte more (1, must be
+///   refused with `FileTooLarge` and send nothing)
+/// - `expectfiles <n> <secs>`: until n files received, every one with
+///   exactly the expected bytes (more fails)
+/// - `expectfilename <index> <%-escaped name>`: the index-th file received
+///   carries exactly this (cleaned) name
+/// - `settimer <secs>`: the disappearing timer (§I.2) for the peer
+/// - `expecttimer <secs> <by_me 0|1> <n> <wait>`: until n timer changes
+///   reported, the latest being (secs, by_me); n held
+/// - `expectexpire <secs>`: every text and file received so far carries
+///   this `expire_secs` (held)
+/// - `expectpurged <n> <secs>`: until n disappearing messages purged
+/// - `expectresumed <0|1>`: the current TLS connection did (1) or did not
+///   (0) resume from a ticket, and the relay accepted this connection's
+///   publish (its connection proof, bound to this connection's exporter)
+/// - with `--features e2e-hooks` only (test hooks in the core, §C):
+///   `clockoffset <±secs>` (the pair clock), `askttl <secs>` (blind ask
+///   timeout), `bumpcounter <n>` (pair counter desync), `replaceps`
+///   (pair-secret mismatch), `expectepoch <day> <counter>` (the stored
+///   pair epoch)
+/// - `expectrequests <n> <secs>`: until n message requests from the peer
+///   (more fails); `accept`: pin the latest one's keys (its knock's ML-KEM
+///   key included) and ask
 /// - `report`: `RESULT received=[..] receipts_delivered=N ... events=k:n,..`
 fn script(me: &Peer, cards: &[Card], steps: &str) -> Result<bool, String> {
     let peer = first(cards)?;
@@ -591,10 +656,162 @@ fn run_step(
             Ok(ok && clean)
         }
         "nokeyevents" => {
-            let count: Count = Box::new(|r| r.key_events.len());
+            // Only the warnings count: 2 mismatch, 3 bad signature. Code 5
+            // (an ML-KEM key learned from a contact's knock) is informational.
+            let count: Count = Box::new(|r| {
+                r.key_events
+                    .iter()
+                    .filter(|(_, code, _)| matches!(code, 2 | 3))
+                    .count()
+            });
             let ok = me.snapshot(|r| count(r)) == 0;
-            held.hold("key events".into(), 0, count);
+            held.hold("mismatch key events".into(), 0, count);
             Ok(ok)
+        }
+        "expectrequests" => {
+            let (n, t) = (num("count")? as usize, num("seconds")?);
+            let count: Count = Box::new(move |r| r.requests_from(&ik).len());
+            Ok(hold_count(me, held, "requests".into(), n, t, count))
+        }
+        // Accept the peer's request as the app does: pin the keys its knock
+        // carried (with its ML-KEM key, §A.5), then ask.
+        "accept" => {
+            let req = me
+                .snapshot(|r| r.requests_from(&peer.ik).into_iter().last())
+                .ok_or("accept: no request from the peer")?;
+            println!(
+                "REQUEST kem_hex_len={} intro={:?}",
+                req.kem_hex.len(),
+                req.intro_text
+            );
+            if req.kem_hex.len() != 2368 {
+                return Err(format!(
+                    "request carries a {}-hex ML-KEM key",
+                    req.kem_hex.len()
+                ));
+            }
+            me.client
+                .pin_peer_key(
+                    req.identity_hex.clone(),
+                    req.agreement_hex.clone(),
+                    Some(req.kem_hex),
+                )
+                .map_err(|e| e.to_string())?;
+            me.ask(peer).map(|_| true)
+        }
+        "expectcircuits" => {
+            let (n, t) = (num("count")? as usize, num("seconds")?);
+            let count: Count = Box::new(move |r| r.circuits_with(&ik));
+            Ok(hold_count(me, held, "circuits".into(), n, t, count))
+        }
+        "stamp" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs_f64();
+            println!("STAMP {arg} {now:.6}");
+            Ok(true)
+        }
+        "steady" => {
+            let (on, ms) = if arg == "off" {
+                (false, rchat_core::steady::STEADY_DEFAULT_SLOT_MS)
+            } else {
+                (true, num("slot ms")? as u32)
+            };
+            me.client
+                .set_steady_traffic(on, ms, true)
+                .map(|_| true)
+                .map_err(|e| e.to_string())
+        }
+        "sendlong" => {
+            let len = num("bytes")? as usize;
+            let label = args.next().ok_or("sendlong: <bytes> <label>")?;
+            if label.len() > len {
+                return Err("sendlong: label longer than the text".into());
+            }
+            let text = format!("{label}{}", "x".repeat(len - label.len()));
+            me.send(peer, &text).map(|_| true)
+        }
+        "sendfile" => {
+            let len = num("bytes")? as usize;
+            let name = harness::pct_decode(args.next().ok_or("sendfile: <bytes> <name> [mime]")?)?;
+            let mime = args.next().unwrap_or("application/octet-stream");
+            me.send_file(peer, &name, mime, len).map(|_| true)
+        }
+        "sendmaxfile" => {
+            use rchat_core::file_msg::{FILE_HEADER_LEN, MAX_FILE_PLAINTEXT};
+            let over = num("0|1")? as usize;
+            let (name, mime) = ("max.bin", "application/octet-stream");
+            let len = MAX_FILE_PLAINTEXT - FILE_HEADER_LEN - name.len() - mime.len() + over;
+            let outcome = me.send_file(peer, name, mime, len);
+            match (over, outcome) {
+                (0, r) => r.map(|_| true),
+                (_, Err(e)) if e.to_lowercase().contains("too large") => Ok(true),
+                (_, Err(e)) => Err(format!("refused, but not as too large: {e}")),
+                (_, Ok(id)) => Err(format!("a file over the limit was sent as {id}")),
+            }
+        }
+        "expectfiles" => {
+            let (n, t) = (num("count")? as usize, num("seconds")?);
+            let from = ik.clone();
+            let count: Count =
+                Box::new(move |r| r.files.iter().filter(|f| f.sender == from).count());
+            let ok = hold_count(me, held, "files".into(), n, t, count);
+            let bad: Count = Box::new(|r| r.files.iter().filter(|f| !f.content_ok).count());
+            let clean = me.snapshot(|r| bad(r)) == 0;
+            held.hold("files with wrong bytes".into(), 0, bad);
+            Ok(ok && clean)
+        }
+        "expectfilename" => {
+            let index = num("index")? as usize;
+            let want = harness::pct_decode(args.next().ok_or("expectfilename: <index> <name>")?)?;
+            let got = me.snapshot(|r| r.files.get(index).map(|f| f.name.clone()));
+            println!("FILENAME {index} {got:?}");
+            Ok(got.as_deref() == Some(want.as_str()))
+        }
+        "settimer" => {
+            let secs = num("seconds")? as u32;
+            let outcome = me
+                .client
+                .set_disappearing_timer(peer.ik.clone(), secs)
+                .map_err(|e| e.to_string())?;
+            println!("TIMER set {secs}: {outcome:?}");
+            Ok(true)
+        }
+        "expecttimer" => {
+            let secs = num("timer seconds")? as u32;
+            let by_me = num("by_me")? != 0.0;
+            let (n, t) = (num("count")? as usize, num("seconds")?);
+            let from = ik.clone();
+            let count: Count =
+                Box::new(move |r| r.timers.iter().filter(|x| x.peer == from).count());
+            let ok = hold_count(me, held, "timer changes".into(), n, t, count);
+            let latest = me.snapshot(|r| r.timers.iter().rev().find(|x| x.peer == ik).cloned());
+            Ok(ok && latest.is_some_and(|x| x.secs == secs && x.by_me == by_me))
+        }
+        "expectexpire" => {
+            let secs = num("seconds")? as u32;
+            let from = ik.clone();
+            let bad: Count = Box::new(move |r| r.expire_mismatches(&from, secs));
+            let ok = me.snapshot(|r| bad(r)) == 0;
+            held.hold(format!("received without expire_secs {secs}"), 0, bad);
+            Ok(ok)
+        }
+        "expectpurged" => {
+            let (n, t) = (num("count")? as usize, num("seconds")?);
+            let count: Count = Box::new(|r| r.purged.len());
+            Ok(hold_count(me, held, "purged".into(), n, t, count))
+        }
+        "expectresumed" => {
+            let want = num("0|1")? != 0.0;
+            let resumed = me.client.tls_session_resumed();
+            let proven = me.client.is_key_bundle_published();
+            let tickets = me.client.tls_ticket_count();
+            println!("TLS resumed={resumed} publish_accepted={proven} tickets={tickets}");
+            Ok(resumed == want && proven)
+        }
+        "clockoffset" | "askttl" | "bumpcounter" | "replaceps" | "expectepoch" => {
+            hook_step(me, peer, op, arg)
         }
         "report" => {
             report(me, peer);
@@ -602,6 +819,61 @@ fn run_step(
         }
         other => Err(format!("unknown step {other:?}")),
     }
+}
+
+/// The steps that need the core's test hooks (`--features e2e-hooks`).
+#[cfg(feature = "e2e-hooks")]
+fn hook_step(me: &Peer, peer: &Card, op: &str, arg: &str) -> Result<bool, String> {
+    let e = |e: rchat_core::RChatError| e.to_string();
+    let int = || {
+        arg.trim()
+            .parse::<i64>()
+            .map_err(|_| format!("{op}: bad number {arg:?}"))
+    };
+    match op {
+        "clockoffset" => me.client.test_set_pair_clock_offset(int()?).map_err(e)?,
+        "askttl" => {
+            let secs = arg
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|t| t.is_finite() && *t > 0.0);
+            let secs = secs.ok_or("askttl: <seconds>")?;
+            me.client
+                .test_set_blind_ask_ttl(Duration::from_secs_f64(secs))
+                .map_err(e)?
+        }
+        "bumpcounter" => {
+            let by = u32::try_from(int()?).map_err(|_| "bumpcounter: <n>")?;
+            me.client
+                .test_bump_pair_counter(peer.ik.clone(), by)
+                .map_err(e)?
+        }
+        "replaceps" => me
+            .client
+            .test_replace_pair_secret(peer.ik.clone())
+            .map_err(e)?,
+        "expectepoch" => {
+            let want: Vec<i64> = arg
+                .split_whitespace()
+                .map(|v| v.parse::<i64>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| "expectepoch: <day> <counter>")?;
+            let epoch = me.client.test_pair_epoch(peer.ik.clone());
+            println!("EPOCH {epoch:?}");
+            return Ok(want.len() == 2
+                && epoch.is_some_and(|(d, c)| i64::from(d) == want[0] && i64::from(c) == want[1]));
+        }
+        _ => return Err(format!("unknown hook step {op}")),
+    }
+    Ok(true)
+}
+
+#[cfg(not(feature = "e2e-hooks"))]
+fn hook_step(_: &Peer, _: &Card, op: &str, _: &str) -> Result<bool, String> {
+    Err(format!(
+        "{op}: this test client was built without --features e2e-hooks"
+    ))
 }
 
 /// Wait until `count` reaches `n`, then hold it to exactly `n` (more is a
@@ -626,8 +898,11 @@ fn report(me: &Peer, peer: &Card) {
             .join(",");
         let reasons: Vec<u8> = r.undelivered().iter().map(|(why, _)| *why).collect();
         format!(
-            "received={:?} sent={} receipts_delivered={} acked={} resent={} events={} undelivered_reasons={:?} key_events={} errors={:?}",
-            r.texts_from(&peer.ik),
+            "received={:?} files={:?} timers={:?} purged={} sent={} receipts_delivered={} acked={} resent={} events={} undelivered_reasons={:?} key_events={} errors={:?}",
+            r.texts_from(&peer.ik).iter().map(|t| if t.len() > 40 { format!("{}…({} B)", &t[..t.char_indices().nth(24).map_or(t.len(), |(i, _)| i)], t.len()) } else { t.clone() }).collect::<Vec<_>>(),
+            r.files.iter().map(|f| (f.name.clone(), f.len, f.expire_secs, f.content_ok)).collect::<Vec<_>>(),
+            r.timers.iter().map(|t| (t.secs, t.by_me)).collect::<Vec<_>>(),
+            r.purged.len(),
             r.sent_order.len(),
             r.delivered_sent(),
             r.acked_sent(),
@@ -679,6 +954,21 @@ mod tests {
         );
         assert!(Card::parse(&json.replace(r#""v":2"#, r#""v":3"#)).is_err());
         assert!(Card::parse(&json.replace(&"d".repeat(128), &"d".repeat(126))).is_err());
+
+        // R1 (ahead of card v3): the ML-KEM key travels as base64 of 1184 bytes.
+        use base64::Engine as _;
+        let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]);
+        let with_kem = Card {
+            kem: Some(b64(1184)),
+            ..c.clone()
+        };
+        assert_eq!(Card::parse(&with_kem.to_json()).unwrap(), with_kem);
+        let short = Card {
+            kem: Some(b64(1183)),
+            ..c.clone()
+        };
+        assert!(Card::parse(&short.to_json()).is_err(), "kem of 1183 bytes");
+        assert!(Card::parse(&with_kem.to_json().replace("BwcH", "!!!!")).is_err());
     }
 
     #[test]

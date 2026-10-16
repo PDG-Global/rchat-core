@@ -20,8 +20,15 @@ pub const FRAME_TYPE_SIGNALING: u8 = 0x01;
 pub const FRAME_TYPE_RELAY: u8 = 0x02;
 pub const FRAME_TYPE_CONTROL: u8 = 0x03;
 pub const FRAME_TYPE_KEEPALIVE: u8 = 0x04;
+/// Reserved for a future real-time media frame (protocol v3 §9a). No v3
+/// client sends it and the v3 relay refuses it like any unknown prefix.
+pub const FRAME_TYPE_RESERVED_MEDIA: u8 = 0x05;
 
 /// Unified frame that can be sent over a single WebSocket connection
+// `Control` is the large variant since `CircuitCreatedV3` carries both
+// asks' ephemeral signatures (ruling R7); frames are built, encoded and
+// dropped at once, so boxing it would only add an allocation per frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum UnifiedFrame {
     /// Signaling message (JSON)
@@ -141,6 +148,9 @@ impl UnifiedFrame {
                             Err(e) => Err(FrameError::InvalidJson(e.to_string())),
                         }
                     }
+                    // Reserved for future media (§9a): refused like any
+                    // unknown prefix; never decoded by a v3 relay.
+                    FRAME_TYPE_RESERVED_MEDIA => Err(FrameError::UnknownFrameType(frame_type)),
                     _ => {
                         tracing::debug!(
                             "UnifiedFrame::decode: Unknown frame type: 0x{:02x}",
@@ -299,12 +309,13 @@ pub enum ControlMessage {
         /// Circuit ID of the recipient
         circuit_id: CircuitId,
     },
-    /// 13 (s→c): both sides asked; here is your side of the new pair.
-    /// `role` 0 = initiator (earlier asker), 1 = responder (later asker).
-    /// `peer` is the other side's bundle exactly as it was verified at
-    /// publish. Both ask ephemeral keys are echoed so each side can check
-    /// its own against the ones it has outstanding.
-    CircuitCreatedV2 {
+    /// 13 (s→c, protocol v3; takes v2's `CircuitCreatedV2` slot): both
+    /// sides asked; here is your side of the new pair. `role` 0 = initiator
+    /// (earlier asker), 1 = responder (later asker). `peer` is the other
+    /// side's bundle exactly as it was verified at publish. Both asks'
+    /// X25519 ephemerals and ML-KEM-768 ephemeral public keys are forwarded
+    /// unmodified, so each side can check its own and run X3DH v3 (§A.3).
+    CircuitCreatedV3 {
         circuit_id: CircuitId,
         token: Vec<u8>,
         target_circuit_id: CircuitId,
@@ -312,28 +323,65 @@ pub enum ControlMessage {
         peer: PeerBundle,
         initiator_ephemeral_key: Vec<u8>,
         responder_ephemeral_key: Vec<u8>,
+        initiator_kem_ephemeral_pk: Vec<u8>,
+        responder_kem_ephemeral_pk: Vec<u8>,
+        /// Each asker's Ed25519 signature over its own ephemerals (ruling
+        /// R7, §A.3): `"rchat/ask-eph/v3\0" || asker_ik || ephemeral_key ||
+        /// kem_ephemeral_pk`, 64 bytes, forwarded unmodified.
+        initiator_ephemeral_sig: Vec<u8>,
+        responder_ephemeral_sig: Vec<u8>,
     },
     /// 14 (s→c): a sealed v2 payload delivered outside a live circuit: an
     /// offline ratchet message or a knock.
     QueuedMessage { payload: Vec<u8> },
-    /// 15 (c→s): ask for a circuit with `target_identity`. `knock` is a
-    /// sealed v2 knock of exactly 2048 bytes; `resume_circuit` names the
-    /// caller's own circuit of an existing pair after a transport reconnect.
+    /// 15 (c→s): ask for a circuit with `target_identity`. `kem_ephemeral_pk`
+    /// is the asker's ML-KEM-768 ephemeral (1184 bytes, protocol v3);
+    /// `knock` is a knock v3 of exactly `KNOCK_BYTES` (0x03); `resume_circuit`
+    /// names the caller's own circuit of an existing pair after a transport
+    /// reconnect.
     CircuitAsk {
         target_identity: Vec<u8>,
         ephemeral_key: Vec<u8>,
+        kem_ephemeral_pk: Vec<u8>,
+        /// The asker's identity signature over its ephemerals (R7), 64 bytes.
+        ephemeral_sig: Vec<u8>,
         knock: Vec<u8>,
         resume_circuit: Option<CircuitId>,
     },
+    /// 16 (c→s, protocol v3 §C.2): a blinded ask by rotating pair token, no
+    /// target identity and no knock; `pad` makes it exactly `ASK_WIRE_LEN`
+    /// bytes, like an identity ask. Only a proven connection may send one.
+    CircuitAskBlind {
+        pair_token: Vec<u8>,
+        ephemeral_key: Vec<u8>,
+        kem_ephemeral_pk: Vec<u8>,
+        /// As in `CircuitAsk` (R7), 64 bytes.
+        ephemeral_sig: Vec<u8>,
+        pad: Vec<u8>,
+    },
+    /// 17 (s→c, protocol v3 §C.2, ruling R22): the token of the blinded ask
+    /// whose X25519 ephemeral is `ephemeral_key` is already paired (spent).
+    /// Only the asker's own public value, sent to the asker only: the client
+    /// advances that pair's counter and no other.
+    PairTokenBusy { ephemeral_key: Vec<u8> },
+    /// 18 (s→c, protocol v3 §H.1, ruling R34a): the queue taken at this
+    /// connection's accepted publish (possibly empty) has been handed over.
+    /// Sent after every publish, so it says nothing about what was queued;
+    /// `pad` is always `QUEUE_HANDED_OVER_PAD_LEN` zero bytes.
+    QueueHandedOver { pad: Vec<u8> },
 }
 
-/// A peer's key bundle as carried in `CircuitCreatedV2`. bincode: four
-/// length-prefixed byte vectors in this order (identical to rchat-core's).
+/// `QueueHandedOver.pad` length: the frame has one fixed size.
+pub const QUEUE_HANDED_OVER_PAD_LEN: usize = 32;
+
+/// A peer's v3 key bundle as carried in `CircuitCreatedV3`. bincode: four
+/// length-prefixed byte vectors in this order (identical to rchat-core's);
+/// `kem_pk` is 1184 bytes, length-checked by the client on decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerBundle {
     pub identity_key: Vec<u8>,
     pub identity_agreement_key: Vec<u8>,
-    pub signed_pre_key: Vec<u8>,
+    pub kem_pk: Vec<u8>,
     pub bundle_signature: Vec<u8>,
 }
 
@@ -399,6 +447,12 @@ pub enum ControlErrorCode {
     TargetOffline,
     TargetNotFound,
     InternalError,
+    /// Protocol v3: a known message this relay does not serve yet. Kept
+    /// (unused by this relay) so later codes keep their numbers.
+    NotImplemented,
+    /// 10: reserved. A busy blinded token is answered with the typed
+    /// `ControlMessage::PairTokenBusy` (17, ruling R22), never this code.
+    PairTokenBusy,
 }
 
 /// Frame encoding/decoding errors
@@ -494,9 +548,9 @@ impl FrameBuilder {
         })
     }
 
-    /// `CircuitCreatedV2` for one side of a new pair.
+    /// `CircuitCreatedV3` for one side of a new pair.
     #[allow(clippy::too_many_arguments)]
-    pub fn circuit_created_v2(
+    pub fn circuit_created_v3(
         circuit_id: CircuitId,
         token: Vec<u8>,
         target_circuit_id: CircuitId,
@@ -504,8 +558,12 @@ impl FrameBuilder {
         peer: PeerBundle,
         initiator_ephemeral_key: Vec<u8>,
         responder_ephemeral_key: Vec<u8>,
+        initiator_kem_ephemeral_pk: Vec<u8>,
+        responder_kem_ephemeral_pk: Vec<u8>,
+        initiator_ephemeral_sig: Vec<u8>,
+        responder_ephemeral_sig: Vec<u8>,
     ) -> UnifiedFrame {
-        UnifiedFrame::Control(ControlMessage::CircuitCreatedV2 {
+        UnifiedFrame::Control(ControlMessage::CircuitCreatedV3 {
             circuit_id,
             token,
             target_circuit_id,
@@ -513,6 +571,10 @@ impl FrameBuilder {
             peer,
             initiator_ephemeral_key,
             responder_ephemeral_key,
+            initiator_kem_ephemeral_pk,
+            responder_kem_ephemeral_pk,
+            initiator_ephemeral_sig,
+            responder_ephemeral_sig,
         })
     }
 
@@ -521,16 +583,27 @@ impl FrameBuilder {
         UnifiedFrame::Control(ControlMessage::QueuedMessage { payload })
     }
 
+    /// `QueueHandedOver` (R34a): fixed size, no content.
+    pub fn queue_handed_over() -> UnifiedFrame {
+        UnifiedFrame::Control(ControlMessage::QueueHandedOver {
+            pad: vec![0; QUEUE_HANDED_OVER_PAD_LEN],
+        })
+    }
+
     /// `CircuitAsk` (client → relay; used by tests and tools).
     pub fn circuit_ask(
         target_identity: Vec<u8>,
         ephemeral_key: Vec<u8>,
+        kem_ephemeral_pk: Vec<u8>,
+        ephemeral_sig: Vec<u8>,
         knock: Vec<u8>,
         resume_circuit: Option<CircuitId>,
     ) -> UnifiedFrame {
         UnifiedFrame::Control(ControlMessage::CircuitAsk {
             target_identity,
             ephemeral_key,
+            kem_ephemeral_pk,
+            ephemeral_sig,
             knock,
             resume_circuit,
         })
@@ -751,15 +824,30 @@ mod tests {
         PeerBundle {
             identity_key: vec![0x11; 32],
             identity_agreement_key: vec![0x22; 32],
-            signed_pre_key: vec![0x33; 32],
+            kem_pk: vec![0x33; 1184],
             bundle_signature: vec![0x44; 64],
         }
     }
 
     #[test]
-    fn v2_variants_keep_their_bincode_indices() {
-        // Indices 0..=12 must not move; the new variants are appended.
-        let created = FrameBuilder::circuit_created_v2(
+    fn test_reserved_media_prefix_0x05_is_unknown() {
+        // Protocol v3 §9a: 0x05 is reserved for future media and refused.
+        assert_eq!(FRAME_TYPE_RESERVED_MEDIA, 0x05);
+        for payload in [vec![], vec![0u8; 64]] {
+            let mut bin = vec![FRAME_TYPE_RESERVED_MEDIA];
+            bin.extend_from_slice(&payload);
+            assert!(matches!(
+                UnifiedFrame::decode(&Message::Binary(bin)),
+                Err(FrameError::UnknownFrameType(0x05))
+            ));
+        }
+    }
+
+    #[test]
+    fn v3_variants_keep_their_bincode_indices() {
+        // Indices 0..=12, 14 and 15 do not move; CircuitCreatedV3 takes
+        // v2's slot 13 and CircuitAskBlind is appended as 16.
+        let created = FrameBuilder::circuit_created_v3(
             CircuitId([1; 16]),
             vec![7; 32],
             CircuitId([2; 16]),
@@ -767,10 +855,28 @@ mod tests {
             sample_peer(),
             vec![0x55; 32],
             vec![0x66; 32],
+            vec![0x57; 1184],
+            vec![0x67; 1184],
+            vec![0x5f; 64],
+            vec![0x6f; 64],
         );
         let queued = FrameBuilder::queued_message(vec![0x02, 9, 9]);
-        let ask = FrameBuilder::circuit_ask(vec![3; 32], vec![4; 32], vec![0x02; 2048], None);
-        for (frame, index) in [(created, 13u32), (queued, 14), (ask, 15)] {
+        let ask = FrameBuilder::circuit_ask(
+            vec![3; 32],
+            vec![4; 32],
+            vec![5; 1184],
+            vec![0x5e; 64],
+            vec![0x02; 4096],
+            None,
+        );
+        let blind = UnifiedFrame::Control(ControlMessage::CircuitAskBlind {
+            pair_token: vec![],
+            ephemeral_key: vec![],
+            kem_ephemeral_pk: vec![],
+            ephemeral_sig: vec![0x5e; 64],
+            pad: vec![],
+        });
+        for (frame, index) in [(created, 13u32), (queued, 14), (ask, 15), (blind, 16)] {
             let UnifiedFrame::Control(ctrl) = frame else {
                 panic!("control frame expected")
             };
@@ -779,9 +885,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_variants_round_trip() {
+    fn v3_variants_round_trip() {
         let frames = [
-            FrameBuilder::circuit_created_v2(
+            FrameBuilder::circuit_created_v3(
                 CircuitId([1; 16]),
                 vec![7; 32],
                 CircuitId([2; 16]),
@@ -789,15 +895,36 @@ mod tests {
                 sample_peer(),
                 vec![0x55; 32],
                 vec![0x66; 32],
+                vec![0x57; 1184],
+                vec![0x67; 1184],
+                vec![0x5f; 64],
+                vec![0x6f; 64],
             ),
             FrameBuilder::queued_message(vec![0x02; 200]),
-            FrameBuilder::circuit_ask(vec![3; 32], vec![4; 32], vec![0x02; 2048], None),
             FrameBuilder::circuit_ask(
                 vec![3; 32],
                 vec![4; 32],
-                vec![0x02; 2048],
+                vec![5; 1184],
+                vec![0x5e; 64],
+                vec![0x02; 4096],
+                None,
+            ),
+            FrameBuilder::circuit_ask(
+                vec![3; 32],
+                vec![4; 32],
+                vec![5; 1184],
+                vec![0x5e; 64],
+                vec![0x02; 4096],
                 Some(CircuitId([9; 16])),
             ),
+            UnifiedFrame::Control(ControlMessage::CircuitAskBlind {
+                pair_token: vec![0xB1; 32],
+                ephemeral_key: vec![0xB2; 32],
+                kem_ephemeral_pk: vec![0xB3; 1184],
+                ephemeral_sig: vec![0x5e; 64],
+                pad: vec![0; crate::validate::BLIND_PAD_LEN],
+            }),
+            FrameBuilder::error(ControlErrorCode::NotImplemented, "x"),
         ];
         for frame in frames {
             let decoded = UnifiedFrame::decode(&frame.encode()).unwrap();
@@ -847,7 +974,7 @@ mod tests {
             recipient_identity: String::new(),
             received_at: rand::random(),
         };
-        let created = || ControlMessage::CircuitCreatedV2 {
+        let created = || ControlMessage::CircuitCreatedV3 {
             circuit_id: CircuitId(r16()),
             token: r32(),
             target_circuit_id: CircuitId(r16()),
@@ -855,11 +982,15 @@ mod tests {
             peer: PeerBundle {
                 identity_key: r32(),
                 identity_agreement_key: r32(),
-                signed_pre_key: r32(),
+                kem_pk: (0..1184).map(|_| rand::random::<u8>()).collect(),
                 bundle_signature: (0..64).map(|_| rand::random::<u8>()).collect(),
             },
             initiator_ephemeral_key: r32(),
             responder_ephemeral_key: r32(),
+            initiator_kem_ephemeral_pk: (0..1184).map(|_| rand::random::<u8>()).collect(),
+            responder_kem_ephemeral_pk: (0..1184).map(|_| rand::random::<u8>()).collect(),
+            initiator_ephemeral_sig: vec![0x5f; 64],
+            responder_ephemeral_sig: vec![0x6f; 64],
         };
         use CircuitCloseReason::*;
         let closed_sizes: std::collections::BTreeSet<usize> =
@@ -897,7 +1028,9 @@ mod tests {
             ControlMessage::CircuitAsk {
                 target_identity: r(32),
                 ephemeral_key: r(32),
-                knock: r(2048),
+                kem_ephemeral_pk: r(1184),
+                ephemeral_sig: vec![0x5e; 64],
+                knock: r(crate::validate::KNOCK_BYTES),
                 resume_circuit: resume,
             }
             .encode()
@@ -911,6 +1044,20 @@ mod tests {
         assert_eq!(some.iter().next(), Some(&zero), "zero resume differs");
         // None encodes shorter: the client must always send Some.
         assert_ne!(ask(None), zero);
+        // v3 §C.2: a blinded ask is exactly as long as an identity ask.
+        assert_eq!(zero, crate::validate::ASK_WIRE_LEN);
+        let blind = |_: ()| {
+            ControlMessage::CircuitAskBlind {
+                pair_token: r(32),
+                ephemeral_key: r(32),
+                kem_ephemeral_pk: r(1184),
+                ephemeral_sig: vec![0x5e; 64],
+                pad: r(crate::validate::BLIND_PAD_LEN),
+            }
+            .encode()
+            .len()
+        };
+        assert_eq!(blind(()), zero, "blinded and identity asks differ in size");
 
         let queued = |n: usize| {
             ControlMessage::QueuedMessage { payload: r(n) }

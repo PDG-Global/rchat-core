@@ -1,0 +1,9 @@
+body.photos{background:#1c1f26}
+.mosaic{position:fixed;inset:0;display:grid;grid-template-columns:repeat(4,1fr);grid-auto-rows:1fr;opacity:.55}
+.mosaic i{display:block;background:var(--accent)}
+.mosaic i:nth-child(3n){background:#3b4252}
+.mosaic i:nth-child(4n+1){background:#d8dee9}
+.mosaic i:nth-child(5n){background:#88c0d0}
+.mosaic i:nth-child(7n){background:#b48ead}
+body.photos main{position:relative}
+body.photos .foot{color:#d8dee9}

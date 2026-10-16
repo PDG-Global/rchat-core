@@ -62,10 +62,12 @@ pub struct ServerConfig {
     #[serde(default = "default_identification_timeout")]
     pub identification_timeout_secs: u64,
 
-    /// Most pending `CircuitAsk`s (one-sided asks waiting for the other
-    /// identity to ask back, 540 s lifetime) in the whole server. When full,
-    /// an ask from a lighter source evicts the oldest ask of the heaviest
-    /// source (`max_pending_per_source`); otherwise it is refused.
+    /// Most pending `CircuitAsk`s and `CircuitAskBlind`s (one-sided asks
+    /// waiting for the other side to ask back, 540 s lifetime) in the whole
+    /// server, about 1.6 KB each. Blind asks may hold all but
+    /// `pending_identity_reserve_percent` of it. When full, an ask from a
+    /// lighter source evicts the oldest ask of the heaviest source
+    /// (`max_pending_per_source`); otherwise it is refused. Default 18,000.
     #[serde(default = "default_max_pending_circuit_targets")]
     pub max_pending_circuit_targets: usize,
 
@@ -97,6 +99,51 @@ pub struct ServerConfig {
     /// supplies the client's address.
     #[serde(default = "default_max_pending_per_source")]
     pub max_pending_per_source: usize,
+
+    /// Most distinct pair tokens one connection may hold pending
+    /// `CircuitAskBlind`s for within the 540 s window, counted apart from
+    /// identity asks (final review M1). A core asks blind for every contact
+    /// on every reconnect and holds about four asks per offline contact
+    /// (the current and previous 10-minute slot, each with its ±1 window
+    /// sibling); the relay sees only unrelated tokens, so it charges per
+    /// token. Unset: `DEFAULT_PENDING_BLIND_PER_CONNECTION` (1024, about
+    /// 256 offline contacts), capped at `max_pending_circuit_targets`.
+    #[serde(default)]
+    pub max_pending_blind_per_connection: Option<usize>,
+
+    /// Most pending `CircuitAskBlind`s all connections from one source may
+    /// hold at once, counted apart from identity asks (whose share stays
+    /// `max_pending_per_source`), so many users behind one carrier-grade NAT
+    /// address can hold blind asks for their contacts without crowding out
+    /// first-contact asks. Unset: `DEFAULT_PENDING_BLIND_PER_SOURCE` (4096),
+    /// capped at `max_pending_circuit_targets`. Same proxy caveat as
+    /// `max_pending_per_source`.
+    #[serde(default)]
+    pub max_pending_blind_per_source: Option<usize>,
+
+    /// New pair tokens one connection may ask blind for in a burst (final
+    /// re-review N-1 (a)): a per-connection token bucket, charged only for
+    /// a token the connection holds no ask for (a replay of a held token
+    /// is free), refilled at `blind_ask_refill_per_sec`. Over it the ask is
+    /// refused with `RateLimited`, which the core backs off from. The core
+    /// sends at most 32 asks at once and then 8 a second.
+    /// 1..=`MAX_BLIND_ASK_BURST`. Default 64.
+    #[serde(default = "default_blind_ask_burst")]
+    pub blind_ask_burst: u32,
+
+    /// Refill rate of the `blind_ask_burst` bucket, new tokens a second.
+    /// 1..=`MAX_BLIND_ASK_REFILL_PER_SEC`. Default 8.
+    #[serde(default = "default_blind_ask_refill_per_sec")]
+    pub blind_ask_refill_per_sec: u32,
+
+    /// Percent of `max_pending_circuit_targets` reserved for identity asks
+    /// (first contact and the identity fallback; final re-review N-1 (c)):
+    /// blind asks never hold more than the rest, so blind churn cannot lock
+    /// identity asks out, even without per-source accounting. Identity asks
+    /// may use the whole table. 0..=`MAX_PENDING_IDENTITY_RESERVE_PERCENT`.
+    /// Default 25.
+    #[serde(default = "default_pending_identity_reserve_percent")]
+    pub pending_identity_reserve_percent: u8,
 
     /// Most circuits (pair sides) the identities that asked from one source
     /// may hold at once, counted at creation and kept across reconnects.
@@ -151,6 +198,13 @@ pub struct ServerConfig {
     #[serde(default = "default_websocket_path")]
     pub websocket_path: String,
 
+    /// The port clients dial, when it differs from `bind_addr`'s (NAT, a
+    /// FreeBSD `rdr` rule, a jail). Used only by `--print-invite`; 443 is
+    /// left out of the invite. Unset: 443 behind `proxy_protocol`, else the
+    /// bind port. 1-65535.
+    #[serde(default)]
+    pub public_port: Option<u16>,
+
     /// Static certificate (`[server.tls]`). Mutually exclusive with `acme`.
     pub tls: Option<TlsConfig>,
 
@@ -204,15 +258,44 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub decoy: DecoyConfig,
+
+    /// Tests only: issue tickets with this ticketer instead of a fresh one,
+    /// so two relays can share ticket keys.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub test_ticketer: Option<std::sync::Arc<dyn rustls::server::ProducesTickets>>,
 }
 
-/// Static certificate. TLS 1.3 is mandatory and not configurable, so there
-/// are deliberately no version keys here; unknown keys are rejected.
+/// `[server.tls]`: the static certificate, and TLS settings that apply to
+/// every certificate source. TLS 1.3 is mandatory and not configurable, so
+/// there are deliberately no version keys here; unknown keys are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
+    /// Static certificate chain. Set together with `key_path`, or leave both
+    /// out when `[server.acme]` provides the certificate.
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    /// TLS 1.3 resumption tickets (spec §D.1), default on, for static and
+    /// ACME certificates alike. Ticket keys live only in memory and rotate
+    /// every 6 hours; there is never 0-RTT. Every connection, resumed or
+    /// not, still proves its identity over its own TLS exporter.
+    #[serde(default = "default_true")]
+    pub session_tickets: bool,
+}
+
+impl TlsConfig {
+    /// A static certificate with the default TLS settings.
+    #[cfg(test)]
+    pub fn static_cert(cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+        Self {
+            cert_path: Some(cert_path.into()),
+            key_path: Some(key_path.into()),
+            session_tickets: true,
+        }
+    }
 }
 
 /// Built-in ACME (Let's Encrypt) via TLS-ALPN-01 on the main listener.
@@ -334,6 +417,11 @@ pub struct DecoyConfig {
     /// Absolute path of a static site served to non-WebSocket requests.
     #[serde(default)]
     pub root: Option<PathBuf>,
+    /// Host name that seeds the built-in decoy page when `root` is unset
+    /// (and `--render-decoy` when it is run without `--host`). Default: the
+    /// first `[server.acme]` domain. Never shown on the page.
+    #[serde(default)]
+    pub host: Option<String>,
     /// Value of the `Server` response header.
     #[serde(default = "default_decoy_server")]
     pub server_header: String,
@@ -347,6 +435,7 @@ impl Default for DecoyConfig {
         Self {
             enabled: true,
             root: None,
+            host: None,
             server_header: default_decoy_server(),
             write_timeout_secs: default_decoy_write_timeout(),
         }
@@ -411,8 +500,10 @@ fn default_identification_timeout() -> u64 {
     15
 }
 
+/// About 18,000 × 1.6 KB ≈ 29 MB, the memory 10,000 asks took before each
+/// ask shared its connection's bundle (final re-review N-2).
 fn default_max_pending_circuit_targets() -> usize {
-    10_000
+    18_000
 }
 
 fn default_max_circuits_per_connection() -> usize {
@@ -429,6 +520,28 @@ fn default_max_pending_per_connection() -> usize {
 
 fn default_max_pending_per_source() -> usize {
     1_024
+}
+
+/// `max_pending_blind_per_connection` when unset (final review M1): about
+/// four held blind asks for each of 256 offline contacts.
+pub const DEFAULT_PENDING_BLIND_PER_CONNECTION: usize = 1_024;
+
+/// `max_pending_blind_per_source` when unset (final review M1): room for
+/// several such users behind one carrier-grade NAT address, while one
+/// source still cannot take more than about 23% of the default 18,000-ask
+/// table (and a full table evicts the heaviest source's oldest ask first).
+pub const DEFAULT_PENDING_BLIND_PER_SOURCE: usize = 4_096;
+
+fn default_blind_ask_burst() -> u32 {
+    64
+}
+
+fn default_blind_ask_refill_per_sec() -> u32 {
+    8
+}
+
+fn default_pending_identity_reserve_percent() -> u8 {
+    25
 }
 
 /// With `max_circuits_per_source` unset, one source may hold
@@ -517,13 +630,18 @@ fn default_tls_handshake_timeout() -> u64 {
 
 /// Longest knock lifetime: the clients' verification window (spec §5.3, L2).
 pub const MAX_KNOCK_TTL_SECS: u64 = 259_200;
+/// The longest offline-queue lifetime accepted (72 h, ruling R33 M-6): the
+/// client's disappearing-messages copy says relay copies expire within it.
+pub const MAX_QUEUE_TTL_SECS: u64 = 259_200;
 
 /// `[server.offline_queue]`: retention and (opt-in, encrypted) persistence
 /// of queued items (spec §5.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfflineQueueConfig {
-    /// Message lifetime in seconds; accepted range 3600..=604800. Default 72 h.
+    /// Message lifetime in seconds; accepted range 3600..=259200. Default
+    /// 72 h, which is also the maximum (ruling R33 M-6): the app promises
+    /// that copies waiting at the relay expire "at most 72 hours" (§I.2).
     #[serde(default = "default_queue_ttl_secs")]
     pub ttl_secs: u64,
     /// Global knock budget in bytes (separate from the message budget).
@@ -641,6 +759,9 @@ impl ServerConfig {
         if let Some(bind) = cli.bind {
             self.bind_addr = bind;
         }
+        if let Some(port) = cli.public_port {
+            self.public_port = Some(port);
+        }
         if cli.no_tls {
             self.disable_tls_for_dev(cli.insecure_public_plaintext);
         }
@@ -681,7 +802,15 @@ impl ServerConfig {
             }
             return Ok(TlsMode::Plaintext);
         }
-        match (&self.tls, self.acme.enabled) {
+        let static_cert = match self.tls.as_ref().map(|t| (&t.cert_path, &t.key_path)) {
+            None | Some((None, None)) => None,
+            Some((Some(cert), Some(key))) => Some((cert.clone(), key.clone())),
+            Some(_) => bail!(
+                "[server.tls] cert_path and key_path go together: set both for a static \
+                 certificate, or neither when [server.acme] provides the certificate"
+            ),
+        };
+        match (static_cert, self.acme.enabled) {
             (Some(_), true) => bail!(
                 "both [server.tls] (static certificate) and [server.acme] (automatic \
                  certificates) are configured. Keep exactly one; the server will not guess \
@@ -691,9 +820,9 @@ impl ServerConfig {
                 self.acme.validate()?;
                 Ok(TlsMode::Acme(self.acme.clone()))
             }
-            (Some(tls), false) => Ok(TlsMode::Static {
-                cert_path: tls.cert_path.clone(),
-                key_path: tls.key_path.clone(),
+            (Some((cert_path, key_path)), false) => Ok(TlsMode::Static {
+                cert_path,
+                key_path,
             }),
             (None, false) => bail!(
                 "no TLS configured. Add [server.acme] (automatic Let's Encrypt certificates) or \
@@ -703,11 +832,29 @@ impl ServerConfig {
         }
     }
 
+    /// Whether the relay issues TLS 1.3 resumption tickets (`[server.tls]
+    /// session_tickets`, default true; honoured with ACME too).
+    pub fn session_tickets(&self) -> bool {
+        self.tls.as_ref().map_or(true, |t| t.session_tickets)
+    }
+
     pub fn tls_handshake_timeout(&self) -> Duration {
         Duration::from_secs(self.tls_handshake_timeout_secs)
     }
 
     /// Non-fatal configuration notices to log at startup.
+    /// The host name that seeds this relay's decoy site: `[server.decoy]
+    /// host`, else the first ACME domain, else none.
+    pub fn decoy_host(&self) -> Option<String> {
+        let h = self
+            .decoy
+            .host
+            .as_deref()
+            .or_else(|| self.acme.domains.first().map(String::as_str))?;
+        let h = crate::decoy_render::normalize_host(h);
+        (!h.is_empty()).then_some(h)
+    }
+
     pub fn startup_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.circuit_ttl_secs.is_some() {
@@ -733,6 +880,39 @@ impl ServerConfig {
     pub fn circuits_per_source(&self) -> usize {
         self.max_circuits_per_source
             .unwrap_or((self.max_circuits / CIRCUIT_SOURCE_SHARES).max(2))
+    }
+
+    /// Distinct blind-ask tokens one connection may hold per window:
+    /// `max_pending_blind_per_connection`, or the default capped at the
+    /// relay-wide table.
+    pub fn pending_blind_per_connection(&self) -> usize {
+        self.max_pending_blind_per_connection
+            .unwrap_or(DEFAULT_PENDING_BLIND_PER_CONNECTION.min(self.max_pending_circuit_targets))
+    }
+
+    /// Pending blind asks one source may hold: `max_pending_blind_per_source`,
+    /// or the default capped at the relay-wide table.
+    pub fn pending_blind_per_source(&self) -> usize {
+        self.max_pending_blind_per_source
+            .unwrap_or(DEFAULT_PENDING_BLIND_PER_SOURCE.min(self.max_pending_circuit_targets))
+    }
+
+    /// Most blind asks the pending table may hold: `max_pending_circuit_targets`
+    /// less the identity reserve (`pending_identity_reserve_percent`), at
+    /// least one.
+    pub fn pending_blind_table_cap(&self) -> usize {
+        let reserve = self.max_pending_circuit_targets
+            * usize::from(self.pending_identity_reserve_percent)
+            / 100;
+        self.max_pending_circuit_targets
+            .saturating_sub(reserve)
+            .max(1)
+    }
+
+    /// The per-connection bucket for new blind-ask tokens: (burst, refill
+    /// per second).
+    pub fn blind_ask_rate(&self) -> (u32, u32) {
+        (self.blind_ask_burst, self.blind_ask_refill_per_sec)
     }
 
     /// Token-bucket burst size for inbound traffic: one maximal message must
@@ -784,6 +964,9 @@ impl ServerConfig {
                 self.max_connections
             );
         }
+        if self.public_port == Some(0) {
+            bail!("public_port must be between 1 and 65535");
+        }
         if self.websocket_path.contains(WEBSOCKET_PATH_PLACEHOLDER) {
             bail!(
                 "websocket_path still contains the template placeholder {:?}: set it to a long \
@@ -834,6 +1017,43 @@ impl ServerConfig {
             bail!(
                 "max_pending_per_source must be between 1 and max_pending_circuit_targets (got {})",
                 self.max_pending_per_source
+            );
+        }
+        for (name, value) in [
+            (
+                "max_pending_blind_per_connection",
+                self.max_pending_blind_per_connection,
+            ),
+            (
+                "max_pending_blind_per_source",
+                self.max_pending_blind_per_source,
+            ),
+        ] {
+            if let Some(n) = value {
+                if n == 0 || n > self.max_pending_circuit_targets {
+                    bail!("{name} must be between 1 and max_pending_circuit_targets (got {n})");
+                }
+            }
+        }
+        if !(1..=MAX_BLIND_ASK_BURST).contains(&self.blind_ask_burst) {
+            bail!(
+                "blind_ask_burst must be between 1 and {} (got {})",
+                MAX_BLIND_ASK_BURST,
+                self.blind_ask_burst
+            );
+        }
+        if !(1..=MAX_BLIND_ASK_REFILL_PER_SEC).contains(&self.blind_ask_refill_per_sec) {
+            bail!(
+                "blind_ask_refill_per_sec must be between 1 and {} (got {})",
+                MAX_BLIND_ASK_REFILL_PER_SEC,
+                self.blind_ask_refill_per_sec
+            );
+        }
+        if self.pending_identity_reserve_percent > MAX_PENDING_IDENTITY_RESERVE_PERCENT {
+            bail!(
+                "pending_identity_reserve_percent must be between 0 and {} (got {})",
+                MAX_PENDING_IDENTITY_RESERVE_PERCENT,
+                self.pending_identity_reserve_percent
             );
         }
         if let Some(n) = self.max_circuits_per_source {
@@ -966,9 +1186,9 @@ impl ServerConfig {
                 self.bind_addr
             );
         }
-        if !(3_600..=604_800).contains(&self.offline_queue.ttl_secs) {
+        if !(3_600..=MAX_QUEUE_TTL_SECS).contains(&self.offline_queue.ttl_secs) {
             bail!(
-                "offline_queue.ttl_secs must be between 3600 and 604800 (got {})",
+                "offline_queue.ttl_secs must be between 3600 and 259200 (72 h; got {})",
                 self.offline_queue.ttl_secs
             );
         }
@@ -1003,6 +1223,10 @@ const MAX_PENDING_CIRCUIT_TARGETS: usize = 1_000_000;
 const MAX_IDENTIFICATION_TIMEOUT_SECS: u64 = 300;
 const MAX_CIRCUITS_PER_CONNECTION: usize = 65_536;
 const MAX_CIRCUITS: usize = 10_000_000;
+const MAX_BLIND_ASK_BURST: u32 = 65_536;
+const MAX_BLIND_ASK_REFILL_PER_SEC: u32 = 10_000;
+/// Blind asks keep at least a tenth of the table.
+const MAX_PENDING_IDENTITY_RESERVE_PERCENT: u8 = 90;
 /// Marker in the shipped template's `websocket_path`; the server refuses to
 /// start until it is replaced.
 pub const WEBSOCKET_PATH_PLACEHOLDER: &str = "CHANGE-ME";
@@ -1023,6 +1247,11 @@ impl Default for ServerConfig {
             max_circuits: default_max_circuits(),
             max_pending_per_connection: default_max_pending_per_connection(),
             max_pending_per_source: default_max_pending_per_source(),
+            max_pending_blind_per_connection: None,
+            max_pending_blind_per_source: None,
+            blind_ask_burst: default_blind_ask_burst(),
+            blind_ask_refill_per_sec: default_blind_ask_refill_per_sec(),
+            pending_identity_reserve_percent: default_pending_identity_reserve_percent(),
             max_circuits_per_source: None,
             proxy_protocol: false,
             trusted_proxy: None,
@@ -1032,6 +1261,7 @@ impl Default for ServerConfig {
             outbound_budget_bytes: default_outbound_budget_bytes(),
             buffer_budget_bytes: default_buffer_budget_bytes(),
             websocket_path: default_websocket_path(),
+            public_port: None,
             tls: None,
             acme: AcmeConfig::default(),
             tls_handshake_timeout_secs: default_tls_handshake_timeout(),
@@ -1045,6 +1275,8 @@ impl Default for ServerConfig {
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             decoy: DecoyConfig::default(),
+            #[cfg(test)]
+            test_ticketer: None,
         }
     }
 }
@@ -1075,15 +1307,19 @@ mod tests {
             bind_addr = "127.0.0.1:1"
             [server.offline_queue]
             ttl_secs = 7200
-            knock_budget_bytes = 4096
+            knock_budget_bytes = 5120
             "#,
         )
         .unwrap();
         assert_eq!(c.offline_queue.ttl_secs, 7200);
-        assert_eq!(c.offline_queue.knock_budget_bytes, 4096);
+        assert_eq!(c.offline_queue.knock_budget_bytes, 5120);
         assert!(!c.offline_queue.persist);
         assert_eq!(c.knock_ttl_secs(), 7200);
         c.validate().unwrap();
+        // One knock v3 is 5120 bytes (§A.5): a budget below it is refused.
+        let mut small = c;
+        small.offline_queue.knock_budget_bytes = 4096;
+        assert!(small.validate().is_err());
     }
 
     #[test]
@@ -1094,8 +1330,9 @@ mod tests {
         assert!(!c.offline_queue.persist);
         assert!(!c.offline_queue.allow_persistent_key);
         let mut long = ServerConfig::default();
-        long.offline_queue.ttl_secs = 604_800;
+        long.offline_queue.ttl_secs = MAX_QUEUE_TTL_SECS;
         assert_eq!(long.knock_ttl_secs(), MAX_KNOCK_TTL_SECS);
+        assert!(long.validate().is_ok(), "72 h is the largest accepted");
     }
 
     #[test]
@@ -1108,7 +1345,8 @@ mod tests {
 
     #[test]
     fn offline_queue_ttl_outside_range_is_rejected() {
-        for ttl in [3_599u64, 604_801] {
+        // R33 M-6: above 72 h is refused (the app's honest limit).
+        for ttl in [3_599u64, 259_201, 604_800, u64::MAX] {
             let mut c = ServerConfig::default();
             c.offline_queue.ttl_secs = ttl;
             assert!(err_text(c.validate()).contains("offline_queue.ttl_secs"));
@@ -1326,10 +1564,7 @@ mod tests {
     #[test]
     fn explicit_no_tls_gives_plaintext_and_clears_tls_and_acme() {
         let mut cfg = ServerConfig::from_toml_str(ACME_OK).unwrap();
-        cfg.tls = Some(TlsConfig {
-            cert_path: "/a".into(),
-            key_path: "/b".into(),
-        });
+        cfg.tls = Some(TlsConfig::static_cert("/a", "/b"));
         cfg.bind_addr = "127.0.0.1:18443".parse().unwrap();
         cfg.disable_tls_for_dev(false);
         assert_eq!(cfg.tls_mode().unwrap(), TlsMode::Plaintext);
@@ -1427,6 +1662,16 @@ mod tests {
     }
 
     #[test]
+    fn decoy_host_is_the_explicit_key_then_the_first_acme_domain() {
+        let cfg = ServerConfig::from_toml_str(ACME_OK).unwrap();
+        assert_eq!(cfg.decoy_host().as_deref(), Some("chat.example.com"));
+        let with_host = format!("{ACME_OK}\n[server.decoy]\nhost = \"Other.Example.org.\"\n");
+        let cfg = ServerConfig::from_toml_str(&with_host).unwrap();
+        assert_eq!(cfg.decoy_host().as_deref(), Some("other.example.org"));
+        assert_eq!(ServerConfig::default().decoy_host(), None);
+    }
+
+    #[test]
     fn valid_acme_config_is_accepted() {
         let cfg = ServerConfig::from_toml_str(ACME_OK).unwrap();
         match cfg.tls_mode().unwrap() {
@@ -1516,6 +1761,42 @@ mod tests {
     }
 
     #[test]
+    fn session_tickets_default_on_and_can_be_turned_off() {
+        // §D.1: on by default, with a static certificate...
+        let toml = "[server.tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\n";
+        assert!(ServerConfig::from_toml_str(toml).unwrap().session_tickets());
+        let off = format!("{toml}session_tickets = false\n");
+        let cfg = ServerConfig::from_toml_str(&off).unwrap();
+        assert!(!cfg.session_tickets());
+        assert!(matches!(cfg.tls_mode().unwrap(), TlsMode::Static { .. }));
+        // ...and with ACME, where [server.tls] may carry only the setting.
+        assert!(ServerConfig::from_toml_str(ACME_OK)
+            .unwrap()
+            .session_tickets());
+        let acme_off = format!("{ACME_OK}\n[server.tls]\nsession_tickets = false\n");
+        let cfg = ServerConfig::from_toml_str(&acme_off).unwrap();
+        assert!(!cfg.session_tickets());
+        assert!(matches!(cfg.tls_mode().unwrap(), TlsMode::Acme(_)));
+    }
+
+    #[test]
+    fn tls_block_without_a_certificate_needs_acme() {
+        let cfg = ServerConfig::from_toml_str("[server.tls]\nsession_tickets = true\n").unwrap();
+        assert!(err_text(cfg.tls_mode()).contains("no TLS configured"));
+        for half in ["cert_path = \"/c\"", "key_path = \"/k\""] {
+            let cfg = ServerConfig::from_toml_str(&format!("[server.tls]\n{half}\n")).unwrap();
+            let e = err_text(cfg.tls_mode());
+            assert!(e.contains("go together"), "{e}");
+        }
+    }
+
+    #[test]
+    fn unknown_tls_key_is_still_rejected() {
+        let toml = "[server.tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\nsession_ticket = true\n";
+        assert!(ServerConfig::from_toml_str(toml).is_err());
+    }
+
+    #[test]
     fn dead_tls_version_keys_are_rejected_with_explanation() {
         for key in ["min_version = \"1.3\"", "tls13_only = true"] {
             let toml = format!("[server.tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\n{key}\n");
@@ -1544,6 +1825,8 @@ mod tests {
             cfg.tls_mode().is_ok(),
             "template must be a valid TLS config"
         );
+        assert!(cfg.session_tickets(), "template keeps tickets on (§D.1)");
+        assert!(template.contains("session_tickets = true"));
     }
 
     // ---- S3 resource-limit tests ----
@@ -1551,6 +1834,35 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         ServerConfig::default().validate().unwrap();
+    }
+
+    /// Final re-review N-1: the new-blind-tag bucket and the identity
+    /// reserve parse under [server] with their defaults, and the reserve
+    /// leaves blind asks the rest of the table.
+    #[test]
+    fn blind_ask_bucket_and_identity_reserve_parse_with_defaults() {
+        let d = ServerConfig::default();
+        assert_eq!(d.blind_ask_rate(), (64, 8));
+        assert_eq!(d.pending_identity_reserve_percent, 25);
+        assert_eq!(
+            d.pending_blind_table_cap(),
+            d.max_pending_circuit_targets - d.max_pending_circuit_targets / 4
+        );
+        let c = ServerConfig::from_toml_str(
+            "[server]\nblind_ask_burst = 128\nblind_ask_refill_per_sec = 16\n\
+             pending_identity_reserve_percent = 50\nmax_pending_circuit_targets = 1000\n",
+        )
+        .unwrap();
+        assert_eq!(c.blind_ask_rate(), (128, 16));
+        assert_eq!(c.pending_blind_table_cap(), 500);
+        let none = ServerConfig {
+            pending_identity_reserve_percent: 0,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            none.pending_blind_table_cap(),
+            none.max_pending_circuit_targets
+        );
     }
 
     #[test]
@@ -1565,6 +1877,18 @@ mod tests {
         cfg.validate().unwrap();
     }
 
+    /// Round 1 I-2: `public_port` parses under [server], 0 is refused, and
+    /// a misspelling is still an unknown key.
+    #[test]
+    fn public_port_parses_and_is_checked() {
+        let c = ServerConfig::from_toml_str("[server]\npublic_port = 443\n").unwrap();
+        assert_eq!(c.public_port, Some(443));
+        let c = ServerConfig::from_toml_str("[server]\npublic_port = 0\n").unwrap();
+        assert!(err_text(c.validate()).contains("public_port"));
+        assert!(ServerConfig::from_toml_str("[server]\npublic_port = 70000\n").is_err());
+        assert!(ServerConfig::from_toml_str("[server]\npublic_prot = 443\n").is_err());
+    }
+
     #[test]
     fn unknown_keys_are_rejected_in_every_table() {
         for toml in [
@@ -1575,6 +1899,7 @@ mod tests {
             "[metrics]\nenabeld = true\n",
             "[server.decoy]\nrandomization_strength = 1\n",
             "[server.decoy]\nroot_dir = \"/x\"\n",
+            "[server.decoy]\nhostname = \"x\"\n",
             "[redis]\nurl = \"redis://x\"\n",
         ] {
             assert!(
@@ -1767,6 +2092,15 @@ mod tests {
             |c| c.max_pending_per_connection = 0,
             |c| c.max_pending_per_connection = c.max_pending_circuit_targets + 1,
             |c| c.max_pending_circuit_targets = 2_000_000,
+            |c| c.max_pending_blind_per_connection = Some(0),
+            |c| c.max_pending_blind_per_connection = Some(c.max_pending_circuit_targets + 1),
+            |c| c.max_pending_blind_per_source = Some(0),
+            |c| c.max_pending_blind_per_source = Some(c.max_pending_circuit_targets + 1),
+            |c| c.blind_ask_burst = 0,
+            |c| c.blind_ask_burst = 65_537,
+            |c| c.blind_ask_refill_per_sec = 0,
+            |c| c.blind_ask_refill_per_sec = 10_001,
+            |c| c.pending_identity_reserve_percent = 91,
             |c| c.max_connections_per_ipv6_48 = c.max_connections + 1,
             |c| c.identification_timeout_secs = 0,
             |c| c.identification_timeout_secs = 301,

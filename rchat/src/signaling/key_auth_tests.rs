@@ -182,19 +182,38 @@ async fn a3_publish_before_hello_is_refused() {
     assert!(mapped_client(&state, &id).is_none());
 }
 
-/// A3: a hello that does not offer version 2 is refused and closed.
+/// A3 (protocol v3 hard cutover): a hello that does not offer version 3 —
+/// v1, a v2 client, or v1 and v2 together — is refused and closed.
 #[tokio::test]
-async fn a3_hello_without_version_2_is_refused() {
+async fn a3_hello_without_version_3_is_refused() {
     let (addr, _state) = start(test_config()).await;
-    let mut ws = connect(addr).await;
-    ws.send(hello_message(vec![1])).await.unwrap();
-    let frames = frames_until_closed(&mut ws, WAIT).await;
-    assert_eq!(
-        signaling_error_code(&frames).as_deref(),
-        Some("VersionMismatch")
-    );
-    let text = format!("{frames:?}");
-    assert!(text.contains("client too old; update rChat"));
+    for offered in [vec![1], vec![2], vec![1, 2], vec![]] {
+        let mut ws = connect(addr).await;
+        ws.send(hello_message(offered.clone())).await.unwrap();
+        let frames = frames_until_closed(&mut ws, WAIT).await;
+        assert_eq!(
+            signaling_error_code(&frames).as_deref(),
+            Some("VersionMismatch"),
+            "offered {offered:?}"
+        );
+        let text = format!("{frames:?}");
+        assert!(text.contains("client too old; update rChat"));
+    }
+}
+
+/// Protocol v3: a hello offering 3 (alone or beside 2) selects 3.
+#[tokio::test]
+async fn v3_hello_selects_version_3() {
+    let (addr, _state) = start(test_config()).await;
+    for offered in [vec![3], vec![2, 3]] {
+        let mut ws = connect(addr).await;
+        ws.send(hello_message(offered)).await.unwrap();
+        let reply = next_signaling(&mut ws, MSG_TYPE_HELLO_RESPONSE, WAIT)
+            .await
+            .expect("hello_response");
+        let p: HelloResponsePayload = reply.payload.deserialize_data().expect("payload");
+        assert_eq!(p.selected_version, 3);
+    }
 }
 
 // ---- A7 --------------------------------------------------------------------
@@ -312,7 +331,7 @@ async fn a9_refused_switch_keeps_the_proven_identity_and_stops_the_connection() 
     let x = TestIdentity::random();
     let y = TestIdentity::random();
     let (mut conn, mut rx) = bare_connection(BINDING);
-    conn.protocol_version = 2;
+    conn.protocol_version = crate::protocol::PROTOCOL_VERSION;
     conn.auth_nonce = Some(NONCE);
     conn.proven_identity = Some(x.bytes);
     conn.identity_key = Some(x.hex.clone());
@@ -478,47 +497,105 @@ fn k1_relay_reproduces_the_core_golden_vectors() {
         hex::encode(bb.identity_key),
         "2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d"
     );
+    {
+        use sha2::Digest;
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&ba.kem_pk[..])),
+            "035e068e5fe519242d2dced290348ab4e18cebe119ee9f64142034198b439ad1",
+            "identity A's ML-KEM key, derived from its seed"
+        );
+    }
     assert_eq!(
         hex::encode(ba.bundle_signature),
-        "757d468b446b196d23b8bf1a1519df6c59460c127185f1c9cda4d0694eaeffc5801f480abe88e57d255de0a94e3af05bcce8490185423cbdce8f11e722c20202"
+        "4436fcdb8cac259b44b1cbe9c8e9af47284d4488d0880469c0ebb741d6c1db2c87c1cf920bffdb1f1973884156ae997d2065a218cecccaa8560492191b008e02"
     );
     let ct = keyauth::conn_transcript(&golden::NONCE, &golden::BINDING, &ba).unwrap();
     assert_eq!(
         hex::encode(ct),
-        "72636861742f636f6e6e2d617574682f7631004e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e424242424242424242424242424242424242424242424242424242424242424203a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254757d468b446b196d23b8bf1a1519df6c59460c127185f1c9cda4d0694eaeffc5801f480abe88e57d255de0a94e3af05bcce8490185423cbdce8f11e722c20202"
+        "72636861742f636f6e6e2d617574682f7633004e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e424242424242424242424242424242424242424242424242424242424242424203a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd1662544436fcdb8cac259b44b1cbe9c8e9af47284d4488d0880469c0ebb741d6c1db2c87c1cf920bffdb1f1973884156ae997d2065a218cecccaa8560492191b008e02"
     );
     let cs = keyauth::sign_conn(&a, &golden::NONCE, &golden::BINDING, &ba).unwrap();
     assert_eq!(
         hex::encode(cs),
-        "5706c4c3096a4fa75addb47103cfbe9b0ed489bf3216f6f85ee3d3d0d541e81e52b0e7c122b634e2461f7ee4e4a9a43e2061f6bcce4f9b3a6e4d7c4d02f2d20d"
+        "3105f9d9d20a76d7324da8e1910f8d39395194f777eec8372a6e51876820bddafb00e12ae9ac9e7c5b58b15cfc5ad8205b0ae58538f864a5fad869caff24d000"
     );
     let env = x25519_dalek::StaticSecret::from(golden::ENV_EPH_SECRET);
     let env_pub = x25519_dalek::PublicKey::from(&env).to_bytes();
-    let keys = keyauth::knock_keys(
+    // Knock v3 (§A.5) with the fixed ML-KEM secret 0x4b..: the core's K1
+    // vectors, checked independently.
+    let keys = keyauth::knock_keys_v3(
         a.agreement_secret(),
         &bb.identity_agreement_key,
         &env_pub,
+        &[0x4b; 32],
         &ba.identity_key,
         &bb.identity_key,
+        keyauth::KnockRole::Sender,
     )
     .unwrap();
     assert_eq!(
         hex::encode(keys.k_mac),
-        "4a649bbf8ffdaac549ee4df04f3c16a67b520ce45a8f0f7b552b25f34b0ff63b"
+        "b67618c730d15f55b63736334f962c981b3cb5419e15e71e0153b57d8e6d817f"
     );
     assert_eq!(
         hex::encode(keys.k_intro),
-        "026a515c2fd7cdab458c6b36f12e264b9b39d469242a6d5a757d9768f4e4bbd9"
+        "31dab6442ff3383b315c4e41f154556f82bdd163de8dea5d2d2d397e1c254e56"
     );
     let mac = keyauth::knock_mac(&keys.k_mac, &bb.identity_key, &ba, golden::ISSUED_HOUR).unwrap();
     assert_eq!(
         hex::encode(mac),
-        "d1062fec33ae743591f1158f3b85f8c3b980dd906b33c8820754db8e0d0614fc"
+        "4e5a8fa637222d55f7c8696fc6a03cf5d11066d4f85aecbf065b10c1ab9d7b63"
     );
     assert_eq!(
         hex::encode(keyauth::dev_origin_binding("ws://127.0.0.1:8443").unwrap()),
         "dc0d2d9890cc672819a084e35d4f242202c9bb548e2f76d0fa3222b9a9475725"
     );
+}
+
+// ---- Bundle v3 (§A.2) ----------------------------------------------------------
+
+/// A v3 publish whose `kem_pk` decodes to exactly 1184 bytes is accepted;
+/// one of 1183 or 1185 bytes (otherwise well formed) is refused and maps
+/// nothing.
+#[tokio::test]
+async fn v3_publish_kem_pk_must_be_exactly_1184_bytes() {
+    use base64::Engine as _;
+    let (addr, state) = start(test_config()).await;
+    let id = TestIdentity::random();
+    let kb = key_bundle_of(&id);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&kb.kem_pk)
+            .unwrap()
+            .len(),
+        1184
+    );
+    let mut ws = connect(addr).await;
+    let nonce = hello(&mut ws).await;
+    assert!(matches!(
+        send_publish(&mut ws, &id, &nonce, &dev_binding()).await,
+        PublishReply::Ok(_)
+    ));
+    assert!(mapped_client(&state, &id).is_some());
+
+    for len in [1183usize, 1185] {
+        let other = TestIdentity::random();
+        let mut kem = id.bundle.kem_pk.to_vec();
+        kem.resize(len, 0);
+        let kb = KeyBundle {
+            kem_pk: base64::engine::general_purpose::STANDARD.encode(&kem),
+            ..key_bundle_of(&other)
+        };
+        let mut ws = connect(addr).await;
+        let nonce = hello(&mut ws).await;
+        let proof = keyauth::sign_conn(&other.keys, &nonce, &dev_binding(), &other.bundle).unwrap();
+        ws.send(raw_publish(kb, &proof)).await.unwrap();
+        assert!(
+            !matches!(publish_reply(&mut ws).await, PublishReply::Ok(_)),
+            "kem_pk of {len} bytes accepted"
+        );
+        assert!(mapped_client(&state, &other).is_none(), "{len}: mapped");
+    }
 }
 
 // ---- RF1 (mapping part) --------------------------------------------------------
@@ -559,7 +636,7 @@ async fn hello_payload<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Hel
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    ws.send(hello_message(vec![2])).await.expect("send hello");
+    ws.send(hello_message(vec![3])).await.expect("send hello");
     let reply = next_signaling(ws, MSG_TYPE_HELLO_RESPONSE, WAIT)
         .await
         .expect("hello_response");
@@ -658,7 +735,7 @@ async fn r9_a_live_knock_racing_the_publish_follows_the_response() {
     let state = RelayState::new(Arc::new(test_config()));
     let x = TestIdentity::random();
     let (mut conn, mut rx) = bare_connection(BINDING);
-    conn.protocol_version = 2;
+    conn.protocol_version = crate::protocol::PROTOCOL_VERSION;
     conn.auth_nonce = Some(NONCE);
     let client = conn.client_id;
     state.connections.insert(client, conn);
@@ -685,7 +762,18 @@ async fn r9_a_live_knock_racing_the_publish_follows_the_response() {
     while let Ok((m, _permit)) = rx.try_recv() {
         queued.push(UnifiedFrame::decode(&m).expect("relay frame"));
     }
-    assert_eq!(queued.len(), 2, "the response and the knock: {queued:?}");
+    assert_eq!(
+        queued.len(),
+        3,
+        "the response, the knock and the marker: {queued:?}"
+    );
+    assert!(
+        matches!(
+            &queued[2],
+            UnifiedFrame::Control(ControlMessage::QueueHandedOver { .. })
+        ),
+        "the queue-handed-over marker comes after the queue (R34a)"
+    );
     assert!(
         matches!(&queued[0], UnifiedFrame::Signaling(s)
             if s.msg_type == MSG_TYPE_PUBLISH_KEY_BUNDLE_RESPONSE),
@@ -695,4 +783,72 @@ async fn r9_a_live_knock_racing_the_publish_follows_the_response() {
         &queued[1],
         UnifiedFrame::Control(ControlMessage::QueuedMessage { .. })
     ));
+}
+
+/// Every non-keepalive frame (decoded, raw) up to and including the marker.
+async fn frames_through_marker(ws: &mut Ws) -> Vec<(UnifiedFrame, Vec<u8>)> {
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(WAIT, ws.next()).await {
+            Ok(Some(Ok(m))) => {
+                let frame = UnifiedFrame::decode(&m).expect("frame");
+                if matches!(frame, UnifiedFrame::Keepalive(_)) {
+                    continue;
+                }
+                let done = test_support::is_marker(&frame);
+                seen.push((frame, m.into_data().to_vec()));
+                if done {
+                    return seen;
+                }
+            }
+            other => panic!("no marker: {other:?}"),
+        }
+    }
+}
+
+/// R34a: every accepted publish ends with the queue-handed-over marker,
+/// right after the queue: also when the queue is empty, and with the same
+/// bytes either way (one fixed size, nothing in it).
+#[tokio::test]
+async fn every_publish_gets_the_same_queue_handed_over_marker() {
+    let (addr, state) = start(test_config()).await;
+    // Empty queue.
+    let empty = TestIdentity::random();
+    let mut ws = connect(addr).await;
+    let nonce = hello(&mut ws).await;
+    ws.send(publish_message(&empty, &nonce, &dev_binding()))
+        .await
+        .unwrap();
+    let seen = frames_through_marker(&mut ws).await;
+    assert_eq!(seen.len(), 2, "the response, then the marker: {seen:?}");
+    let empty_marker = seen.last().unwrap().1.clone();
+    // A queue of two.
+    let busy = TestIdentity::random();
+    queue_test_message(&state, &busy, b"ONE".to_vec());
+    queue_test_message(&state, &busy, b"TWO".to_vec());
+    let mut ws = connect(addr).await;
+    let nonce = hello(&mut ws).await;
+    ws.send(publish_message(&busy, &nonce, &dev_binding()))
+        .await
+        .unwrap();
+    let seen = frames_through_marker(&mut ws).await;
+    let queued = seen
+        .iter()
+        .filter(|(f, _)| {
+            matches!(
+                f,
+                UnifiedFrame::Control(ControlMessage::QueuedMessage { .. })
+            )
+        })
+        .count();
+    assert_eq!(queued, 2, "both queued records came before the marker");
+    assert_eq!(
+        seen.last().unwrap().1,
+        empty_marker,
+        "the same bytes either way"
+    );
+    assert_eq!(
+        empty_marker.len(),
+        1 + 4 + 8 + crate::protocol::unified::QUEUE_HANDED_OVER_PAD_LEN
+    );
 }

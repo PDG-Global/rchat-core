@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in - {{BRAND}}</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body class="code">
+<header class="topbar"><div class="brand">{{LOGO_SVG}}<h1>{{BRAND}}</h1></div><nav><a href="#">Explore</a><a href="#">Help</a><a href="#">Register</a></nav></header>
+<main class="center">
+<div class="card">
+<h2>Sign in to {{BRAND}}</h2>
+<p class="muted">{{TAGLINE}}</p>
+<form id="login-form" onsubmit="return false">
+<div class="field"><label for="username">Username or email address</label><input type="text" id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></div>
+<div class="field"><label for="password">Password</label><input type="password" id="password" name="password" autocomplete="current-password" required></div>
+<button type="submit" id="login-btn" class="btn">Sign in</button>
+<div id="login-error" class="error" role="alert"></div>
+</form>
+<div class="row"><a href="#">Forgot password?</a><a href="#">Register a new account</a></div>
+</div>
+<p class="foot">{{FOOTER}} &middot; {{VERSION}}</p>
+</main>
+<script>
+{{LOGIN_JS}}
+</script>
+</body>
+</html>

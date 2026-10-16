@@ -232,7 +232,7 @@ async fn anonymous_connection_is_closed_after_identification_timeout() {
     // A hello alone no longer identifies a connection.
     let mut hello_only = ws_connect(addr).await.unwrap();
     hello_only
-        .send(test_support::hello_message(vec![2]))
+        .send(test_support::hello_message(vec![3]))
         .await
         .unwrap();
 
@@ -319,7 +319,7 @@ mod auth_budget_tests {
         let (addr, _state) = start(test_config()).await;
         let mut ws = connect(addr).await;
         for _ in 0..10 {
-            ws.send(hello_message(vec![2])).await.unwrap();
+            ws.send(hello_message(vec![3])).await.unwrap();
         }
         // The relay closes the connection (panics if it stays open). The
         // last frames can be lost to the TCP reset of closing with unread

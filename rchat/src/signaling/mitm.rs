@@ -3,10 +3,12 @@
 //! Compiled only with `--features test-mitm`. `main` refuses to start such a
 //! build unless `RCHAT_MITM_I_UNDERSTAND=1` and the bind is loopback. Mode
 //! from `RCHAT_MITM`:
-//! * `ak`     — substitute the peer's agreement key and signed pre-key in
-//!   every `CircuitCreatedV2` (signature left as is → bad signature);
-//! * `ek`     — substitute both echoed ephemeral keys (echo checks fail);
-//! * `replay` — record the first `CircuitCreatedV2` per recipient identity,
+//! * `ak`     — substitute the peer's agreement key in every
+//!   `CircuitCreatedV3` (signature left as is → bad signature);
+//! * `ek`     — substitute both echoed X25519 ephemeral keys (echo checks
+//!   fail). No mode touches the ML-KEM ephemerals: they are forwarded
+//!   unchanged (a KEM tamper is caught by the client's X3DH v3, Task 4);
+//! * `replay` — record the first `CircuitCreatedV3` per recipient identity,
 //!   replay it once when that identity publishes again on a new connection,
 //!   and withhold every later genuine frame for it.
 //!
@@ -54,9 +56,8 @@ pub(crate) fn mode() -> Option<MitmMode> {
 
 pub(crate) fn rewrite_ak(msg: &mut ControlMessage, ak: [u8; 32]) -> bool {
     match msg {
-        ControlMessage::CircuitCreatedV2 { peer, .. } => {
+        ControlMessage::CircuitCreatedV3 { peer, .. } => {
             peer.identity_agreement_key = ak.to_vec();
-            peer.signed_pre_key = ak.to_vec();
             true
         }
         _ => false,
@@ -65,7 +66,7 @@ pub(crate) fn rewrite_ak(msg: &mut ControlMessage, ak: [u8; 32]) -> bool {
 
 pub(crate) fn rewrite_eks(msg: &mut ControlMessage, ek_i: [u8; 32], ek_r: [u8; 32]) -> bool {
     match msg {
-        ControlMessage::CircuitCreatedV2 {
+        ControlMessage::CircuitCreatedV3 {
             initiator_ephemeral_key,
             responder_ephemeral_key,
             ..
@@ -112,7 +113,7 @@ fn recipient_identity(to: ClientId, state: &RelayState) -> Option<[u8; 32]> {
     state.connections.get(&to).and_then(|c| c.proven_identity)
 }
 
-/// Tamper with an outgoing `CircuitCreatedV2`. Returns false to drop it.
+/// Tamper with an outgoing `CircuitCreatedV3`. Returns false to drop it.
 pub(crate) fn mitm_rewrite(to: ClientId, msg: &mut ControlMessage, state: &RelayState) -> bool {
     match mode() {
         None => true,
@@ -138,7 +139,7 @@ pub(crate) fn mitm_rewrite(to: ClientId, msg: &mut ControlMessage, state: &Relay
 /// The E5 script's positive evidence that a tampered frame went out (Task
 /// 25 minor). Fixed wording, nothing about the frame.
 fn note_rewrite() {
-    tracing::warn!("TEST-MITM: rewrote a CircuitCreatedV2");
+    tracing::warn!("TEST-MITM: rewrote a CircuitCreatedV3");
 }
 
 /// After a successful publish: in `replay` mode, resend the recorded frame.
@@ -165,7 +166,7 @@ mod tests {
     fn frame() -> ControlMessage {
         let id = IdentityKeyPair::from_seed(&golden::seed_a()).unwrap();
         let b = sign_bundle(&id).unwrap();
-        ControlMessage::CircuitCreatedV2 {
+        ControlMessage::CircuitCreatedV3 {
             circuit_id: CircuitId([1; 16]),
             token: vec![7; 32],
             target_circuit_id: CircuitId([2; 16]),
@@ -173,24 +174,42 @@ mod tests {
             peer: PeerBundle {
                 identity_key: b.identity_key.to_vec(),
                 identity_agreement_key: b.identity_agreement_key.to_vec(),
-                signed_pre_key: b.signed_pre_key.to_vec(),
+                kem_pk: b.kem_pk.to_vec(),
                 bundle_signature: b.bundle_signature.to_vec(),
             },
             initiator_ephemeral_key: vec![0x11; 32],
             responder_ephemeral_key: vec![0x22; 32],
+            initiator_kem_ephemeral_pk: vec![0x13; 1184],
+            responder_kem_ephemeral_pk: vec![0x24; 1184],
+            initiator_ephemeral_sig: vec![0x5f; 64],
+            responder_ephemeral_sig: vec![0x6f; 64],
+        }
+    }
+
+    fn kem_ephemerals(msg: &ControlMessage) -> (Vec<u8>, Vec<u8>) {
+        match msg {
+            ControlMessage::CircuitCreatedV3 {
+                initiator_kem_ephemeral_pk,
+                responder_kem_ephemeral_pk,
+                ..
+            } => (
+                initiator_kem_ephemeral_pk.clone(),
+                responder_kem_ephemeral_pk.clone(),
+            ),
+            _ => panic!("not CircuitCreatedV3"),
         }
     }
 
     fn bundle_of(msg: &ControlMessage) -> SignedBundle {
         match msg {
-            ControlMessage::CircuitCreatedV2 { peer, .. } => SignedBundle::from_slices(
+            ControlMessage::CircuitCreatedV3 { peer, .. } => SignedBundle::from_wire(
                 &peer.identity_key,
                 &peer.identity_agreement_key,
-                &peer.signed_pre_key,
+                &peer.kem_pk,
                 &peer.bundle_signature,
             )
             .unwrap(),
-            _ => panic!("not CircuitCreatedV2"),
+            _ => panic!("not CircuitCreatedV3"),
         }
     }
 
@@ -212,7 +231,6 @@ mod tests {
         assert!(rewrite_ak(&mut msg, RELAY_AK));
         let b = bundle_of(&msg);
         assert_eq!(b.identity_agreement_key, RELAY_AK);
-        assert_eq!(b.signed_pre_key, RELAY_AK);
         assert!(verify_bundle(&b).is_err());
     }
 
@@ -223,7 +241,7 @@ mod tests {
         let mut msg = frame();
         assert!(rewrite_eks(&mut msg, RELAY_EK_I, RELAY_EK_R));
         match msg {
-            ControlMessage::CircuitCreatedV2 {
+            ControlMessage::CircuitCreatedV3 {
                 initiator_ephemeral_key,
                 responder_ephemeral_key,
                 ..
@@ -233,6 +251,20 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// v3 §A.3: the harness's rewrites leave both ML-KEM ephemerals exactly
+    /// as the relay forwarded them (a KEM tamper is the client's to catch,
+    /// Task 4).
+    #[test]
+    fn mitm_rewrites_forward_kem_ephemerals_unchanged() {
+        let genuine = kem_ephemerals(&frame());
+        let mut ak = frame();
+        assert!(rewrite_ak(&mut ak, RELAY_AK));
+        assert_eq!(kem_ephemerals(&ak), genuine);
+        let mut ek = frame();
+        assert!(rewrite_eks(&mut ek, RELAY_EK_I, RELAY_EK_R));
+        assert_eq!(kem_ephemerals(&ek), genuine);
     }
 
     #[test]
@@ -257,7 +289,7 @@ mod tests {
             "later genuine frames pass before a replay"
         );
         let replayed = book.on_publish(id).expect("recorded frame is replayed");
-        assert!(matches!(replayed, ControlMessage::CircuitCreatedV2 { .. }));
+        assert!(matches!(replayed, ControlMessage::CircuitCreatedV3 { .. }));
         assert!(book.on_publish(id).is_none(), "replayed once");
         assert!(
             !book.on_frame(id, &frame()),

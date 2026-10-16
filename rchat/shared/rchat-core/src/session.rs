@@ -78,6 +78,52 @@ pub struct ChatSession {
     /// `device_key::session_binding` of this session's X3DH secret, set at
     /// install and persisted: what a notice signature is bound to (D45).
     pub session_binding: [u8; 32],
+    /// A session we initiated (role 0) whose session-init (§A.4) the peer
+    /// has not yet answered: the first message sealed under the session
+    /// travels as the init, and the init is re-sent byte for byte on each
+    /// new transport until the peer's first reply (or `ASK_TTL`). Cleared
+    /// by the first message decrypted from the peer under this session.
+    /// Persisted.
+    pub init_out: Option<Box<InitOut>>,
+    /// The pair secret PS (§C.1), derived from SK at install on either
+    /// role and wiped on drop. Never logged; this struct has no `Debug`.
+    /// `None` only for a placeholder session with no ratchet. Persisted.
+    pub pair_secret: Option<zeroize::Zeroizing<[u8; 32]>>,
+    /// The pair epoch (§C.1): `(utc day at install, 0)` for a session from
+    /// an identity ask; carried over (already advanced at the match) for a
+    /// session from a blind match. Persisted.
+    pub pair_epoch: crate::pairing::PairEpoch,
+    /// This session came from a blind match (§C.2): its circuit is never
+    /// resumed by id, and the peer is known to hold PS. Persisted.
+    pub blinded: bool,
+    /// Unix time of the first blind ask left unmatched since this session
+    /// was installed (R20, §C.4): the identity fallback is due once it is
+    /// `IDENTITY_FALLBACK_AFTER_SECS` old. A new session starts with none.
+    /// Persisted.
+    pub blind_since_unix: Option<u64>,
+    /// Unix time of the last identity fallback ask to the peer (R20: at
+    /// most one per `IDENTITY_FALLBACK_INTERVAL_SECS`), carried from session
+    /// to session. Persisted.
+    pub last_identity_fallback_unix: Option<u64>,
+}
+
+/// The initiator's session-init for one session (protocol v3 §A.4). Holds
+/// no secret: `ct` went on the wire, and `confirm` is a MAC over it.
+#[derive(Clone)]
+pub struct InitOut {
+    pub ct: Box<[u8; crate::kem::KEM_CT_LEN]>,
+    pub confirm: [u8; 32],
+    /// The sealed init once it was built: re-sent as these bytes.
+    pub sent: Option<SentInit>,
+}
+
+/// A session-init as first sealed.
+#[derive(Clone)]
+pub struct SentInit {
+    pub id: [u8; 16],
+    pub payload: Vec<u8>,
+    /// Transport epoch it was last sent on: it is re-sent on a later one.
+    pub epoch: u64,
 }
 
 /// A message waiting to be sent
@@ -87,6 +133,13 @@ pub struct PendingMessage {
     pub content: Vec<u8>,
     pub msg_type: MessageType,
     pub timestamp_ms: u64,
+}
+
+/// The queued plaintext is wiped when the message goes (R30 M-3).
+impl Drop for PendingMessage {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.content);
+    }
 }
 
 /// Session establishment state
@@ -131,7 +184,27 @@ impl ChatSession {
             created_at_unix: crate::unix_now_secs(),
             reported_lost: std::collections::HashMap::new(),
             session_binding: [0; 32],
+            init_out: None,
+            pair_secret: None,
+            pair_epoch: crate::pairing::PairEpoch { day: 0, counter: 0 },
+            blinded: false,
+            blind_since_unix: None,
+            last_identity_fallback_unix: None,
         }
+    }
+
+    /// A one-way tag of the pair secret: equal for sessions of one PS
+    /// lineage (an identity install and the blind re-pairs since). A
+    /// message sealed under an earlier session of the same lineage may be
+    /// re-sealed under this one (R19): only the holder of that PS can have
+    /// matched the blind asks in between. Never logged.
+    pub fn pair_lineage(&self) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let ps = self.pair_secret.as_ref()?;
+        let mut h = Sha256::new();
+        h.update(b"rchat/pair-lineage/v3\0");
+        h.update(&ps[..]);
+        Some(h.finalize().into())
     }
 
     pub fn set_identities(&mut self, our_ik: [u8; 32], peer_ik: [u8; 32]) {

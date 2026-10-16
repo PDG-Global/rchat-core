@@ -14,6 +14,7 @@ use crate::protocol::signaling::{
 };
 use crate::protocol::unified::{PeerBundle, UnifiedFrame};
 use crate::protocol::ErrorCode;
+use base64::Engine as _;
 use rchat_core::keyauth::{self, SignedBundle};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -41,28 +42,24 @@ pub(super) fn verify_publish(
     conn: &UnifiedConnection,
     payload: &PublishKeyBundlePayload,
 ) -> Result<VerifiedPublish, PublishRejection> {
-    if conn.protocol_version != 2 {
+    if conn.protocol_version != crate::protocol::PROTOCOL_VERSION {
         return Err(PublishRejection::NoChallenge);
     }
     let nonce = conn.auth_nonce.ok_or(PublishRejection::NoChallenge)?;
     let kb = &payload.key_bundle;
     let decode = |s: &str| hex::decode(s).map_err(|_| PublishRejection::BadBundle);
-    let bundle = SignedBundle::from_slices(
+    let kem_pk = crate::validate::decode_kem_pk(&kb.kem_pk).ok_or(PublishRejection::BadBundle)?;
+    let bundle = SignedBundle::from_wire(
         &decode(&kb.identity_key)?,
         &decode(&kb.identity_agreement_key)?,
-        &decode(&kb.signed_pre_key)?,
-        &decode(&kb.signed_pre_key_signature)?,
+        &kem_pk,
+        &decode(&kb.bundle_signature)?,
     )
     .map_err(|_| PublishRejection::BadBundle)?;
     if let Some(proven) = conn.proven_identity {
         if proven != bundle.identity_key {
             return Err(PublishRejection::IdentitySwitch);
         }
-    }
-    // v2: the signed pre-key IS the identity agreement key (spec §4.1, F7).
-    // A bundle that names a different SPK is refused even if validly signed.
-    if bundle.signed_pre_key != bundle.identity_agreement_key {
-        return Err(PublishRejection::BadBundle);
     }
     // Order matters: the bundle signature is checked before the connection
     // proof, which is only meaningful over a verified bundle.
@@ -94,8 +91,8 @@ pub(super) fn key_bundle_hex(b: &SignedBundle) -> KeyBundle {
     KeyBundle {
         identity_key: hex::encode(b.identity_key),
         identity_agreement_key: hex::encode(b.identity_agreement_key),
-        signed_pre_key: hex::encode(b.signed_pre_key),
-        signed_pre_key_signature: hex::encode(b.bundle_signature),
+        kem_pk: base64::engine::general_purpose::STANDARD.encode(&b.kem_pk[..]),
+        bundle_signature: hex::encode(b.bundle_signature),
         one_time_pre_keys: Vec::new(),
     }
 }
@@ -161,7 +158,7 @@ pub(super) fn peer_bundle(b: &SignedBundle) -> PeerBundle {
     PeerBundle {
         identity_key: b.identity_key.to_vec(),
         identity_agreement_key: b.identity_agreement_key.to_vec(),
-        signed_pre_key: b.signed_pre_key.to_vec(),
+        kem_pk: b.kem_pk.to_vec(),
         bundle_signature: b.bundle_signature.to_vec(),
     }
 }
@@ -172,11 +169,12 @@ pub(super) fn proven_bundle(conn: &UnifiedConnection) -> Option<SignedBundle> {
     let identity = conn.proven_identity?;
     let kb = conn.key_bundle.as_ref()?;
     let d = |s: &str| hex::decode(s).ok();
-    let bundle = SignedBundle::from_slices(
+    let kem_pk = crate::validate::decode_kem_pk(&kb.kem_pk)?;
+    let bundle = SignedBundle::from_wire(
         &d(&kb.identity_key)?,
         &d(&kb.identity_agreement_key)?,
-        &d(&kb.signed_pre_key)?,
-        &d(&kb.signed_pre_key_signature)?,
+        &kem_pk,
+        &d(&kb.bundle_signature)?,
     )
     .ok()?;
     (bundle.identity_key == identity).then_some(bundle)
@@ -200,7 +198,7 @@ mod tests {
 
     fn challenged() -> UnifiedConnection {
         let (mut conn, _rx) = bare_connection(BINDING);
-        conn.protocol_version = 2;
+        conn.protocol_version = crate::protocol::PROTOCOL_VERSION;
         conn.auth_nonce = Some(NONCE);
         conn
     }
@@ -255,24 +253,28 @@ mod tests {
     }
 
     #[test]
-    fn a_validly_signed_bundle_with_a_distinct_signed_pre_key_is_refused() {
+    fn a_validly_signed_bundle_with_a_malformed_kem_pk_is_refused() {
         use ed25519_dalek::{Signer, SigningKey};
         let id = TestIdentity::from_seed(1);
-        let other_spk = TestIdentity::from_seed(2).bundle.identity_agreement_key;
+        // Right size, but every coefficient is >= q (FIPS 203 modulus check).
+        let bad_kem = Box::new([0xFFu8; 1184]);
         let t = keyauth::bundle_transcript(
             &id.bundle.identity_key,
             &id.bundle.identity_agreement_key,
-            &other_spk,
-        )
-        .unwrap();
+            &bad_kem,
+        );
         let seed = id.keys.seed_bytes();
         let signer = SigningKey::from_bytes(&seed[..32].try_into().unwrap());
         let bundle = SignedBundle {
-            signed_pre_key: other_spk,
+            kem_pk: bad_kem,
             bundle_signature: signer.sign(&t).to_bytes(),
             ..id.bundle.clone()
         };
-        keyauth::verify_bundle(&bundle).expect("the signature itself is valid");
+        assert_eq!(
+            keyauth::verify_bundle(&bundle),
+            Err(keyauth::KeyAuthError::WeakKey),
+            "validly signed, refused for the KEM key"
+        );
         let sig = keyauth::sign_conn(&id.keys, &NONCE, &BINDING, &bundle).unwrap();
         let p = PublishKeyBundlePayload {
             key_bundle: key_bundle_hex(&bundle),

@@ -628,6 +628,7 @@ fn evict(inner: &mut Inner, seq: u64, queues: &DashMap<IdTag, MessageQueue>) {
 mod tests {
     use super::*;
     use crate::signaling::{MessageQueue, StoredMessage};
+    use crate::validate::KNOCK_BYTES;
 
     fn tag(i: u32) -> IdTag {
         let mut b = [0u8; 32];
@@ -639,9 +640,10 @@ mod tests {
         b[..4].copy_from_slice(&i.to_be_bytes());
         PairTag(b)
     }
+    /// A knock-v3-shaped payload (the store never opens it).
     fn knock(fill: u8) -> Vec<u8> {
-        let mut k = vec![fill; 2048];
-        k[0] = 0x02;
+        let mut k = vec![fill; KNOCK_BYTES];
+        k[0] = crate::validate::KNOCK_VERSION;
         k
     }
     fn knocks_for(q: &DashMap<IdTag, MessageQueue>, r: IdTag) -> Vec<StoredMessage> {
@@ -652,6 +654,37 @@ mod tests {
 
     fn src(n: u8) -> Option<SourceKey> {
         Some(SourceKey([n; 32]))
+    }
+
+    /// Knock v3 budget arithmetic (§A.5, 5120-byte knocks): the default
+    /// 16 MiB store holds 3276 knocks, a source's share (1/16) is 204, and
+    /// the share never drops below one knock on a tiny budget.
+    #[test]
+    fn knock_v3_budget_arithmetic() {
+        assert_eq!(KNOCK_BYTES, 5120);
+        let store = KnockStore::new(16 << 20);
+        let queues = DashMap::new();
+        let mut i = 0u32;
+        // 17 sources x 204 = 3468 offered: each source is capped at its
+        // share, and the store at its budget.
+        for s in 1..=17u8 {
+            for _ in 0..204 {
+                i += 1;
+                store.enqueue(tag(i), Some(pair(i)), knock(s), 1, &queues, src(s));
+            }
+        }
+        assert_eq!((16usize << 20) / KNOCK_BYTES, 3276);
+        assert_eq!((16usize << 20) / KNOCK_SOURCE_SHARES / KNOCK_BYTES, 204);
+        assert!(store.used() <= 16 << 20);
+        assert_eq!(store.used() % KNOCK_BYTES, 0, "whole knocks only");
+        assert_eq!(store.used() / KNOCK_BYTES, 3276, "full to the budget");
+        let tiny = KnockStore::new(KNOCK_BYTES);
+        tiny.enqueue(tag(1), Some(pair(1)), knock(1), 1, &queues, src(1));
+        assert_eq!(
+            tiny.used(),
+            KNOCK_BYTES,
+            "one knock fits the minimum budget"
+        );
     }
 
     /// R-2: one source cannot flush the store - beyond its share it evicts
@@ -673,18 +706,18 @@ mod tests {
             );
         }
         assert_eq!(knocks_for(&queues, victim).len(), 1, "victim's knock kept");
-        assert!(store.used() <= (16 << 20) / KNOCK_SOURCE_SHARES + 2048);
+        assert!(store.used() <= (16 << 20) / KNOCK_SOURCE_SHARES + KNOCK_BYTES);
     }
 
     /// R-2: with the store full from many sources, the heaviest source pays,
     /// not the oldest knock relay-wide.
     #[test]
     fn a_full_store_evicts_from_the_heaviest_source() {
-        // 32 knocks fit; each source's share is 32 * 2048 / 16 = 2 knocks.
+        // 32 knocks fit; each source's share is 32 * KNOCK_BYTES / 16 = 2 knocks.
         // 20 sources x 2 + the victim's 1 = 41: nine evictions, each from a
         // source still holding two, never the victim's lone knock (which a
         // relay-wide oldest-first eviction would take first).
-        let store = KnockStore::new(32 * 2048);
+        let store = KnockStore::new(32 * KNOCK_BYTES);
         let queues = DashMap::new();
         let victim = tag(1);
         store.enqueue(victim, Some(pair(1)), knock(0xaa), 1, &queues, src(1));
@@ -703,7 +736,7 @@ mod tests {
             }
         }
         assert_eq!(knocks_for(&queues, victim).len(), 1, "lightest source kept");
-        assert_eq!(store.used(), 32 * 2048);
+        assert_eq!(store.used(), 32 * KNOCK_BYTES);
     }
 
     /// R-2: a flood aimed at one recipient evicts the flooder's own knocks
@@ -781,7 +814,7 @@ mod tests {
     }
     #[test]
     fn q7_full_global_budget_evicts_the_oldest_knock_relay_wide() {
-        let store = KnockStore::new(3 * 2048);
+        let store = KnockStore::new(3 * KNOCK_BYTES);
         let queues: DashMap<IdTag, MessageQueue> = DashMap::new();
         // A recipient with an ordinary queued message: never touched.
         queues.insert(
@@ -814,7 +847,7 @@ mod tests {
         for i in 2..=4 {
             assert_eq!(knocks_for(&queues, tag(i)).len(), 1);
         }
-        assert_eq!(store.used(), 3 * 2048);
+        assert_eq!(store.used(), 3 * KNOCK_BYTES);
         let msgs = queues.get(&tag(99)).unwrap();
         assert_eq!(msgs.pending.len(), 1, "message queue unaffected");
         assert_eq!(msgs.bytes, 300);
@@ -856,7 +889,7 @@ mod tests {
         assert_eq!(left[0].payload, knock(0xbb));
         assert_eq!(left[0].enqueued_at_unix_secs, 20, "takes a new enqueued_at");
         assert_eq!(store.index_len(), 1);
-        assert_eq!(store.used(), 2048);
+        assert_eq!(store.used(), KNOCK_BYTES);
     }
 
     #[test]
@@ -918,7 +951,7 @@ mod tests {
             "age == ttl kept (strict)"
         );
         assert_eq!(store.index_len(), 1);
-        assert_eq!(store.used(), 2048);
+        assert_eq!(store.used(), KNOCK_BYTES);
     }
 
     #[test]
@@ -962,7 +995,7 @@ mod tests {
 
     #[test]
     fn restored_knocks_count_toward_budget_and_cap_without_an_index() {
-        let store = KnockStore::new(2 * 2048);
+        let store = KnockStore::new(2 * KNOCK_BYTES);
         let queues = DashMap::new();
         let mut restored = vec![StoredMessage {
             payload: knock(1),
@@ -978,7 +1011,7 @@ mod tests {
                 bytes: 0,
             },
         );
-        assert_eq!(store.used(), 2048);
+        assert_eq!(store.used(), KNOCK_BYTES);
         assert_eq!(store.index_len(), 0, "pair tags are never persisted");
         // L-1: restored knocks have their own bucket. Two new knocks from
         // one (unattributed) bucket: the second makes room from its own
@@ -998,7 +1031,7 @@ mod tests {
     /// picked by map order.
     #[test]
     fn a_full_store_of_one_knock_sources_takes_new_knocks_oldest_first() {
-        let store = KnockStore::new(4 * 2048); // share: one knock per source
+        let store = KnockStore::new(4 * KNOCK_BYTES); // share: one knock per source
         let queues = DashMap::new();
         let src = |n: u8| Some(SourceKey([n; 32]));
         for i in [3u8, 1, 0, 2] {
@@ -1025,24 +1058,27 @@ mod tests {
         assert_eq!(left, vec![0, 1, 2, 9], "the first-stored knock went");
     }
 
-    /// N-5: 8,192 single-knock sources (a full 16 MiB store, e.g. a proxy
-    /// pool) do not block a new source's first contact for the knock TTL.
+    /// N-5: single-knock sources filling the 16 MiB store (3,276 knocks
+    /// of 5120 bytes, e.g. a proxy pool) do not block a new source's first
+    /// contact for the knock TTL.
     #[test]
     fn many_single_knock_sources_do_not_block_a_new_sources_knock() {
         let store = KnockStore::new(16 << 20);
         let queues = DashMap::new();
         let src = |n: u32| Some(SourceKey(blake3::hash(&n.to_le_bytes()).into()));
-        for i in 0..8192u32 {
+        let fit = ((16usize << 20) / KNOCK_BYTES) as u32;
+        for i in 0..fit {
             store.enqueue(tag(i), None, knock(1), u64::from(i), &queues, src(i));
         }
-        assert_eq!(store.used(), 16 << 20, "the store is full");
+        let full = fit as usize * KNOCK_BYTES;
+        assert_eq!(store.used(), full, "the store is full");
         assert_eq!(
             store.enqueue(tag(90_000), None, knock(2), 90_000, &queues, src(90_000)),
             KnockOutcome::Queued
         );
         assert_eq!(knocks_for(&queues, tag(90_000)).len(), 1);
         assert!(knocks_for(&queues, tag(0)).is_empty(), "the oldest went");
-        assert_eq!(store.used(), 16 << 20);
+        assert_eq!(store.used(), full);
     }
 
     /// L-1: at a recipient's cap, many one-knock sources cannot flush the

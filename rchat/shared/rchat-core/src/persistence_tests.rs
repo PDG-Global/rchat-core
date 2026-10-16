@@ -13,7 +13,7 @@ fn sp5_failing_sink_sends_nothing() {
     let mut p = stored_pair(&sa, &sb);
     sa.fail.store(true, Ordering::SeqCst);
     let err =
-        p.a.seal_ratchet(&p.pb.hex, [1; 16], b"\x01lost")
+        p.a.seal_ratchet(&p.pb.hex, [1; 16], b"\x01\0\0\0\0lost")
             .unwrap_err();
     assert!(matches!(err, RChatError::StatePersistFailed));
     assert!(
@@ -97,7 +97,8 @@ fn sp14_concurrent_sends_never_write_an_older_state() {
             let (a, peer) = (a.clone(), peer.clone());
             std::thread::spawn(move || {
                 for _ in 0..200 {
-                    a.seal_ratchet(&peer, rand::random(), b"\x01c").unwrap();
+                    a.seal_ratchet(&peer, rand::random(), b"\x01\0\0\0\0c")
+                        .unwrap();
                 }
             })
         })
@@ -226,7 +227,7 @@ fn new_session_without_a_durable_write_is_not_announced() {
     let (i_ek, r_ek) = (ek_a.public_key().to_bytes(), ek_b.public_key().to_bytes());
     p.a.peers
         .push_ask(&p.pb.hex, ek_a, std::time::Instant::now());
-    feed(&mut p.a, created_v2(0, &p.pb.bundle, i_ek, r_ek));
+    feed(&mut p.a, created_v3(0, &p.pb.bundle, i_ek, r_ek));
     assert!(
         !p.a_log
             .lock()
@@ -385,14 +386,17 @@ fn retired_sessions_last_decrypt_survives_a_failed_write() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
     // B alone gets a new session: its old one (A's current) is retired.
+    // B initiates here, so it installs at once (a responder would wait
+    // for session-init, §A.3); its session-init is never relayed.
     let ek_b = crate::crypto::EphemeralKeyPair::generate();
-    let r_ek = ek_b.public_key().to_bytes();
-    let i_ek = crate::crypto::EphemeralKeyPair::generate()
+    let i_ek = ek_b.public_key().to_bytes();
+    let r_ek = crate::crypto::EphemeralKeyPair::generate()
         .public_key()
         .to_bytes();
     p.b.peers
         .push_ask(&p.pa.hex, ek_b, std::time::Instant::now());
-    feed(&mut p.b, created_v2(1, &p.pa.bundle, i_ek, r_ek));
+    feed(&mut p.b, created_v3(0, &p.pa.bundle, i_ek, r_ek));
+    drain(&mut p.b_rx);
     assert_eq!(p.b.session_manager.retired_count(&p.pa.hex), 1);
     let now = crate::unix_now_secs();
     let last = crate::session::RETIRED_MAX_DECRYPTS - 1;
@@ -469,9 +473,7 @@ fn rotation_grace_writes_the_reported_identity_first() {
     let mut p = stored_pair(&sa, &sb);
     let pn = peer(0x77);
     p.b.peers.unpin(&p.pa.hex);
-    p.b.peers
-        .pin(&pn.hex, pn.bundle.identity_agreement_key)
-        .unwrap();
+    p.b.peers.pin_card(&pn).unwrap();
     p.b.rotated_from.insert(
         p.pa.hex.clone(),
         (pn.hex.clone(), std::time::Instant::now()),
@@ -561,14 +563,17 @@ fn retry_sender_rotation_reaches_everyone() {
 fn exhausted_retired_session_stays_out_when_its_write_fails() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
+    // B initiates here, so it installs at once (a responder would wait
+    // for session-init, §A.3); its session-init is never relayed.
     let ek_b = crate::crypto::EphemeralKeyPair::generate();
-    let r_ek = ek_b.public_key().to_bytes();
-    let i_ek = crate::crypto::EphemeralKeyPair::generate()
+    let i_ek = ek_b.public_key().to_bytes();
+    let r_ek = crate::crypto::EphemeralKeyPair::generate()
         .public_key()
         .to_bytes();
     p.b.peers
         .push_ask(&p.pa.hex, ek_b, std::time::Instant::now());
-    feed(&mut p.b, created_v2(1, &p.pa.bundle, i_ek, r_ek));
+    feed(&mut p.b, created_v3(0, &p.pa.bundle, i_ek, r_ek));
+    drain(&mut p.b_rx);
     let last = crate::session::RETIRED_MAX_DECRYPTS - 1;
     p.b.session_manager
         .set_retired_for_test(&p.pa.hex, crate::unix_now_secs(), last);
@@ -614,12 +619,15 @@ fn sp8_restart_with_a_queue_delivers() {
 }
 
 /// SP9: the restored session resumes after the first accepted publish; one
-/// restored without a circuit asks with the all-zero resume.
+/// restored without a circuit asks with the all-zero resume. Task 9: a
+/// known contact on the blind path re-pairs blind instead (never a resume
+/// of its circuit), so this is the identity path's behaviour.
 #[test]
 fn sp9_restored_session_resumes() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
     let (mut b2, mut rx, _log) = restart_from(0xB2, 0xA1, &sb);
+    keep_identity_path(&mut b2, &p.pa.hex);
     b2.after_publish_ok(std::time::Instant::now());
     let resumes: Vec<_> = sent_controls(&mut rx)
         .into_iter()
@@ -633,6 +641,7 @@ fn sp9_restored_session_resumes() {
     p.b.handle_circuit_closed(C2); // detaches B's circuit
     p.b.persist_peer(&p.pa.hex).unwrap();
     let (mut b3, mut rx3, _log) = restart_from(0xB2, 0xA1, &sb);
+    keep_identity_path(&mut b3, &p.pa.hex);
     b3.ask(
         &p.pa.hex,
         crate::circuits::AskTrigger::User,
@@ -647,10 +656,23 @@ fn sp9_restored_session_resumes() {
         })
         .collect();
     assert_eq!(asks, vec![crate::circuits::ZERO_CIRCUIT]);
+    // Without the identity-path mark, a restored known contact re-pairs
+    // blind and never names its circuit (Task 9).
+    let (mut b1, mut rx1, _log) = restart_from(0xB2, 0xA1, &sb);
+    b1.after_publish_ok(std::time::Instant::now());
+    let sent = sent_controls(&mut rx1);
+    assert_eq!(
+        blind_asks_in(&sent),
+        1,
+        "blind re-pair of the restored session"
+    );
+    assert!(sent
+        .iter()
+        .all(|m| !matches!(m, ControlMessage::CircuitAsk { .. })));
 }
 
 /// SP10 (amends K12): replays after a restart are dropped by received_ids
-/// before any decrypt, and a replayed CircuitCreatedV2 is still refused.
+/// before any decrypt, and a replayed CircuitCreatedV3 is still refused.
 #[test]
 fn sp10_replay_after_restart_is_dropped_before_decrypt() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
@@ -673,7 +695,7 @@ fn sp10_replay_after_restart_is_dropped_before_decrypt() {
         attempts,
         "never decrypted twice"
     );
-    let replay = created_v2(1, &p.pa.bundle, [1; 32], [2; 32]);
+    let replay = created_v3(1, &p.pa.bundle, [1; 32], [2; 32]);
     feed(&mut b2, replay);
     assert!(
         sent_controls(&mut b2_rx)
@@ -786,6 +808,8 @@ fn fill_identity_state(inner: &mut ClientInner, peer_hex: &str) {
             internal: None,
             binding: [0; 32],
             expire_after: crate::acks::ACK_UNKNOWN_AFTER,
+            plaintext: None,
+            lineage: None,
         },
     );
     inner.cover_replies_charged.insert(
@@ -899,7 +923,7 @@ fn restore_refuses_kind_and_key_mismatches() {
     let keys = crate::state_store::StateKeys::new(TEST_STATE_KEY);
     let (pa, pc) = (peer(0xA1), peer(0xC3));
     let rec = |ik: [u8; 32]| {
-        crate::state_store::encode_body(&crate::state_store::PeerRecordV1 {
+        crate::state_store::encode_body(&crate::state_store::PeerRecordV2 {
             peer_ik: ik,
             received_ids: vec![[9; 16]],
             ..Default::default()
@@ -947,12 +971,8 @@ fn restore_refuses_kind_and_key_mismatches() {
     }
     let (mut b, _rx) = published(0xB2);
     let log = install_event_log(&mut b);
-    b.peers
-        .pin(&pa.hex, pa.bundle.identity_agreement_key)
-        .unwrap();
-    b.peers
-        .pin(&pc.hex, pc.bundle.identity_agreement_key)
-        .unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    b.peers.pin_card(&pc).unwrap();
     with_store(&mut b, &sink);
     b.state.as_mut().unwrap().staged = staged;
     b.restore_staged_state();
@@ -981,9 +1001,7 @@ fn higher_counter_wins_and_seeds_the_next_write() {
     assert!(counter(&newer) > counter(&old));
 
     let (mut b2, _rx) = published(0xB2);
-    b2.peers
-        .pin(&p.pa.hex, p.pa.bundle.identity_agreement_key)
-        .unwrap();
+    b2.peers.pin_card(&p.pa).unwrap();
     with_store(&mut b2, &sb);
     let store = b2.state.as_mut().unwrap();
     store.stage_keep_higher(key.clone(), newer.clone());
@@ -1234,8 +1252,16 @@ fn forget_paths_clear_tracking_and_delete_the_record() {
     let before = std::time::Instant::now();
     p.b.apply_set_recipient(&p.pa.hex, Some(&hex::encode([0x99; 32])))
         .unwrap();
-    // The old pin's ask is gone; the one set_recipient sends under the new
-    // pin is in flight (Task 4).
+    // R1: the new keys' card brings its ML-KEM key; then the ask goes.
+    assert!(p.b.peers.set_kem_pk(&p.pa.hex, p.pa.bundle.kem_pk.clone()));
+    p.b.ask(
+        &p.pa.hex,
+        crate::circuits::AskTrigger::User,
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    // The old pin's ask is gone; the one sent under the new pin is in
+    // flight (Task 4).
     let fresh = p.b.unanswered_asks.remove(&p.pa.hex);
     assert!(fresh.is_some_and(|(at, _)| at >= before), "new pin's ask");
     assert!(tracking_cleared(&p.b, &p.pa.hex));
@@ -1341,9 +1367,7 @@ fn client_api_stages_and_clears() {
     let files: Vec<(String, Vec<u8>)> = sb.files.lock().unwrap().clone().into_iter().collect();
     let n = files.len();
     let (mut b2, _rx) = published(0xB2);
-    b2.peers
-        .pin(&p.pa.hex, p.pa.bundle.identity_agreement_key)
-        .unwrap();
+    b2.peers.pin_card(&p.pa).unwrap();
     let client = wrap(b2);
     client.import_state_records(files.clone()); // no store yet: ignored
     assert!(client.inner.try_read().unwrap().state.is_none());
@@ -1589,9 +1613,7 @@ fn answered_ask_meta_write_follows_the_session_write_once() {
     let (mut a, mut rx) = published(0xA1);
     with_store(&mut a, &sink);
     let b = peer(0xB2);
-    a.peers
-        .pin(&b.hex, b.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&b).unwrap();
     a.ask(
         &b.hex,
         crate::circuits::AskTrigger::User,
@@ -1611,7 +1633,7 @@ fn answered_ask_meta_write_follows_the_session_write_once() {
     let r_ek = crate::crypto::EphemeralKeyPair::generate()
         .public_key()
         .to_bytes();
-    feed(&mut a, created_v2(0, &b.bundle, ek, r_ek));
+    feed(&mut a, created_v3(0, &b.bundle, ek, r_ek));
     assert!(a.has_live_circuit(&b.hex));
     let meta = crate::state_store::META_KEY;
     let keys: Vec<String> = sink
@@ -1637,9 +1659,7 @@ fn answered_ask_meta_write_follows_the_session_write_once() {
     // A refusal still writes the cleared ask.
     let (mut a, mut rx) = published(0xA1);
     with_store(&mut a, &sink);
-    a.peers
-        .pin(&b.hex, b.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&b).unwrap();
     a.ask(
         &b.hex,
         crate::circuits::AskTrigger::User,
@@ -1648,7 +1668,7 @@ fn answered_ask_meta_write_follows_the_session_write_once() {
     .unwrap();
     drop(sent_controls(&mut rx));
     assert_eq!(open_meta(&sink, 0xA1).unanswered_asks.len(), 1);
-    feed(&mut a, created_v2(0, &b.bundle, [0x42; 32], r_ek));
+    feed(&mut a, created_v3(0, &b.bundle, [0x42; 32], r_ek));
     assert!(
         open_meta(&sink, 0xA1).unanswered_asks.is_empty(),
         "echo refusal"
@@ -1664,9 +1684,7 @@ fn restored_ask_survives_a_meta_write_and_is_resent_uncounted() {
     let (mut a, mut rx) = published(0xA1);
     with_store(&mut a, &sink);
     let b = peer(0xB2);
-    a.peers
-        .pin(&b.hex, b.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&b).unwrap();
     a.ask(
         &b.hex,
         crate::circuits::AskTrigger::User,
@@ -1706,9 +1724,7 @@ fn unanswered_ask_is_in_the_meta_record_until_answered_or_blocked() {
     let (mut a, mut rx) = published(0xA1);
     with_store(&mut a, &sink);
     let b = peer(0xB2);
-    a.peers
-        .pin(&b.hex, b.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&b).unwrap();
     let ask_ek = |a: &mut ClientInner, rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>| {
         a.unanswered_asks.clear(); // past the in-flight window
         a.ask(
@@ -1743,7 +1759,7 @@ fn unanswered_ask_is_in_the_meta_record_until_answered_or_blocked() {
     let r_ek = crate::crypto::EphemeralKeyPair::generate()
         .public_key()
         .to_bytes();
-    feed(&mut a, created_v2(0, &b.bundle, ek, r_ek));
+    feed(&mut a, created_v3(0, &b.bundle, ek, r_ek));
     assert!(a.has_live_circuit(&b.hex));
     assert!(
         open_meta(&sink, 0xA1).unanswered_asks.is_empty(),
@@ -1780,7 +1796,7 @@ fn answered_ask_stays_on_disk_while_the_session_write_fails() {
     let key = crate::state_store::StateKeys::new(TEST_STATE_KEY)
         .record_key_for(&p.pb.bundle.identity_key);
     sa.fail_keys.lock().unwrap().insert(key);
-    feed(&mut p.a, created_v2(0, &p.pb.bundle, i, r));
+    feed(&mut p.a, created_v3(0, &p.pb.bundle, i, r));
     assert!(!p.a.unanswered_asks.contains_key(&p.pb.hex), "answered");
     assert_eq!(
         open_meta(&sa, 0xA1).unanswered_asks,
@@ -1875,6 +1891,35 @@ fn rv3_reinstall_recovery() {
     assert_eq!(resets, 1, "once per session");
 }
 
+/// The companion of `rv3_reinstall_recovery` (fix round 1 (e)): the
+/// queued sends left a second or more before the new session, as they
+/// usually do in real use. A's reset report takes them (reason 3) and
+/// makes them eligible; B's later reason-1 notice for them is then not
+/// reported again, and nothing is made eligible twice.
+#[test]
+fn rv3_queued_sends_older_than_the_session_are_reason_3_once() {
+    let r = rv3_run(3, |a, b| a.age_sent_for_test(&b.hex, 1));
+    let a_ev = statuses(&r.p.a_log);
+    for id in &r.ids {
+        let hex_id = hex::encode(id);
+        let reasons: Vec<u8> = a_ev
+            .iter()
+            .filter_map(|e| match e {
+                crate::status::StatusEvent::PeerUndelivered {
+                    message_id, reason, ..
+                } if *message_id == hex_id => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, vec![3], "reason 3 only, once");
+        let eligible = a_ev
+            .iter()
+            .filter(|e| matches!(e, crate::status::StatusEvent::ResendEligible { message_id, .. } if *message_id == hex_id))
+            .count();
+        assert_eq!(eligible, 1, "made eligible once: no duplicate resend");
+    }
+}
+
 /// SP13: decrypted, then a crash before the app stored it → reason 2.
 #[test]
 fn sp13_lost_before_stored_is_reported() {
@@ -1883,6 +1928,7 @@ fn sp13_lost_before_stored_is_reported() {
     let id = push_text(&p.a, &p.pb.hex, "never stored");
     relay_all(&mut p.a_rx, &mut p.b); // no mark_seen_and_receipt: the app died
     let (mut b2, mut b2_rx, _log) = restart_from(0xB2, 0xA1, &sb);
+    keep_identity_path(&mut b2, &p.pa.hex); // resumes its identity circuit (Task 9)
     b2.after_publish_ok(std::time::Instant::now());
     feed(
         &mut b2,
@@ -1917,7 +1963,7 @@ fn rv7_delivered_after_stored() {
     let intro: [u8; 16] = [0x1d; 16];
     p.b.peers.mark_seen(&p.pa.hex, intro);
     let pk =
-        p.a.seal_ratchet(&p.pb.hex, intro, b"\x01intro text")
+        p.a.seal_ratchet(&p.pb.hex, intro, b"\x01\0\0\0\0intro text")
             .unwrap();
     feed(&mut p.b, Frame::Relay(pk));
     assert_eq!(
@@ -2008,6 +2054,7 @@ fn lost_id_resend_passes_the_duplicate_drop_and_other_replays_do_not() {
         feed(&mut p.b, Frame::Relay(pk));
     }
     let (mut b2, mut b2_rx, b2_log) = restart_from(0xB2, 0xA1, &sb);
+    keep_identity_path(&mut b2, &p.pa.hex); // resumes its identity circuit (Task 9)
     b2.after_publish_ok(std::time::Instant::now());
     feed(
         &mut b2,
@@ -2037,7 +2084,9 @@ fn lost_id_resend_passes_the_duplicate_drop_and_other_replays_do_not() {
         .all(|s| !matches!(s, crate::status::StatusEvent::DecryptFailed { .. })));
     // Every other replay is dropped before decrypt: the stored message's id.
     let attempts = |c: &ClientInner| c.decrypt_attempts.load(Ordering::Relaxed);
-    let stored_again = p.a.seal_ratchet(&p.pb.hex, stored, b"\x01stored").unwrap();
+    let stored_again =
+        p.a.seal_ratchet(&p.pb.hex, stored, b"\x01\0\0\0\0stored")
+            .unwrap();
     let before = attempts(&b2);
     feed(&mut b2, Frame::Relay(stored_again));
     assert_eq!(
@@ -2049,7 +2098,7 @@ fn lost_id_resend_passes_the_duplicate_drop_and_other_replays_do_not() {
     drop(b2);
     let (mut b3, _b3_rx, b3_log) = restart_from(0xB2, 0xA1, &sb);
     let resend =
-        p.a.seal_ratchet(&p.pb.hex, id, b"\x01never stored")
+        p.a.seal_ratchet(&p.pb.hex, id, b"\x01\0\0\0\0never stored")
             .unwrap();
     let resend_replay = resend.clone();
     feed(&mut b3, Frame::Relay(resend));
@@ -2211,18 +2260,16 @@ fn owed_notice_burns_nothing_while_the_transport_is_down() {
 /// A notice that is still owed after a restart keeps its no-prior-session flag.
 #[test]
 fn owed_notice_flag_survives_a_restart() {
-    let (mut a, _a_rx) = published(0xA1);
+    let (mut a, mut a_rx) = published(0xA1);
     let (mut b, _b_rx) = published(0xB2);
     let (pa, pb) = (peer(0xA1), peer(0xB2));
-    a.peers
-        .pin(&pb.hex, pb.bundle.identity_agreement_key)
-        .unwrap();
-    b.peers
-        .pin(&pa.hex, pa.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
     let sb = MemorySink::default();
     with_store(&mut b, &sb);
-    reestablish(&mut a, &mut b, &pa, &pb); // B cannot send its notice yet
+    b.receipt_delay_override = Some(std::time::Duration::from_secs(60)); // B's notice waits
+    reestablish(&mut a, &mut b, &pa, &pb);
+    relay_all(&mut a_rx, &mut b); // session-init: B installs (v3, §A.3)
     assert_eq!(open_record(&sb, 0xB2, &pa).notice_flags, 1);
     let (b2, _rx, _log) = restart_from(0xB2, 0xA1, &sb);
     assert!(b2.notice_due.contains(&pa.hex));
@@ -2584,7 +2631,9 @@ fn rs1_same_id_resend_is_never_eligible_again() {
     assert_eq!(eligible(&p.a_log), 1);
     // The app resends with the same id (the `seal_ratchet` path the FFI's
     // same-id send uses records it again).
-    let pk = p.a.seal_ratchet(&peer_hex, id, b"\x01lost").unwrap();
+    let pk =
+        p.a.seal_ratchet(&peer_hex, id, b"\x01\0\0\0\0lost")
+            .unwrap();
     drop(pk);
     assert_eq!(p.a.sent_ids_for(&peer_hex).len(), 2, "recorded again");
     // A later session (its reported set starts empty) loses it again.
@@ -2654,9 +2703,7 @@ fn guard1_old_identity_session_notice_in_the_grace_counts_for_nothing() {
     // The new identity already has its own session with A; the old one's
     // session still decrypts in-flight messages.
     let (mut b9, mut b9_rx) = published(0xB9);
-    b9.peers
-        .pin(&p.pa.hex, p.pa.bundle.identity_agreement_key)
-        .unwrap();
+    b9.peers.pin_card(&p.pa).unwrap();
     reestablish(&mut p.a, &mut b9, &p.pa, &new);
     relay_all(&mut p.a_rx, &mut b9);
     drain(&mut b9_rx);
@@ -2703,9 +2750,7 @@ fn rs2_rotation_guard() {
     let mut r = r;
     let new = peer(0xB9);
     let (mut b9, mut b9_rx) = published(0xB9);
-    b9.peers
-        .pin(&r.p.pa.hex, r.p.pa.bundle.identity_agreement_key)
-        .unwrap();
+    b9.peers.pin_card(&r.p.pa).unwrap();
     reestablish(&mut r.p.a, &mut b9, &r.p.pa, &new);
     relay_all(&mut r.p.a_rx, &mut b9);
     drain(&mut b9_rx);
@@ -2739,9 +2784,7 @@ fn rotation_then_restart_reason_3_is_never_eligible() {
     assert!(a2.rotated_from.is_empty(), "the rotation is forgotten");
     assert!(a2.was_sent_to(&new.hex, &id), "the id survived the restart");
     let (mut b9, mut b9_rx) = published(0xB9);
-    b9.peers
-        .pin(&p.pa.hex, p.pa.bundle.identity_agreement_key)
-        .unwrap();
+    b9.peers.pin_card(&p.pa).unwrap();
     reestablish(&mut a2, &mut b9, &p.pa, &new);
     relay_all(&mut a2_rx, &mut b9);
     drain(&mut b9_rx);
@@ -2948,7 +2991,7 @@ fn rs6_attacker_without_pinned_keys() {
     let ek = crate::crypto::EphemeralKeyPair::generate();
     let i = ek.public_key().to_bytes();
     q.a.peers.push_ask(&q.pb.hex, ek, std::time::Instant::now());
-    feed(&mut q.a, created_v2(0, &impostor, i, [9; 32]));
+    feed(&mut q.a, created_v3(0, &impostor, i, [9; 32]));
     assert_eq!(q.a.peers.state(&q.pb.hex), PeerKeyState::Mismatch);
     assert_eq!(eligible(&q.a_log), 0);
     // A notice under the retired session (RV4), or naming ids never sent
@@ -3190,7 +3233,7 @@ fn dk4_device_key_never_taken_from_the_network() {
         .push_ask(&p.pb.hex, ek_a, std::time::Instant::now());
     feed(
         &mut p.a,
-        created_v2(
+        created_v3(
             0,
             &p.pb.bundle,
             ek_a_pub,
@@ -3604,12 +3647,8 @@ fn receipts_wait_for_an_owed_flagged_notice() {
         c.receipt_delay_override = Some(std::time::Duration::from_secs(60));
     }
     let (pa, pb) = (peer(0xA1), peer(0xB2));
-    a.peers
-        .pin(&pb.hex, pb.bundle.identity_agreement_key)
-        .unwrap();
-    b.peers
-        .pin(&pa.hex, pa.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
     reestablish(&mut a, &mut b, &pa, &pb); // first contact
     relay_all(&mut a_rx, &mut b); // A's hello sync
     b.fire_due_receipts(std::time::Instant::now() + std::time::Duration::from_secs(120));
@@ -3708,15 +3747,13 @@ fn receipts_held_by_an_owed_flagged_notice_leave_after_a_restart() {
     let (mut b, _b_rx) = published(0xB2);
     let a_log = install_event_log(&mut a);
     let (pa, pb) = (peer(0xA1), peer(0xB2));
-    a.peers
-        .pin(&pb.hex, pb.bundle.identity_agreement_key)
-        .unwrap();
-    b.peers
-        .pin(&pa.hex, pa.bundle.identity_agreement_key)
-        .unwrap();
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
     let sb = MemorySink::default();
     with_store(&mut b, &sb);
-    reestablish(&mut a, &mut b, &pa, &pb); // B cannot send its notice yet
+    b.receipt_delay_override = Some(std::time::Duration::from_secs(60)); // B's notice waits
+    reestablish(&mut a, &mut b, &pa, &pb);
+    relay_all(&mut a_rx, &mut b); // session-init: B installs (v3, §A.3)
     assert_eq!(open_record(&sb, 0xB2, &pa).notice_flags, 1);
     let ids = [push_text(&a, &pb.hex, "d1"), push_text(&a, &pb.hex, "d2")];
     let (mut b2, mut b2_rx, b2_log) = restart_from(0xB2, 0xA1, &sb);
@@ -3816,9 +3853,7 @@ fn m1_held_forged_bodies_rewrite_meta_once_per_tick() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
     let c = peer(0xC3);
-    p.b.peers
-        .pin(&c.hex, c.bundle.identity_agreement_key)
-        .unwrap();
+    p.b.peers.pin_card(&c).unwrap();
     let before = sb.tried.load(Ordering::SeqCst);
     for _ in 0..300 {
         feed(&mut p.b, queued(m1_forged(&c, &p.pb, rand::random(), 1024)));
@@ -3848,11 +3883,9 @@ fn m1_a_relay_frame_from_another_sender_than_the_circuit_peer_is_dropped() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
     let c = peer(0xC3);
-    p.b.peers
-        .pin(&c.hex, c.bundle.identity_agreement_key)
-        .unwrap();
+    p.b.peers.pin_card(&c).unwrap();
     let genuine =
-        p.a.seal_ratchet(&p.pb.hex, rand::random(), b"\x01hi")
+        p.a.seal_ratchet(&p.pb.hex, rand::random(), b"\x01\0\0\0\0hi")
             .unwrap();
     let token =
         p.a.session_manager
@@ -3904,9 +3937,7 @@ fn the_timer_flushes_coalesced_writes_and_resets_the_tick_limits() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
     let c = peer(0xC3);
-    p.b.peers
-        .pin(&c.hex, c.bundle.identity_agreement_key)
-        .unwrap();
+    p.b.peers.pin_card(&c).unwrap();
     for _ in 0..3 {
         feed(&mut p.b, queued(m1_forged(&c, &p.pb, rand::random(), 64)));
     }
@@ -3967,4 +3998,484 @@ fn the_timer_flushes_coalesced_writes_and_resets_the_tick_limits() {
         37,
         "DecryptFailed resumes in a later tick"
     );
+}
+
+// ---- Protocol v3 (Task 4): session-init state in the records ----
+
+/// §A.3: a responder restarted before the session-init arrives still opens
+/// it: the wait is in the peer record, with the KEM ephemeral as its
+/// 64-byte seed (R4), never the expanded secret. The queued init then
+/// installs the session, the pair resumes its circuit after the publish,
+/// and the record no longer holds the wait.
+#[test]
+fn pending_session_init_survives_a_restart() {
+    let (mut a, mut a_rx) = published(0xA1);
+    let (mut b, _b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sb = MemorySink::default();
+    with_store(&mut b, &sb);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    let rec = open_record(&sb, 0xB2, &pa);
+    let pending = rec.pending_init.as_ref().expect("the wait is stored");
+    assert_eq!(pending.kem_seed.len(), crate::kem::KEM_SEED_LEN);
+    assert!(rec.session.is_none(), "no session before the init");
+    let from_a = sent_relays(&mut a_rx);
+    drop(b);
+    let (mut b2, mut b2_rx, b2_log) = restart_from(0xB2, 0xA1, &sb);
+    assert!(b2.awaiting_init(&pa.hex));
+    // After the publish the pair's circuit is resumed, not asked afresh.
+    b2.after_publish_ok(std::time::Instant::now());
+    let resumes: Vec<_> = sent_controls(&mut b2_rx)
+        .into_iter()
+        .filter_map(|m| match m {
+            ControlMessage::CircuitAsk { resume_circuit, .. } => resume_circuit,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resumes, vec![C2], "the pending circuit is resumed");
+    for pkt in from_a {
+        feed(&mut b2, queued(pkt.payload));
+    }
+    assert!(!b2.awaiting_init(&pa.hex));
+    assert!(b2.session_manager.get(&pa.hex).unwrap().is_established);
+    assert!(open_record(&sb, 0xB2, &pa).pending_init.is_none());
+    push_text(&a, &pb.hex, "after restart");
+    for pkt in sent_relays(&mut a_rx) {
+        feed(&mut b2, queued(pkt.payload));
+    }
+    assert_eq!(texts(&b2_log), vec![b"after restart".to_vec()]);
+}
+
+/// Ruling R8 / review M-5: a wait older than the offline queue (72 h) is
+/// dropped at restore exactly as an expired wait is: its circuit is closed
+/// and the pair asked again. A record whose wait names another agreement
+/// key than the pin is deleted (C-1).
+#[test]
+fn an_expired_or_repinned_pending_init_is_not_restored() {
+    let (mut a, _a_rx) = published(0xA1);
+    let (mut b, _b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sb = MemorySink::default();
+    with_store(&mut b, &sb);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    let now = crate::unix_now_secs();
+    {
+        let w = b.pending_inits.get_mut(&pa.hex).unwrap();
+        w.created_at_unix = now - crate::circuits::PENDING_INIT_MAX_AGE_SECS - 3600;
+        w.expires_at_unix = now - 1;
+    }
+    b.persist_peer(&pa.hex).unwrap();
+    let rec = open_record(&sb, 0xB2, &pa);
+    assert!(rec.pending_init.is_some(), "the old wait is on disk");
+    let (b2, mut b2_rx, _log) = restart_from(0xB2, 0xA1, &sb);
+    assert!(!b2.awaiting_init(&pa.hex));
+    let closed: Vec<_> = sent_controls(&mut b2_rx)
+        .into_iter()
+        .filter_map(|m| match m {
+            ControlMessage::CloseCircuit { circuit_id } => Some(circuit_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, vec![C2], "the half-made circuit is closed");
+    assert!(
+        b2.pending_reasks.contains_key(&pa.hex) || b2.deferred_asks.contains(&pa.hex),
+        "the pair is asked again"
+    );
+    let key =
+        crate::state_store::StateKeys::new(TEST_STATE_KEY).record_key_for(&pa.bundle.identity_key);
+    let left = sb.files.lock().unwrap().get(&key).cloned();
+    assert!(
+        left.is_none()
+            || open_sealed(0xB2, &key, &left.unwrap())
+                .pending_init
+                .is_none(),
+        "the dropped wait left the record (an empty record is deleted)"
+    );
+
+    let sb = MemorySink::default();
+    with_store(&mut b, &sb);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    b.persist_peer(&pa.hex).unwrap();
+    // Restarted with A pinned under another key: the record goes.
+    let (mut c, _rx) = published(0xB2);
+    c.peers
+        .pin(&pa.hex, peer(0x66).bundle.identity_agreement_key)
+        .unwrap();
+    with_store(&mut c, &sb);
+    let files = sb.files.lock().unwrap().clone();
+    for (key, sealed) in files {
+        c.state.as_mut().unwrap().stage_keep_higher(key, sealed);
+    }
+    c.restore_staged_state();
+    assert!(!c.awaiting_init(&pa.hex));
+}
+
+/// Ruling R8 (the review's scenario): B waits for a session-init on a
+/// second pair (distinct circuits from the first), then is suspended for
+/// 30 min, past the wait's online TTL. The wait counts online time only:
+/// after the restart it is still there, the queued init opens, and the
+/// text sent meanwhile arrives.
+#[test]
+fn a_wait_survives_thirty_minutes_offline() {
+    let (mut a, mut a_rx) = published(0xA1);
+    let (mut b, mut b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sb = MemorySink::default();
+    with_store(&mut b, &sb);
+    // First pair, fully confirmed.
+    reestablish(&mut a, &mut b, &pa, &pb);
+    for pkt in sent_relays(&mut a_rx) {
+        feed(&mut b, queued(pkt.payload));
+    }
+    push_text(&b, &pa.hex, "hi");
+    for pkt in sent_relays(&mut b_rx) {
+        feed(&mut a, queued(pkt.payload));
+    }
+    assert!(b.session_manager.get(&pa.hex).unwrap().is_established);
+    // Second pair on its own circuits: B waits, then sleeps 30 min.
+    let (c3, c4) = (
+        crate::protocol::CircuitId([0xC3; 16]),
+        crate::protocol::CircuitId([0xC4; 16]),
+    );
+    reestablish_on(&mut a, &mut b, &pa, &pb, (c3, c4.clone()));
+    assert!(b.awaiting_init(&pa.hex));
+    let now = crate::unix_now_secs();
+    {
+        let w = b.pending_inits.get_mut(&pa.hex).unwrap();
+        w.created_at_unix = now - 1800;
+        w.expires_at_unix = now - 1200;
+    }
+    b.persist_peer(&pa.hex).unwrap();
+    drop(b);
+    push_text(&a, &pb.hex, "while you were away");
+    let from_a = sent_relays(&mut a_rx);
+    let (mut b2, mut b2_rx, b2_log) = restart_from(0xB2, 0xA1, &sb);
+    assert!(b2.awaiting_init(&pa.hex), "online time only: still waiting");
+    assert!(
+        b2.pending_inits.get(&pa.hex).unwrap().expires_at_unix
+            >= now + crate::peers::ASK_TTL.as_secs()
+    );
+    b2.after_publish_ok(std::time::Instant::now());
+    let resumes: Vec<_> = sent_controls(&mut b2_rx)
+        .into_iter()
+        .filter_map(|m| match m {
+            ControlMessage::CircuitAsk { resume_circuit, .. } => resume_circuit,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resumes, vec![c4], "B resumes the second pair's circuit");
+    for pkt in from_a {
+        feed(&mut b2, queued(pkt.payload));
+    }
+    assert!(!b2.awaiting_init(&pa.hex));
+    assert_eq!(texts(&b2_log), vec![b"while you were away".to_vec()]);
+    assert!(
+        !statuses(&b2_log)
+            .iter()
+            .any(|e| matches!(e, crate::status::StatusEvent::DecryptFailed { .. })),
+        "nothing undecryptable"
+    );
+}
+
+/// §A.4: the initiator's unanswered session-init is in its record, so a
+/// restart re-sends the very same bytes at the first resume.
+#[test]
+fn unanswered_session_init_is_resent_after_a_restart() {
+    let (mut a, mut a_rx) = published(0xA1);
+    let (mut b, _b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sa = MemorySink::default();
+    with_store(&mut a, &sa);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    let init = sent_relays(&mut a_rx).remove(0);
+    let rec = open_record(&sa, 0xA1, &pb);
+    let stored = rec.session.as_ref().unwrap().init_out.as_ref().unwrap();
+    assert_eq!(stored.sent_payload, init.payload);
+    assert!(stored.sent_payload.len() > 4096);
+    assert!(rec.session.as_ref().unwrap().pair_secret.is_some());
+    let (mut a2, mut a2_rx, _log) = restart_from(0xA1, 0xB2, &sa);
+    a2.is_key_bundle_published = true;
+    feed(
+        &mut a2,
+        Frame::Control(ControlMessage::CircuitExists {
+            circuit_id: C1,
+            token: TOKEN.to_vec(),
+            target_circuit_id: C2,
+            is_initiator: true,
+        }),
+    );
+    let again = sent_relays(&mut a2_rx);
+    assert_eq!(again[0].payload, init.payload, "the same bytes, first");
+    feed(&mut b, Frame::Relay(again[0].clone()));
+    assert!(b.session_manager.get(&pa.hex).unwrap().can_send());
+}
+
+// ---- Task 4 fix round 2 (N-1, N-2) ----
+
+/// Review N-1: a too-old wait dropped at restore must not write a
+/// half-merged peer record. Every write of the peer's record made during
+/// the restore carries all it held (no delete, no lost ids), and the wait
+/// is gone from the final record; the circuit is closed and re-asked.
+#[test]
+fn a_wait_dropped_at_restore_never_writes_a_partial_record() {
+    let (mut a, mut a_rx) = published(0xA1);
+    let (mut b, mut b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sb = MemorySink::default();
+    with_store(&mut b, &sb);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    for pkt in sent_relays(&mut a_rx) {
+        feed(&mut b, queued(pkt.payload));
+    }
+    push_text(&a, &pb.hex, "hello b");
+    for pkt in sent_relays(&mut a_rx) {
+        feed(&mut b, queued(pkt.payload));
+    }
+    push_text(&b, &pa.hex, "hi a");
+    let _ = sent_relays(&mut b_rx);
+    let (c3, c4) = (
+        crate::protocol::CircuitId([0xC3; 16]),
+        crate::protocol::CircuitId([0xC4; 16]),
+    );
+    reestablish_on(&mut a, &mut b, &pa, &pb, (c3, c4.clone()));
+    assert!(b.awaiting_init(&pa.hex));
+    let now = crate::unix_now_secs();
+    b.pending_inits.get_mut(&pa.hex).unwrap().created_at_unix =
+        now - crate::circuits::PENDING_INIT_MAX_AGE_SECS - 3600;
+    b.persist_peer(&pa.hex).unwrap();
+    let before = open_record(&sb, 0xB2, &pa);
+    assert!(!before.received_ids.is_empty() && !before.sent_ids.is_empty());
+    assert!(before.pending_init.is_some());
+    drop(b);
+    let hlen = sb.history.lock().unwrap().len();
+    let (b2, mut b2_rx, _log) = restart_from(0xB2, 0xA1, &sb);
+    let key =
+        crate::state_store::StateKeys::new(TEST_STATE_KEY).record_key_for(&pa.bundle.identity_key);
+    let writes: Vec<Vec<u8>> = sb.history.lock().unwrap()[hlen..]
+        .iter()
+        .filter(|(k, _)| *k == key)
+        .map(|(_, b)| b.clone())
+        .collect();
+    assert!(!writes.is_empty());
+    for w in &writes {
+        assert!(!w.is_empty(), "the record is never deleted");
+        let r = open_sealed(0xB2, &key, w);
+        assert_eq!(r.received_ids, before.received_ids, "received ids kept");
+        assert_eq!(r.sent_ids.len(), before.sent_ids.len(), "sent ids kept");
+        assert_eq!(r.seen_ids, before.seen_ids);
+        assert!(r.session.is_some());
+    }
+    let after = open_record(&sb, 0xB2, &pa);
+    assert!(after.pending_init.is_none(), "the wait is gone");
+    assert!(!b2.awaiting_init(&pa.hex));
+    let closed: Vec<_> = sent_controls(&mut b2_rx)
+        .into_iter()
+        .filter_map(|m| match m {
+            ControlMessage::CloseCircuit { circuit_id } => Some(circuit_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, vec![c4], "the wait's circuit is closed");
+    // B still holds the first pair's session: the publish asks for it (a
+    // blind re-pair of that known contact, Task 9), so the pair is formed
+    // again.
+    let mut b2 = b2;
+    b2.after_publish_ok(std::time::Instant::now());
+    assert_eq!(blind_asks_in(&sent_controls(&mut b2_rx)), 1);
+}
+
+/// Review N-1: an unpublished restore that applies the peer record before
+/// the meta record, with a too-old wait. The close is kept for the next
+/// publish, and the meta record on disk keeps what it held (a pending
+/// close, a held body and an unanswered ask) plus the new close: no meta
+/// write happens before the staged meta is applied.
+#[test]
+fn a_wait_dropped_at_restore_keeps_the_staged_meta() {
+    let (mut a, _a_rx) = published(0xA1);
+    let (mut b, _b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    let pc = peer(0xC3);
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    b.peers.pin_card(&pc).unwrap();
+    let sb = MemorySink::default();
+    with_store(&mut b, &sb);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    let now = crate::unix_now_secs();
+    b.pending_inits.get_mut(&pa.hex).unwrap().created_at_unix =
+        now - crate::circuits::PENDING_INIT_MAX_AGE_SECS - 3600;
+    b.persist_peer(&pa.hex).unwrap();
+    let marker = crate::protocol::CircuitId([0x5a; 16]);
+    b.pending_closes.push(marker.clone());
+    b.unanswered_asks.insert(
+        pc.hex.clone(),
+        (std::time::Instant::now(), b.transport_epoch),
+    );
+    b.pending_encrypted_messages
+        .push_back(crate::PendingEncrypted {
+            sender_hex: pc.hex.clone(),
+            message_id: [0x77; 16],
+            body: vec![1, 2, 3],
+        });
+    b.persist_meta();
+    drop(b);
+    let keys = crate::state_store::StateKeys::new(TEST_STATE_KEY);
+    let our_ik = pb.bundle.identity_key;
+    let meta_on_disk = |sealed: &[u8]| -> crate::state_store::MetaRecordV1 {
+        let (_, _, body) = keys
+            .open(&our_ik, crate::state_store::META_KEY, sealed)
+            .unwrap();
+        bincode::deserialize(&body).unwrap()
+    };
+    let hlen = sb.history.lock().unwrap().len();
+    let (mut b2, _rx) = inner_with_identity(0xB2);
+    b2.bypass_frame_gate = false;
+    b2.is_key_bundle_published = false;
+    b2.peers.pin_card(&pa).unwrap();
+    b2.peers.pin_card(&pc).unwrap();
+    with_store(&mut b2, &sb);
+    let mut files: Vec<_> = sb.files.lock().unwrap().clone().into_iter().collect();
+    files.sort_by_key(|(k, _)| k == crate::state_store::META_KEY); // peer first
+    let store = b2.state.as_mut().unwrap();
+    for (k, s) in files {
+        store.stage_keep_higher(k, s);
+    }
+    b2.restore_staged_state();
+    assert!(!b2.awaiting_init(&pa.hex));
+    // Every meta write of the restore keeps the staged contents.
+    let meta_writes: Vec<Vec<u8>> = sb.history.lock().unwrap()[hlen..]
+        .iter()
+        .filter(|(k, _)| k == crate::state_store::META_KEY)
+        .map(|(_, b)| b.clone())
+        .collect();
+    assert!(!meta_writes.is_empty(), "the close was recorded");
+    for w in &meta_writes {
+        let m = meta_on_disk(w);
+        assert!(m.pending_closes.contains(&marker.0), "pending close kept");
+        assert!(
+            m.unanswered_asks.contains(&pc.bundle.identity_key),
+            "ask kept"
+        );
+        assert!(
+            m.held.iter().any(|h| h.message_id == [0x77; 16]),
+            "held body kept"
+        );
+    }
+    let last = meta_on_disk(meta_writes.last().unwrap());
+    assert!(
+        last.pending_closes.contains(&C2.0),
+        "the wait's close is kept"
+    );
+    assert!(b2.pending_closes.contains(&C2));
+}
+
+/// Review N-2: a restored session whose session-init was never sealed
+/// owes the hello that carries it; the tick sends it, the init first,
+/// and the tracked re-sends held behind it follow.
+#[test]
+fn a_restored_unsent_init_owes_its_hello() {
+    let (mut a, mut a_rx) = published(0xA1);
+    let (mut b, _b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sa = MemorySink::default();
+    with_store(&mut a, &sa);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    let _ = sent_relays(&mut a_rx);
+    // As if the hello's seal had failed before the kill: unclaimed init.
+    a.session_manager
+        .get_mut(&pb.hex)
+        .unwrap()
+        .init_out
+        .as_mut()
+        .unwrap()
+        .sent = None;
+    a.persist_peer(&pb.hex).unwrap();
+    drop(a);
+    let (mut a2, mut a2_rx, _log) = restart_from(0xA1, 0xB2, &sa);
+    assert!(a2.hello_sync_due.contains(&pb.hex), "the hello is owed");
+    a2.is_key_bundle_published = true;
+    feed(
+        &mut a2,
+        Frame::Control(ControlMessage::CircuitExists {
+            circuit_id: C1,
+            token: TOKEN.to_vec(),
+            target_circuit_id: C2,
+            is_initiator: true,
+        }),
+    );
+    if let Some(ws) = &a2.websocket {
+        ws.set_connected_for_test();
+    }
+    a2.redrive_owed_sends(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    let sent = sent_relays(&mut a2_rx);
+    assert!(!sent.is_empty(), "the hello left");
+    let b_id = b.identity.clone().unwrap();
+    let first = crate::sealed::open(
+        &b_id.public_signing_key().to_bytes(),
+        b_id.agreement_secret(),
+        &sent[0].payload,
+    )
+    .unwrap();
+    assert_eq!(first.kind, crate::session_init::SESSION_INIT_TYPE);
+    assert!(!a2.hello_sync_due.contains(&pb.hex));
+}
+
+/// Final review L7: a message that expired while it was still the payload
+/// of our unanswered session-init is not re-sent with it. The init is
+/// rebuilt around a cover message (a new hello) and the stored record
+/// drops the old payload, so neither a resume nor a restart sends the
+/// expired message again.
+#[test]
+fn forgetting_the_init_message_rebuilds_the_init_around_cover() {
+    let (mut a, mut a_rx) = published(0xA1);
+    let (mut b, _b_rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.peers.pin_card(&pb).unwrap();
+    b.peers.pin_card(&pa).unwrap();
+    let sa = MemorySink::default();
+    with_store(&mut a, &sa);
+    reestablish(&mut a, &mut b, &pa, &pb);
+    let _ = sent_relays(&mut a_rx);
+    // The init is unclaimed, and a text is the first seal: it travels as
+    // the session-init.
+    a.session_manager
+        .get_mut(&pb.hex)
+        .unwrap()
+        .init_out
+        .as_mut()
+        .unwrap()
+        .sent = None;
+    let id = push_text(&a, &pb.hex, "expires soon");
+    let init_id = |a: &ClientInner| {
+        a.session_manager
+            .get(&pb.hex)
+            .unwrap()
+            .init_out
+            .as_ref()
+            .and_then(|i| i.sent.as_ref().map(|s| (s.id, s.payload.clone())))
+    };
+    let (first, old_payload) = init_id(&a).unwrap();
+    assert_eq!(first, id, "the text is the init");
+    let _ = sent_relays(&mut a_rx);
+    a.forget_message(&hex::encode(id));
+    let (now_id, payload) = init_id(&a).expect("an init is out again");
+    assert_ne!(now_id, id, "rebuilt around another message");
+    assert_ne!(payload, old_payload);
+    assert!(!payload.is_empty());
+    let rec = open_record(&sa, 0xA1, &pb);
+    let stored = rec.session.as_ref().unwrap().init_out.as_ref().unwrap();
+    assert_ne!(stored.sent_id, Some(id), "the record no longer holds it");
+    assert_ne!(stored.sent_payload, old_payload);
 }

@@ -6,7 +6,11 @@ use tracing::{error, info, warn};
 
 mod config;
 mod decoy;
+mod decoy_render;
+#[cfg(test)]
+mod decoy_render_tests;
 mod hardening;
+mod invite;
 mod limits;
 mod metrics;
 mod privacy;
@@ -14,6 +18,7 @@ mod protocol;
 mod proxy_protocol;
 mod signaling;
 mod tls;
+mod tls_pq;
 mod validate;
 
 /// A test's scratch directory under the system temp dir, removed when the
@@ -96,17 +101,110 @@ struct Cli {
     /// version + 1), print the new pin, then exit.
     #[arg(long, conflicts_with = "print_relay_pin")]
     rotate_relay_identity: bool,
+
+    /// Print this relay's invite (an rchat://relay link with its URL and
+    /// pin) and draw it as a QR code, then exit. Run it as the service user.
+    /// The host comes from [server.decoy] host, else the first [server.acme]
+    /// domain. The invite holds the secret WebSocket path: it is printed
+    /// here only, never logged.
+    #[arg(
+        long,
+        conflicts_with_all = ["init_relay_identity", "print_relay_pin", "rotate_relay_identity", "render_decoy", "no_tls"]
+    )]
+    print_invite: bool,
+
+    /// With --print-invite: the port clients dial, overriding [server]
+    /// public_port (NAT, rdr, a jail). 443 is left out of the invite.
+    #[arg(long, value_name = "PORT", requires = "print_invite", value_parser = clap::value_parser!(u16).range(1..))]
+    public_port: Option<u16>,
+
+    /// Write this relay's static decoy website into DIR, then exit. DIR must
+    /// be empty or a directory rendered this way before. The site is chosen
+    /// from the relay identity key and the host name, so this relay always
+    /// gives the same site and nobody without the key can work it out. Run
+    /// it as the service user (it reads the identity key). Point
+    /// `[server.decoy] root` at DIR to serve it.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["init_relay_identity", "print_relay_pin", "rotate_relay_identity", "no_tls"]
+    )]
+    render_decoy: Option<PathBuf>,
+
+    /// With --render-decoy: the relay's public host name (default: from
+    /// [server.decoy] host or the first [server.acme] domain in the config).
+    #[arg(long, value_name = "HOSTNAME", requires = "render_decoy")]
+    host: Option<String>,
+}
+
+impl Cli {
+    /// A one-shot mode whose result is printed to stdout: logs go to stderr.
+    fn prints_result(&self) -> bool {
+        self.print_invite
+            || self.print_relay_pin
+            || self.init_relay_identity
+            || self.rotate_relay_identity
+            || self.render_decoy.is_some()
+    }
+}
+
+/// `--render-decoy`: render the site into `dir` and return the line to
+/// print. The seed is the relay identity's decoy seed for `host` (final
+/// review M2: `HKDF(identity secret, salt = host)`), the one the built-in
+/// page uses, so the rendered site matches what the relay would serve
+/// without a `root` and can't be computed from the host alone. The identity
+/// key at `identity_path` must exist and be readable: run it as the service
+/// user, as `--print-invite`.
+fn run_render_decoy(
+    dir: &std::path::Path,
+    host: Option<&str>,
+    identity_path: &std::path::Path,
+) -> Result<String> {
+    let fail = |e: std::io::Error| anyhow::anyhow!("--render-decoy failed: {e}");
+    let host = host
+        .map(decoy_render::normalize_host)
+        .filter(|h| !h.is_empty());
+    let seed = signaling::relay_identity_decoy_seed(identity_path, host.as_deref())?;
+    decoy_render::render_decoy_seeded(seed, dir).map_err(fail)?;
+    let source = match &host {
+        Some(h) => h.clone(),
+        None => "this relay (no host name)".to_string(),
+    };
+    let product = decoy_render::render_site_for_seed(seed).product;
+    Ok(format!(
+        "wrote a {product:?} decoy site for {source} into {}",
+        dir.display()
+    ))
+}
+
+/// `--print-invite`: the invite for this relay's configured host, path and
+/// identity key. The caller prints it; nothing here logs.
+fn run_print_invite(
+    config: &ServerConfig,
+    identity_path: &std::path::Path,
+    ansi: bool,
+) -> Result<String> {
+    let (pin, _version) = signaling::relay_identity_load(identity_path)?;
+    invite::print_invite_output(config, &pin, ansi)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // The one-shot print modes write only their result to stdout (the
+    // invite, the pin), so logs go to stderr there (round 1 M-7).
+    let writer = if cli.prints_result() {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
         .with_env_filter(&cli.log_level)
         .with_target(false)
         .with_thread_ids(true)
         .with_line_number(true)
+        .with_writer(writer)
         .init();
 
     install_panic_hook();
@@ -140,6 +238,23 @@ async fn main() -> Result<()> {
         );
     }
     let identity_path = PathBuf::from(config.relay_identity_path.clone().unwrap_or_default());
+    if let Some(dir) = &cli.render_decoy {
+        // The host: --host, else the configured host (or first ACME
+        // domain), else none. Seeded from the relay identity key with it,
+        // as the built-in page (final review M2).
+        let host = cli.host.clone().or_else(|| config.decoy_host());
+        println!(
+            "{}",
+            run_render_decoy(dir, host.as_deref(), &identity_path)?
+        );
+        return Ok(());
+    }
+    if cli.print_invite {
+        use std::io::IsTerminal;
+        let ansi = std::io::stdout().is_terminal();
+        print!("{}", run_print_invite(&config, &identity_path, ansi)?);
+        return Ok(());
+    }
     if cli.init_relay_identity || cli.print_relay_pin || cli.rotate_relay_identity {
         let (pin, version) = if cli.init_relay_identity {
             signaling::relay_identity_init(&identity_path)?
@@ -358,6 +473,7 @@ mod legacy_wipe_tests {
 mod cli_tests {
     use super::*;
     use clap::CommandFactory;
+    use sha2::Digest;
 
     #[test]
     fn version_flag_prints_the_package_version() {
@@ -371,5 +487,136 @@ mod cli_tests {
             Cli::command().get_version(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn render_decoy_flags_parse_and_conflict() {
+        let c =
+            Cli::try_parse_from(["rchat-server", "--render-decoy", "/d", "--host", "A.b"]).unwrap();
+        assert_eq!(c.render_decoy.as_deref(), Some(std::path::Path::new("/d")));
+        assert_eq!(c.host.as_deref(), Some("A.b"));
+        assert!(Cli::try_parse_from(["rchat-server", "--host", "x"]).is_err());
+        assert!(Cli::try_parse_from([
+            "rchat-server",
+            "--render-decoy",
+            "/d",
+            "--init-relay-identity"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn print_modes_log_to_stderr() {
+        for args in [
+            &["rchat-server", "--print-invite"][..],
+            &["rchat-server", "--print-relay-pin"],
+            &["rchat-server", "--init-relay-identity"],
+            &["rchat-server", "--rotate-relay-identity"],
+            &["rchat-server", "--render-decoy", "/d"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).unwrap().prints_result(),
+                "{args:?}"
+            );
+        }
+        assert!(!Cli::try_parse_from(["rchat-server"])
+            .unwrap()
+            .prints_result());
+    }
+
+    #[test]
+    fn print_invite_flag_parses_and_conflicts() {
+        let c = Cli::try_parse_from(["rchat-server", "--config", "/c", "--print-invite"]).unwrap();
+        assert!(c.print_invite);
+        let c = Cli::try_parse_from(["rchat-server", "--print-invite", "--public-port", "443"])
+            .unwrap();
+        assert_eq!(c.public_port, Some(443));
+        let cfg = ServerConfig::default().with_cli_overrides(&c);
+        assert_eq!(cfg.public_port, Some(443));
+        assert!(Cli::try_parse_from(["rchat-server", "--public-port", "443"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rchat-server", "--print-invite", "--public-port", "0"]).is_err()
+        );
+        for other in [
+            "--init-relay-identity",
+            "--print-relay-pin",
+            "--rotate-relay-identity",
+            "--no-tls",
+        ] {
+            assert!(
+                Cli::try_parse_from(["rchat-server", "--print-invite", other]).is_err(),
+                "{other}"
+            );
+        }
+    }
+
+    /// Part J: the invite carries this relay's own pin, from its identity
+    /// key; with no host configured it refuses and says to set one.
+    #[test]
+    fn print_invite_uses_the_relay_identity_and_configured_host() {
+        let t = ScratchDir::new("print-invite-cmd");
+        let key = t.join("relay_identity.key");
+        let (pin, _) = signaling::relay_identity_init(&key).unwrap();
+        let mut config = ServerConfig {
+            websocket_path: "/dummy-secret-path".into(),
+            ..ServerConfig::default()
+        };
+        config.bind_addr = "0.0.0.0:443".parse().unwrap();
+        let e = run_print_invite(&config, &key, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[server.decoy]"), "{e}");
+        config.decoy.host = Some("chat.example.com".into());
+        let out = run_print_invite(&config, &key, false).unwrap();
+        let link = out
+            .lines()
+            .find(|l| l.starts_with("rchat://relay?"))
+            .expect("link line");
+        let parsed = rchat_core::invite::parse_invite(link).unwrap();
+        assert_eq!(parsed.pin, pin);
+        assert_eq!(parsed.url, "wss://chat.example.com/dummy-secret-path");
+        assert!(out.contains(invite::SENSITIVITY));
+        assert!(out.contains('▀') || out.contains('▄'), "a QR block");
+        // No key: refused, as --print-relay-pin is.
+        assert!(run_print_invite(&config, &t.join("missing.key"), false).is_err());
+    }
+
+    /// Final review M2: `--render-decoy` always loads the relay identity and
+    /// seeds from its secret and the host, exactly as the built-in page
+    /// does; a host alone (public) no longer determines the site.
+    #[test]
+    fn render_decoy_command_seeds_from_the_identity_and_host_and_refuses_foreign_dirs() {
+        let t = ScratchDir::new("render-decoy-cmd");
+        let key = t.join("relay_identity.key");
+        signaling::relay_identity_init(&key).unwrap();
+        let index = |dir: &str| std::fs::read(t.join(dir).join("index.html")).unwrap();
+        let built_in = |host: Option<&str>| {
+            let seed = signaling::relay_identity_decoy_seed(&key, host).unwrap();
+            decoy_render::render_site_for_seed(seed)
+                .get("index.html")
+                .unwrap()
+                .to_vec()
+        };
+        let msg = run_render_decoy(&t.join("a"), Some("Chat.Example.com."), &key).unwrap();
+        assert!(msg.contains("chat.example.com"), "{msg}");
+        assert_eq!(index("a"), built_in(Some("chat.example.com")));
+        let public_only = decoy_render::render_site_for_seed(<[u8; 32]>::from(
+            sha2::Sha256::digest(b"chat.example.com"),
+        ));
+        assert_ne!(index("a"), public_only.get("index.html").unwrap());
+        // No host: the identity seed alone, and it matches the built-in site.
+        run_render_decoy(&t.join("b"), None, &key).unwrap();
+        assert_eq!(index("b"), built_in(None));
+        // No identity key: refused, with or without a host; nothing written.
+        let missing = t.join("missing.key");
+        assert!(run_render_decoy(&t.join("n"), None, &missing).is_err());
+        assert!(run_render_decoy(&t.join("n"), Some("h.example.com"), &missing).is_err());
+        assert!(!t.join("n").exists());
+        // A foreign directory is refused.
+        std::fs::create_dir(t.join("f")).unwrap();
+        std::fs::write(t.join("f/keep"), b"x").unwrap();
+        assert!(run_render_decoy(&t.join("f"), Some("h.example.com"), &key).is_err());
+        assert!(run_render_decoy(&t.join("f"), None, &key).is_err());
+        assert!(!t.join("f/index.html").exists());
     }
 }

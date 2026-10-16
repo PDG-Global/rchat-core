@@ -13,15 +13,15 @@ use crate::privacy;
 use crate::protocol::relay::{CircuitToken, RelayPacket};
 use crate::protocol::signaling::{Payload as SignalingPayload, *};
 use crate::protocol::unified::{
-    ControlErrorCode, ControlMessage, FrameBuilder, KeepaliveMessage, UnifiedFrame,
-    UnifiedFrame as Frame,
+    ControlErrorCode, ControlMessage, FrameBuilder, FrameError, KeepaliveMessage, PeerBundle,
+    UnifiedFrame, UnifiedFrame as Frame,
 };
-use crate::protocol::{validate_timestamp, CircuitId, ClientId, ErrorCode};
+use crate::protocol::{validate_timestamp, CircuitId, ClientId, ErrorCode, PROTOCOL_VERSION};
 use crate::validate;
 
 #[cfg(test)]
 use self::circuits::PendingAsk;
-use self::tags::{id_tag, IdTag, PairTag};
+use self::tags::{id_tag, BlindTag, IdTag, PairTag};
 use dashmap::DashMap;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use std::net::SocketAddr;
@@ -53,7 +53,11 @@ mod relay_identity;
 mod tags;
 
 #[cfg(test)]
+mod blind_pairing_tests;
+#[cfg(test)]
 mod circuit_race_tests;
+#[cfg(test)]
+mod client_resumption_tests;
 #[cfg(test)]
 mod inflight_salvage_tests;
 #[cfg(test)]
@@ -85,6 +89,8 @@ mod state_bounds_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+mod tls_resumption_tests;
+#[cfg(test)]
 mod unresumed_forward_tests;
 
 /// A record in a recipient's offline queue (spec §5.3, M4). Nothing names a
@@ -108,6 +114,21 @@ pub(crate) struct MessageQueue {
     pending: Vec<StoredMessage>,
     /// Bytes charged to the offline budget for the non-knock records.
     bytes: usize,
+}
+
+impl MessageQueue {
+    /// Records that are messages (knocks have their own budget).
+    fn message_count(&self) -> usize {
+        self.pending.iter().filter(|m| !m.is_knock).count()
+    }
+
+    /// Messages of exactly the steady sealed size (R26 sub-cap).
+    fn steady_sized_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|m| !m.is_knock && m.payload.len() == limits::STEADY_SEALED_LEN)
+            .count()
+    }
 }
 
 impl StoredMessage {
@@ -179,9 +200,19 @@ pub(crate) struct RelayState {
     pub(crate) circuits: Arc<DashMap<CircuitId, CircuitRoutingInfo>>,
     /// Routing slot: identity tag -> the connection proven as it (R1).
     pub(crate) identity_to_client: Arc<DashMap<IdTag, ClientId>>,
-    /// Live pairs, keyed by pair tag.
+    /// Live pairs from identity asks, keyed by pair tag.
     pub(crate) identity_pair_circuits: Arc<DashMap<PairTag, CircuitPairInfo>>,
-    /// One-sided asks, keyed by pair tag (≤ `ASK_TTL` = 540 s; gone within 600 s with the sweep).
+    /// Live pairs from blinded asks (protocol v3 §C.2), keyed by the token's
+    /// keyed tag: no identity pair is stored for them.
+    pub(crate) blind_pair_circuits: Arc<DashMap<BlindTag, BlindPairInfo>>,
+    /// Ruling R21: blinded circuits whose owning connection closed while the
+    /// row stayed (the peer was still online), by the owner's identity tag,
+    /// so the owner's next publish ends them at once. Memory only, per boot;
+    /// an entry goes with its row (teardown, sweep), so none outlives
+    /// `PAIR_ORPHAN_TTL`. It names one identity's circuits, never a pair.
+    pub(crate) departed_blind: Arc<DashMap<IdTag, Vec<CircuitId>>>,
+    /// One-sided asks, keyed by pair tag or, for blinded asks, by the token's
+    /// keyed tag (≤ `ASK_TTL` = 540 s; gone within 600 s with the sweep).
     pub(crate) pending_asks: Arc<fair_share::PendingAsks>,
     /// Circuits per identity tag and per source (R-3).
     pub(crate) circuit_counts: Arc<fair_share::CircuitCounts>,
@@ -227,6 +258,8 @@ impl RelayState {
             circuits: Arc::new(DashMap::new()),
             identity_to_client: Arc::new(DashMap::new()),
             identity_pair_circuits: Arc::new(DashMap::new()),
+            blind_pair_circuits: Arc::new(DashMap::new()),
+            departed_blind: Arc::new(DashMap::new()),
             pending_asks: Arc::new(fair_share::PendingAsks::default()),
             circuit_counts: Arc::new(fair_share::CircuitCounts::default()),
             message_queues: Arc::new(DashMap::new()),
@@ -268,8 +301,57 @@ pub(crate) struct CircuitPairInfo {
     created_at: Instant,
 }
 
+/// A live pair from a blinded match (protocol v3 §C.2). Side a is the
+/// earlier asker (the initiator). The row is keyed by the token's
+/// `BlindTag` and holds the two connection slots and their circuit ids
+/// only: no identity, no `IdTag`, no `PairTag`. A blinded pair is never
+/// resumed, so its slots never change.
+#[derive(Clone)]
+pub(crate) struct BlindPairInfo {
+    circuit_id_a: CircuitId,
+    circuit_id_b: CircuitId,
+    /// The connection of side a (owner of `circuit_id_a`) and of side b.
+    conn_a: ClientId,
+    conn_b: ClientId,
+    /// Each side's source at creation (fair shares, R-3).
+    source_a: Option<SourceKey>,
+    source_b: Option<SourceKey>,
+    /// As in `CircuitPairInfo`: the orphan and unresumed clocks.
+    orphaned_since: Option<Instant>,
+    unresumed_since: Option<Instant>,
+    created_at: Instant,
+}
+
+/// Which pair row a circuit belongs to: an identity pair (`PairTag`) or a
+/// blinded one (`BlindTag`). Never logged.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PairKey {
+    Identity(PairTag),
+    Blind(BlindTag),
+}
+
+#[cfg(test)]
+impl PairKey {
+    /// The tag's bytes, for tests that scan relay state.
+    pub(crate) fn raw(&self) -> [u8; 32] {
+        match self {
+            PairKey::Identity(p) => p.0,
+            PairKey::Blind(b) => b.0,
+        }
+    }
+}
+
+impl std::fmt::Debug for PairKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairKey(..)")
+    }
+}
+
 /// Routing for one circuit id: `client_a` owns it (received it in
-/// `CircuitCreatedV2`), `client_b` is the other member.
+/// `CircuitCreatedV3`), `client_b` is the other member. The tags name each
+/// member's identity for its offline queue and for a member that is back
+/// on a new connection; blinded circuits carry them too (see
+/// `circuits::handle_circuit_ask_blind`).
 #[derive(Clone)]
 pub(crate) struct CircuitRoutingInfo {
     client_a: ClientId,
@@ -278,7 +360,7 @@ pub(crate) struct CircuitRoutingInfo {
     tag_b: IdTag,
     token_a: CircuitToken,
     token_b: CircuitToken,
-    pair: PairTag,
+    pair: PairKey,
     /// The pair's other routing entry (the circuit id `client_b` owns), so
     /// forwarding never scans a connection's circuits (R-11).
     peer_circuit: CircuitId,
@@ -322,10 +404,12 @@ pub(crate) struct UnifiedConnection {
     /// parked. Pruned lazily against `circuits`; bounded by
     /// `max_circuits_per_connection`.
     created_circuits: std::collections::HashSet<CircuitId>,
-    /// Offline targets this connection parked state for, with the time it
-    /// did so; bounded by `max_pending_per_connection` within
+    /// Offline targets (or, for blinded asks, token tags) this connection
+    /// parked state for, with the time it did so; bounded by
+    /// `max_pending_per_connection` (identity targets) plus
+    /// `pending_blind_per_connection()` (tokens) within
     /// `PENDING_CHARGE_WINDOW`.
-    pending_charges: std::collections::VecDeque<(IdTag, Instant)>,
+    pending_charges: std::collections::VecDeque<(ChargeKey, Instant)>,
     /// 2 after a v2 hello; 0 before. Publishes need 2.
     protocol_version: u32,
     /// Unused connection-auth nonce (from hello, or the last
@@ -345,6 +429,23 @@ pub(crate) struct UnifiedConnection {
     /// is off (`max_connections_per_ip = 0` without `proxy_protocol`: behind
     /// a front end every connection has the front end's address).
     source: Option<SourceKey>,
+    /// Sent a circuit ask (blind or identity) since its publish (final
+    /// review L1). A background drain connection publishes, reads its
+    /// queue and leaves without ever asking; only a connection that asks is
+    /// the member's foreground connection. Until then the member counts as
+    /// offline for its blinded rows (R21, R18 and the sweep's 0 s grace
+    /// wait for the first ask; packets for it are queued and acknowledged),
+    /// and records salvaged or re-queued for it wait in its queue (L5).
+    /// Set once, never cleared.
+    has_asked: bool,
+    /// Bucket for blind asks under pair tokens this connection holds no
+    /// charge for (final re-review N-1 (a)); made on the first such ask
+    /// from `blind_ask_burst` and `blind_ask_refill_per_sec`.
+    blind_ask_bucket: Option<limits::AskBucket>,
+    /// The verified bundle as asks carry it, shared by every pending ask of
+    /// this connection (final re-review N-2) instead of a copy in each.
+    /// Made on the first ask after a publish; cleared by a publish.
+    peer_bundle: Option<Arc<PeerBundle>>,
 }
 
 /// (pin, version) of the identity at `path`. A missing key is an error
@@ -352,6 +453,12 @@ pub(crate) struct UnifiedConnection {
 pub fn relay_identity_load(path: &Path) -> anyhow::Result<(String, u32)> {
     let id = relay_identity::RelayIdentity::load(path)?;
     Ok((id.pin(), id.version()))
+}
+
+/// The decoy seed derived from the identity at `path` (must exist) and
+/// `host` (final review M2: the same seed the built-in page uses).
+pub fn relay_identity_decoy_seed(path: &Path, host: Option<&str>) -> anyhow::Result<[u8; 32]> {
+    Ok(relay_identity::RelayIdentity::load(path)?.decoy_seed(host))
 }
 
 /// `--init-relay-identity`: create the key once.
@@ -409,7 +516,11 @@ impl Server {
             );
         }
 
-        let decoy_config = DecoyConfig::from_settings(&config.decoy, &config.websocket_path)?;
+        let decoy_config = DecoyConfig::from_settings(
+            &config.decoy,
+            &config.websocket_path,
+            relay_identity.decoy_seed(config.decoy_host().as_deref()),
+        )?;
         // Only meaningful where the listener faces the network (TLS); the
         // --no-tls dev/proxy mode is loopback-only.
         if config.websocket_path == "/" && tls_front.is_some() {
@@ -884,6 +995,13 @@ fn sweep_stale_state(now: Instant, state: &RelayState) {
     }
 }
 
+/// Text of the `RateLimited` refusal of an ask over a pending-ask cap.
+/// Never starts with `rchat_core::protocol::OFFLINE_QUEUE_FULL_PREFIX`, so
+/// the core takes it as an ask refusal (final re-review N-3).
+pub(crate) const PENDING_REFUSAL_TEXT: &str = "Too many pending circuit requests; try again later";
+/// Text of the `RateLimited` refusal of a matching ask over a circuit cap.
+pub(crate) const CIRCUIT_REFUSAL_TEXT: &str = "Too many circuits; try again later";
+
 /// Refuse a new pending `CircuitAsk`: over the connection's
 /// `max_pending_per_connection`, over its source's `max_pending_per_source`,
 /// or with the table (`max_pending_circuit_targets`) full and no heavier
@@ -895,10 +1013,7 @@ async fn refuse_pending_target(
 ) {
     metrics::reject(metrics::REJECT_PENDING_TARGETS);
     debug!("Pending circuit target cap reached; refusing request");
-    let err = FrameBuilder::error(
-        ControlErrorCode::RateLimited,
-        "Too many pending circuit requests; try again later",
-    );
+    let err = FrameBuilder::error(ControlErrorCode::RateLimited, PENDING_REFUSAL_TEXT);
     let _ = send_frame(client_id, err, connections).await;
 }
 
@@ -907,14 +1022,43 @@ async fn refuse_pending_target(
 /// 600 s (M8).
 const PENDING_CHARGE_WINDOW: Duration = Duration::from_secs(540);
 
+/// What a pending charge is for: an identity ask's target, or a blinded
+/// ask's token tag (protocol v3 §C.2). Never logged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChargeKey {
+    Target(IdTag),
+    Blind(BlindTag),
+}
+
+impl ChargeKey {
+    fn is_blind(&self) -> bool {
+        matches!(self, ChargeKey::Blind(_))
+    }
+}
+
+#[cfg(test)]
+impl ChargeKey {
+    /// The tag's bytes, for tests that scan relay state.
+    pub(crate) fn raw(&self) -> [u8; 32] {
+        match self {
+            ChargeKey::Target(t) => t.0,
+            ChargeKey::Blind(b) => b.0,
+        }
+    }
+}
+
 /// Charge `client_id` for parking state for offline `target`. A target
 /// already charged within the window is free (client retries); otherwise at
-/// most `cap` distinct targets per window.
+/// most `cap` distinct targets of `target`'s kind (identity targets, or
+/// blind tokens) per window, and a new blind token also takes a token from
+/// the connection's bucket (`rate`: burst, refill per second; final
+/// re-review N-1 (a)).
 fn charge_pending(
     connections: &DashMap<ClientId, UnifiedConnection>,
     client_id: ClientId,
-    target: IdTag,
+    target: ChargeKey,
     cap: usize,
+    rate: Option<(u32, u32)>,
 ) -> PendingCharge {
     let Some(mut conn) = connections.get_mut(&client_id) else {
         return PendingCharge::Refused;
@@ -930,8 +1074,23 @@ fn charge_pending(
     if conn.pending_charges.iter().any(|(t, _)| *t == target) {
         return PendingCharge::Existing;
     }
-    if conn.pending_charges.len() >= cap {
+    // Identity and blind charges have separate caps (final review M1).
+    let same_kind = conn
+        .pending_charges
+        .iter()
+        .filter(|(t, _)| t.is_blind() == target.is_blind())
+        .count();
+    if same_kind >= cap {
         return PendingCharge::Refused;
+    }
+    if let Some((burst, per_sec)) = rate {
+        let bucket = conn
+            .blind_ask_bucket
+            .get_or_insert_with(|| limits::AskBucket::new_at(burst, per_sec, now));
+        if !bucket.try_take_at(now) {
+            metrics::reject(metrics::REJECT_BLIND_ASK_RATE);
+            return PendingCharge::Refused;
+        }
     }
     conn.pending_charges.push_back((target, now));
     PendingCharge::New
@@ -952,7 +1111,7 @@ enum PendingCharge {
 fn uncharge_pending(
     connections: &DashMap<ClientId, UnifiedConnection>,
     client_id: ClientId,
-    target: IdTag,
+    target: ChargeKey,
 ) {
     if let Some(mut conn) = connections.get_mut(&client_id) {
         if conn
@@ -962,6 +1121,18 @@ fn uncharge_pending(
         {
             conn.pending_charges.pop_back();
         }
+    }
+}
+
+/// Remove `client_id`'s charge for `target`, wherever it is in its list
+/// (a replayed blind ask moved to another connection).
+fn discharge_pending(
+    connections: &DashMap<ClientId, UnifiedConnection>,
+    client_id: ClientId,
+    target: ChargeKey,
+) {
+    if let Some(mut conn) = connections.get_mut(&client_id) {
+        conn.pending_charges.retain(|(t, _)| *t != target);
     }
 }
 
@@ -1039,20 +1210,33 @@ fn evict_for(state: &RelayState, sides: [fair_share::Side; 2]) -> bool {
     if held <= own {
         return false;
     }
-    let newest = state
+    let of_victim =
+        |a: Option<SourceKey>, b: Option<SourceKey>| a == Some(victim) || b == Some(victim);
+    let newest_identity = state
         .identity_pair_circuits
         .iter()
-        .filter(|p| p.source_a == Some(victim) || p.source_b == Some(victim))
+        .filter(|p| of_victim(p.source_a, p.source_b))
         .max_by_key(|p| p.created_at)
-        .map(|p| *p.key());
-    let Some(pair) = newest else {
+        .map(|p| (p.created_at, PairKey::Identity(*p.key())));
+    let newest_blind = state
+        .blind_pair_circuits
+        .iter()
+        .filter(|p| of_victim(p.source_a, p.source_b))
+        .max_by_key(|p| p.created_at)
+        .map(|p| (p.created_at, PairKey::Blind(*p.key())));
+    let newest = newest_identity
+        .into_iter()
+        .chain(newest_blind)
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, key)| key);
+    let Some(key) = newest else {
         return false;
     };
     // Never wait for another pair's lock while holding the caller's.
-    let Some(_guard) = pair_lock::PAIR_LOCKS.try_lock(pair) else {
+    let Some(_guard) = circuits::try_lock_pair(key) else {
         return false;
     };
-    circuits::teardown_pair(pair, state, None);
+    circuits::teardown_key(key, state, None);
     metrics::reject(metrics::REJECT_CIRCUIT_EVICTED);
     debug!("Circuit table full; evicted the heaviest source's newest pair");
     state.circuits.len() + 2 <= state.config.max_circuits
@@ -1073,10 +1257,7 @@ fn record_created_circuit(
 async fn refuse_circuit(client_id: ClientId, connections: &DashMap<ClientId, UnifiedConnection>) {
     metrics::reject(metrics::REJECT_CIRCUIT_CAP);
     debug!("Circuit cap reached; refusing CircuitAsk");
-    let err = FrameBuilder::error(
-        ControlErrorCode::RateLimited,
-        "Too many circuits; try again later",
-    );
+    let err = FrameBuilder::error(ControlErrorCode::RateLimited, CIRCUIT_REFUSAL_TEXT);
     let _ = send_frame(client_id, err, connections).await;
 }
 
@@ -1329,6 +1510,9 @@ where
             closing: false,
             auth_budget: crate::limits::AuthBudget::new(Instant::now()),
             source,
+            has_asked: false,
+            blind_ask_bucket: None,
+            peer_bundle: None,
         },
     );
 
@@ -1577,6 +1761,17 @@ where
                                 debug!("Frame handling error: {}", e);
                             }
                         }
+                        Err(FrameError::UnknownFrameType(_)) => {
+                            // An unknown prefix (0x05 is reserved for future
+                            // media, protocol v3 §9a) is refused and the
+                            // connection closed; nothing reaches a handler.
+                            metrics::reject(metrics::REJECT_UNKNOWN_FRAME);
+                            debug!("Unknown frame type; closing");
+                            if let Some(mut conn) = connections.get_mut(&client_id) {
+                                conn.closing = true;
+                                let _ = conn.ws_tx.send(Message::Close(None));
+                            }
+                        }
                         Err(e) => {
                             // PRIVACY: never log the frame bytes themselves.
                             debug!("Failed to decode frame: {}", e.kind());
@@ -1719,10 +1914,11 @@ fn salvageable(msg: &Message, enqueued_at: u64) -> Option<StoredMessage> {
         Ok(UnifiedFrame::Relay(packet)) => (packet.payload, false),
         Ok(UnifiedFrame::Control(ControlMessage::QueuedMessage { payload })) => {
             // Knocks reach a recipient as `QueuedMessage` records too;
-            // they are exactly `KNOCK_BYTES` of sealed v2. Delivery is
-            // the same either way; only the accounting differs.
+            // they are exactly `KNOCK_BYTES` of knock v3 (version byte
+            // 0x03, §A.5). Delivery is the same either way; only the
+            // accounting differs.
             let knock = payload.len() == validate::KNOCK_BYTES
-                && payload.first() == Some(&validate::SEALED_V2);
+                && payload.first() == Some(&validate::KNOCK_VERSION);
             (payload, knock)
         }
         _ => return None,
@@ -1750,6 +1946,17 @@ fn salvageable(msg: &Message, enqueued_at: u64) -> Option<StoredMessage> {
 /// a repeated envelope id (D35). What the socket accepted in full and the
 /// peer never read is beyond the relay's sight; the client's end-to-end
 /// receipts still show it undelivered.
+///
+/// Post-marker window (final review L5). A record handed to the member's
+/// other connection after that connection's `QueueHandedOver` marker can
+/// be lost the same way if that connection is about to close: a background
+/// drain ends on the marker (plus a short grace) and may never read what
+/// follows. So records go at once only to a connection that has asked
+/// (`is_foreground`, which drains never are); otherwise they wait in the
+/// queue for the next publish or the foreground connection's first ask
+/// (`note_first_ask`). What remains: a foreground connection that is
+/// closing without the relay knowing yet (its Close not yet read) may
+/// still be handed records it never reads, as above.
 async fn salvage_unsent(
     in_flight: Option<limits::Outbound>,
     mut rx: tokio::sync::mpsc::Receiver<limits::Outbound>,
@@ -1783,7 +1990,17 @@ async fn salvage_unsent(
             dropped
         );
     }
-    let live = state.identity_to_client.get(&tag).map(|c| *c);
+    // Final review L5: handed over at once only to a connection that has
+    // asked (`is_foreground`). A background drain may already have read
+    // its `QueueHandedOver` marker and be closing: a record written to it
+    // now could be accepted by its socket and never read. Otherwise the
+    // records wait in the queue for the member's next publish or its
+    // foreground connection's first ask.
+    let live = state
+        .identity_to_client
+        .get(&tag)
+        .map(|c| *c)
+        .filter(|c| is_foreground(*c, state));
     let backlog = live.and_then(|_| take_offline_queue(tag, state));
     drop(guard);
     // Re-queued (or dropped by admission): their outbound share goes back.
@@ -1799,15 +2016,30 @@ async fn salvage_unsent(
 /// (its budget and caps). Admitted messages go to the front of the queue,
 /// older first. Returns how many records were dropped. Called under
 /// `tag`'s `ID_LOCKS` guard.
+///
+/// The R26 steady-size sub-cap is weighed per record (final review L3) but
+/// never refuses one here: every salvaged record was already acknowledged
+/// to its sender (a relay packet) or taken from the queue (a stored
+/// record), so a refusal would lose a message that may be real with no one
+/// told; steady-sized cover and real messages look the same to the relay.
+/// A record over the sub-cap is kept and counted
+/// (`rchat_salvaged_over_steady_subcap_total`). The overshoot is bounded by
+/// what one salvage can carry (one connection's outbound queue), the
+/// queue's byte and count caps still apply to it, and while the queue is
+/// over the sub-cap new steady-sized records are refused at
+/// `store_offline` as before, so R26's purpose (cover cannot crowd real
+/// messages out of a recipient's queue) holds for every record not yet
+/// acknowledged.
 fn requeue_salvaged(tag: IdTag, msgs: Vec<StoredMessage>, state: &RelayState) -> usize {
-    let (mut bytes, mut count) = state
+    let (mut bytes, mut count, mut steady_sized) = state
         .message_queues
         .get(&tag)
-        .map(|q| (q.bytes, q.pending.iter().filter(|m| !m.is_knock).count()))
-        .unwrap_or((0, 0));
+        .map(|q| (q.bytes, q.message_count(), q.steady_sized_count()))
+        .unwrap_or((0, 0, 0));
     let mut admitted = Vec::new();
     let mut charged = 0usize;
     let mut dropped = 0usize;
+    let mut over_sub_cap = 0u64;
     for m in msgs {
         if m.is_knock {
             state.knocks.enqueue(
@@ -1823,6 +2055,12 @@ fn requeue_salvaged(tag: IdTag, msgs: Vec<StoredMessage>, state: &RelayState) ->
         let cost = m.budget_cost();
         match state.offline_budget.try_reserve(bytes, count, cost) {
             Ok(()) => {
+                if !limits::steady_sized_admits(steady_sized, m.payload.len()) {
+                    over_sub_cap += 1;
+                }
+                if m.payload.len() == limits::STEADY_SEALED_LEN {
+                    steady_sized += 1;
+                }
                 bytes += cost;
                 count += 1;
                 charged += cost;
@@ -1833,6 +2071,13 @@ fn requeue_salvaged(tag: IdTag, msgs: Vec<StoredMessage>, state: &RelayState) ->
                 dropped += 1;
             }
         }
+    }
+    if over_sub_cap > 0 {
+        metrics::SALVAGED_OVER_STEADY_SUBCAP.inc_by(over_sub_cap);
+        debug!(
+            "Kept {} salvaged steady-sized records over the steady-size sub-cap",
+            over_sub_cap
+        );
     }
     if !admitted.is_empty() {
         state
@@ -2003,8 +2248,8 @@ async fn handle_signaling_message(
                 .deserialize_data::<HelloPayload>()
                 .map(|h| h.supported_versions)
                 .unwrap_or_default();
-            if !offered.contains(&2) {
-                debug!("Hello without protocol v2; closing");
+            if !offered.contains(&PROTOCOL_VERSION) {
+                debug!("Hello without protocol v3; closing");
                 if let Some(mut conn) = connections.get_mut(&client_id) {
                     conn.closing = true;
                     let reply = key_auth::error_signal(
@@ -2021,7 +2266,7 @@ async fn handle_signaling_message(
             let nonce = key_auth::new_nonce();
             let mut binding = [0u8; 32];
             if let Some(mut conn) = connections.get_mut(&client_id) {
-                conn.protocol_version = 2;
+                conn.protocol_version = PROTOCOL_VERSION;
                 conn.auth_nonce = Some(nonce);
                 binding = conn.channel_binding;
             }
@@ -2031,7 +2276,7 @@ async fn handle_signaling_message(
                 SignalingPayload::new(
                     MSG_TYPE_HELLO_RESPONSE,
                     HelloResponsePayload {
-                        selected_version: 2,
+                        selected_version: PROTOCOL_VERSION,
                         server_info: ServerInfo {
                             version: env!("CARGO_PKG_VERSION").to_string(),
                             capabilities: vec![
@@ -2094,6 +2339,7 @@ async fn handle_signaling_message(
                 // Replacing the nonce consumes the one just used.
                 conn.auth_nonce = Some(next_challenge);
                 conn.key_bundle = Some(key_auth::key_bundle_hex(&verified.bundle));
+                conn.peer_bundle = None;
                 conn.proven_identity = Some(verified.identity);
                 conn.identified = true;
                 conn.identity_key = Some(hex::encode(verified.identity));
@@ -2135,6 +2381,14 @@ async fn handle_signaling_message(
             if let Some(queue) = backlog {
                 drain_offline_queue(client_id, tag, queue, state).await;
             }
+            // R34a: the queue (possibly empty) is handed over. Same channel,
+            // after every queued record, so a client that sees the marker has
+            // read everything the queue held (a background drain ends on it).
+            send_queue_handed_over(client_id, state).await;
+            // R21's teardown of the member's departed blinded rows waits
+            // for this connection's first ask (final review L1,
+            // `note_first_ask`): a background drain publishes and never
+            // asks, so it must not end rows it will never re-pair.
         }
         MSG_TYPE_LOOKUP_KEY_BUNDLE => {
             // Return not found for now
@@ -2388,9 +2642,29 @@ async fn handle_relay_packet(
         "Target {} is not reachable on its slot; forwarding or storing",
         privacy::tag(target_id.as_ref())
     );
-    match forward_to_live_identity(target_tag, target_id, &packet.payload, state).await {
+    // Ruling R15 (c) / R18: a blinded circuit is never handed over to its
+    // member's new connection (no D34): a member that reconnected re-pairs
+    // under a new token. Offline, the packet is filed in its queue; live
+    // elsewhere, the row ends and the sender gets `CircuitNotFound`.
+    let hand_over = matches!(routing.pair, PairKey::Identity(_));
+    match forward_to_live_identity(target_tag, target_id, &packet.payload, hand_over, state).await {
         ForwardOutcome::Forwarded | ForwardOutcome::Queued => {
             send_message_ack(from, &message_id, connections)
+        }
+        ForwardOutcome::Moved => {
+            // R18: no ack (the core keeps the message tracked and re-sends
+            // it on the re-paired session); the blinded row goes now and the
+            // sender is told its circuit is gone.
+            circuits::teardown_moved_blind(packet.circuit_id, state).await;
+            let error_msg = FrameBuilder::error(
+                ControlErrorCode::CircuitNotFound,
+                format!(
+                    "{}{}",
+                    rchat_core::protocol::CIRCUIT_NOT_FOUND_PREFIX,
+                    hex::encode(packet.circuit_id.as_ref())
+                ),
+            );
+            let _ = send_frame(from, error_msg, connections).await;
         }
         ForwardOutcome::Refused => {
             // Only members of a circuit (accepted contacts) can get here.
@@ -2399,7 +2673,8 @@ async fn handle_relay_packet(
             let error_msg = FrameBuilder::error(
                 ControlErrorCode::RateLimited,
                 format!(
-                    "Offline queue full; message {} not stored",
+                    "{}message {} not stored",
+                    rchat_core::protocol::OFFLINE_QUEUE_FULL_PREFIX,
                     validate::prefix(&message_id, 8)
                 ),
             );
@@ -2419,6 +2694,9 @@ enum ForwardOutcome {
     Queued,
     /// Admission refused; the caller sends the queue-full error.
     Refused,
+    /// Blinded circuit only (R18): the member is live on another
+    /// connection. Nothing was stored; the caller ends the row.
+    Moved,
 }
 
 /// D34: the decision is made under `ID_LOCKS(target_tag)`, the lock publish
@@ -2430,6 +2708,7 @@ async fn forward_to_live_identity(
     target_tag: IdTag,
     slot_client: ClientId,
     payload: &[u8],
+    hand_over: bool,
     state: &RelayState,
 ) -> ForwardOutcome {
     let guard = pair_lock::ID_LOCKS.lock(target_tag).await;
@@ -2438,7 +2717,27 @@ async fn forward_to_live_identity(
         .get(&target_tag)
         .map(|c| *c)
         .filter(|c| *c != slot_client)
-        .and_then(|c| state.connections.get(&c).map(|conn| conn.ws_tx.clone()));
+        .and_then(|c| {
+            state
+                .connections
+                .get(&c)
+                .map(|conn| (conn.ws_tx.clone(), conn.has_asked))
+        });
+    // R15 (c) / R18: a blinded circuit is never handed over. With its
+    // member live elsewhere (decided under the lock) the row must end;
+    // with the member offline the packet is filed as for identity pairs.
+    // Final review L1: a member live only on a connection that has not
+    // asked (a background drain, or a foreground one before its first
+    // ask) counts as offline: the packet is filed and acknowledged, and
+    // the first ask hands it over (`note_first_ask`).
+    let live = match live {
+        Some((_, false)) if !hand_over => None,
+        other => other.map(|(tx, _)| tx),
+    };
+    if !hand_over && live.is_some() {
+        drop(guard);
+        return ForwardOutcome::Moved;
+    }
     // Final review L-2: a queue with no room gets the same answer whether
     // B is offline or online without having resumed (the queue-full
     // error), so a full queue reveals no presence. Decided under the lock.
@@ -2450,12 +2749,14 @@ async fn forward_to_live_identity(
             knock_seq: 0,
         }
         .budget_cost();
-        let (bytes, count) = state
+        let (bytes, count, steady_sized) = state
             .message_queues
             .get(&target_tag)
-            .map(|q| (q.bytes, q.pending.iter().filter(|m| !m.is_knock).count()))
-            .unwrap_or((0, 0));
-        if !state.offline_budget.would_admit(bytes, count, cost) {
+            .map(|q| (q.bytes, q.message_count(), q.steady_sized_count()))
+            .unwrap_or((0, 0, 0));
+        if !state.offline_budget.would_admit(bytes, count, cost)
+            || !limits::steady_sized_admits(steady_sized, payload.len())
+        {
             drop(guard);
             metrics::reject(metrics::REJECT_QUEUE_OVERFLOW);
             debug!("Offline queue full; refusing message");
@@ -2506,7 +2807,13 @@ async fn requeue_after_failed_forward(
         knock_seq: 0,
     };
     let dropped = requeue_salvaged(target_tag, vec![msg], state);
-    let live = state.identity_to_client.get(&target_tag).map(|c| *c);
+    // As in `salvage_unsent` (final review L5): only to a foreground
+    // connection; otherwise the next publish or first ask takes it.
+    let live = state
+        .identity_to_client
+        .get(&target_tag)
+        .map(|c| *c)
+        .filter(|c| is_foreground(*c, state));
     let backlog = live.and_then(|_| take_offline_queue(target_tag, state));
     drop(guard);
     if let (Some(client), Some(queue)) = (live, backlog) {
@@ -2540,11 +2847,18 @@ fn store_offline(tag: IdTag, payload: Vec<u8>, state: &RelayState) -> bool {
 
     let admitted = {
         let mut queue = message_queues.entry(tag).or_default();
-        let messages = queue.pending.iter().filter(|m| !m.is_knock).count();
-        match state
-            .offline_budget
-            .try_reserve(queue.bytes, messages, cost)
-        {
+        let messages = queue.message_count();
+        let steady_ok =
+            limits::steady_sized_admits(queue.steady_sized_count(), stored_msg.payload.len());
+        // R26: over the steady-size sub-cap reads as a full queue.
+        let reserved = if steady_ok {
+            state
+                .offline_budget
+                .try_reserve(queue.bytes, messages, cost)
+        } else {
+            Err(limits::OfflineRejection::RecipientFull)
+        };
+        match reserved {
             Ok(()) => {
                 queue.bytes += cost;
                 queue.pending.push(stored_msg);
@@ -2633,6 +2947,16 @@ async fn drain_offline_queue(
             undelivered.len()
         );
         requeue_offline(tag, undelivered, state);
+    }
+}
+
+/// Tell `client_id` its queue has been handed over (protocol v3 §H.1,
+/// ruling R34a). Best effort: a connection that can't take it is going.
+async fn send_queue_handed_over(client_id: ClientId, state: &RelayState) {
+    let tx = state.connections.get(&client_id).map(|c| c.ws_tx.clone());
+    if let Some(tx) = tx {
+        let frame = FrameBuilder::queue_handed_over().encode();
+        let _ = tx.send_wait(frame, limits::OUTBOUND_SEND_TIMEOUT).await;
     }
 }
 
@@ -2738,6 +3062,15 @@ pub(crate) fn extract_message_id(payload: &[u8]) -> Option<String> {
 /// Handle a control message
 async fn handle_control_message(client_id: ClientId, msg: ControlMessage, state: &RelayState) {
     let connections = &state.connections;
+    // Protocol v3 §C.2: only a proven connection may send a blinded ask.
+    // Checked first, before the message is parsed further or anything is
+    // stored (Task 3 review M5).
+    if matches!(msg, ControlMessage::CircuitAskBlind { .. })
+        && !circuits::is_proven(client_id, state)
+    {
+        circuits::refuse_unproven_blind(client_id, state).await;
+        return;
+    }
     // Validate client-supplied keys and ids at the boundary. Refused with an
     // error frame that does not echo the input; nothing is stored.
     if let Err(reason) = validate::control(&msg) {
@@ -2747,17 +3080,28 @@ async fn handle_control_message(client_id: ClientId, msg: ControlMessage, state:
         return;
     }
 
+    if matches!(
+        msg,
+        ControlMessage::CircuitAsk { .. } | ControlMessage::CircuitAskBlind { .. }
+    ) {
+        note_first_ask(client_id, state).await;
+    }
+
     match msg {
         ControlMessage::CircuitAsk {
             target_identity,
             ephemeral_key,
+            kem_ephemeral_pk,
+            ephemeral_sig,
             knock,
             resume_circuit,
         } => {
             // Lengths were checked by `validate::control`.
-            let (Ok(target), Ok(ephemeral)) = (
+            let (Ok(target), Ok(ephemeral), Ok(kem), Ok(sig)) = (
                 <[u8; 32]>::try_from(target_identity.as_slice()),
                 <[u8; 32]>::try_from(ephemeral_key.as_slice()),
+                <circuits::KemEphemeral>::try_from(kem_ephemeral_pk.as_slice()),
+                <[u8; crate::validate::ASK_EPH_SIG_BYTES]>::try_from(ephemeral_sig.as_slice()),
             ) else {
                 return;
             };
@@ -2765,6 +3109,7 @@ async fn handle_control_message(client_id: ClientId, msg: ControlMessage, state:
                 client_id,
                 target,
                 ephemeral,
+                Box::new(circuits::AskEphemerals { kem, sig }),
                 knock,
                 normalize_resume(resume_circuit),
                 state,
@@ -2774,8 +3119,81 @@ async fn handle_control_message(client_id: ClientId, msg: ControlMessage, state:
         ControlMessage::CloseCircuit { circuit_id } => {
             circuits::handle_close_circuit(client_id, circuit_id, state).await;
         }
+        ControlMessage::CircuitAskBlind {
+            pair_token,
+            ephemeral_key,
+            kem_ephemeral_pk,
+            ephemeral_sig,
+            pad: _,
+        } => {
+            // Lengths were checked by `validate::control`.
+            let (Ok(token), Ok(ephemeral), Ok(kem), Ok(sig)) = (
+                <[u8; 32]>::try_from(pair_token.as_slice()),
+                <[u8; 32]>::try_from(ephemeral_key.as_slice()),
+                <circuits::KemEphemeral>::try_from(kem_ephemeral_pk.as_slice()),
+                <[u8; crate::validate::ASK_EPH_SIG_BYTES]>::try_from(ephemeral_sig.as_slice()),
+            ) else {
+                return;
+            };
+            circuits::handle_circuit_ask_blind(
+                client_id,
+                token,
+                ephemeral,
+                Box::new(circuits::AskEphemerals { kem, sig }),
+                state,
+            )
+            .await;
+        }
         _ => {}
     }
+}
+
+/// Final review L1: the first ask (blind or identity) on a proven
+/// connection marks it as the member's foreground connection. Then, before
+/// the ask itself is handled and before any pair or token lock is taken
+/// (lock order: `ID_LOCKS` first), the member's offline queue filled since
+/// its publish (packets for its blinded rows while it counted as offline,
+/// records salvaged from its old connection) is handed over, and R21 ends
+/// its blinded rows whose slot is still a closed connection, so the peers
+/// that stayed are told `CircuitClosed` and re-ask blind. A background
+/// drain connection never asks, so it never triggers either.
+async fn note_first_ask(client_id: ClientId, state: &RelayState) {
+    let tag = {
+        let Some(mut conn) = state.connections.get_mut(&client_id) else {
+            return;
+        };
+        let Some(identity) = conn.proven_identity else {
+            return;
+        };
+        if conn.has_asked {
+            return;
+        }
+        // Set before the queue is taken below: a packet decided after this
+        // sees a foreground member; one decided before was queued under the
+        // identity lock and is taken here.
+        conn.has_asked = true;
+        id_tag(&identity)
+    };
+    let guard = pair_lock::ID_LOCKS.lock(tag).await;
+    let mapped = state
+        .identity_to_client
+        .get(&tag)
+        .is_some_and(|c| *c == client_id);
+    let backlog = mapped.then(|| take_offline_queue(tag, state)).flatten();
+    drop(guard);
+    if let Some(queue) = backlog {
+        drain_offline_queue(client_id, tag, queue, state).await;
+    }
+    circuits::end_departed_blind_rows(tag, client_id, state).await;
+}
+
+/// Whether `client_id` is a live connection that has asked (its member's
+/// foreground connection, `has_asked`) and is not being refused.
+pub(super) fn is_foreground(client_id: ClientId, state: &RelayState) -> bool {
+    state
+        .connections
+        .get(&client_id)
+        .is_some_and(|c| c.has_asked && !c.closing)
 }
 
 /// Handle a keepalive message

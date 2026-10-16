@@ -11,8 +11,9 @@
 pub const DK_DOMAIN: &[u8; 20] = b"rchat/device-key/v1\0";
 /// Domain of the device key's signature over a session notice (D45).
 pub const NOTICE_SIG_DOMAIN: &[u8; 24] = b"rchat/session-notice/v1\0";
-/// Domain of the hash that binds a notice signature to one session (D45).
-const SESSION_BINDING_DOMAIN: &[u8; 25] = b"rchat/session-binding/v1\0";
+/// Domain of the hash that binds a notice signature to one session (D45;
+/// v3 since protocol v3, §A.3: SK now comes from X3DH v3).
+pub const SESSION_BINDING_DOMAIN: &[u8; 25] = b"rchat/session-binding/v3\0";
 
 /// A contact's device key as pinned from their scanned card (D44): the
 /// SEC1 uncompressed P-256 public key and whether it lives in secure hardware.
@@ -31,8 +32,8 @@ pub trait DeviceSigner: Send + Sync {
     fn sign(&self, msg: &[u8]) -> Option<[u8; 64]>;
 }
 
-/// `SHA-256("rchat/session-binding/v1\0" || SK)`, where SK is the session's
-/// X3DH v2 output. A hash, never SK itself: it is persisted with the session.
+/// `SHA-256("rchat/session-binding/v3\0" || SK)`, where SK is the session's
+/// X3DH v3 output (§A.3). A hash, never SK itself: it is persisted with the session.
 pub fn session_binding(sk: &[u8; 32]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -222,7 +223,7 @@ mod tests {
     fn session_binding_is_a_domain_separated_hash() {
         use sha2::{Digest, Sha256};
         let mut expected = Sha256::new();
-        expected.update(b"rchat/session-binding/v1\0");
+        expected.update(b"rchat/session-binding/v3\0");
         expected.update([7u8; 32]);
         let expected: [u8; 32] = expected.finalize().into();
         assert_eq!(session_binding(&[7; 32]), expected);

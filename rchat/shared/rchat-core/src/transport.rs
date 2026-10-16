@@ -6,7 +6,10 @@
 //! - Delivery confirmation tracking
 //! - Half-open connection detection
 
-use crate::tls_boring::{connect_with_fingerprint, BoringTlsStream, TlsFingerprint};
+use crate::tls_boring::{
+    connect_resumable, connect_with_fingerprint, BoringTlsStream, TlsFingerprint,
+};
+use crate::tls_resumption::ResumptionStore;
 use crate::{protocol::*, RChatError};
 use futures::{SinkExt, StreamExt};
 use std::pin::Pin;
@@ -170,6 +173,9 @@ pub struct TransportConfig {
     pub reconnect_max_attempts_after_connect: u32,
     /// `ws://` only: origin whose hash stands in for the channel binding.
     pub dev_origin: Option<String>,
+    /// `wss://` only: TLS 1.3 tickets for the pinned relay (spec §D.1),
+    /// owned by the client. None: every handshake is a full one.
+    pub resumption: Option<ResumptionStore>,
 }
 
 impl Default for TransportConfig {
@@ -186,6 +192,7 @@ impl Default for TransportConfig {
             auto_reconnect: true,
             reconnect_max_attempts_after_connect: 0,
             dev_origin: None,
+            resumption: None,
         }
     }
 }
@@ -194,7 +201,8 @@ impl Default for TransportConfig {
 /// sink (`set_event_sink`).
 #[derive(Debug)]
 pub enum TransportEvent {
-    Frame(Frame),
+    /// Boxed: v3 control frames (`CircuitCreatedV3`) make `Frame` large.
+    Frame(Box<Frame>),
     Binary(Vec<u8>),
     Disconnected,
     Reconnected,
@@ -203,7 +211,7 @@ pub enum TransportEvent {
 /// Internal message for the event loop
 #[derive(Debug)]
 pub enum InternalMessage {
-    Frame(Frame),
+    Frame(Box<Frame>),
     Binary(Vec<u8>),
     Disconnect,
 }
@@ -247,6 +255,9 @@ pub struct WebSocketClient {
     reconnect_watcher_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Key-authentication channel binding of the current connection.
     channel_binding: Arc<parking_lot::Mutex<Option<[u8; 32]>>>,
+    /// The live socket's byte clock (protocol v3 §H.1, R34a): a background
+    /// drain's fallback end counts bytes, never only whole frames.
+    read_clock: Arc<parking_lot::Mutex<Option<ReadClock>>>,
     /// Bounded queue for connection events (C-9). When set, the reader
     /// waits for room instead of calling the frame/binary/disconnect/
     /// reconnect callbacks, so a slow consumer stops the socket being read
@@ -292,6 +303,7 @@ impl WebSocketClient {
             reconnect_callback: Arc::new(RwLock::new(None)),
             reconnect_watcher_handle: Arc::new(RwLock::new(None)),
             channel_binding: Arc::new(parking_lot::Mutex::new(None)),
+            read_clock: Arc::new(parking_lot::Mutex::new(None)),
             event_sink: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -457,6 +469,7 @@ impl WebSocketClient {
             reconnect_callback: self.reconnect_callback.clone(),
             reconnect_watcher_handle: Arc::new(RwLock::new(None)),
             channel_binding: self.channel_binding.clone(),
+            read_clock: self.read_clock.clone(),
             event_sink: self.event_sink.clone(),
         };
 
@@ -598,10 +611,20 @@ impl WebSocketClient {
 
         // Establish TLS if needed, then perform WebSocket handshake
         let (stream, binding) = if is_wss {
-            // Use BoringSSL with Chrome fingerprint for DPI evasion
+            // BoringSSL; with a store, a ticket for the pinned relay is
+            // offered and fresh ones kept (a refused ticket: full handshake).
+            let fingerprint = self.config.tls_fingerprint;
+            let handshake = async {
+                match &self.config.resumption {
+                    Some(store) => {
+                        connect_resumable(tcp_stream, host, port, fingerprint, store).await
+                    }
+                    None => connect_with_fingerprint(tcp_stream, host, fingerprint, None).await,
+                }
+            };
             let tls_stream = timeout(
                 Duration::from_secs(self.config.connection_timeout_secs),
-                connect_with_fingerprint(tcp_stream, host, self.config.tls_fingerprint, None),
+                handshake,
             )
             .await
             .map_err(|_| RChatError::ConnectionFailed {
@@ -676,6 +699,7 @@ impl WebSocketClient {
         let last_received = self.last_received.clone();
         // Bytes arriving count as liveness, not only complete messages.
         let read_clock = ws_stream.get_ref().read_clock();
+        *self.read_clock.lock() = Some(read_clock.clone());
         let message_callback = self.message_callback.clone();
         let binary_callback = self.binary_callback.clone();
         let disconnect_callback = self.disconnect_callback.clone();
@@ -760,7 +784,7 @@ impl WebSocketClient {
 
                                     // Notify the consumer (waits for room in the sink).
                                     if let Some(sink) = &event_sink {
-                                        if sink.send(TransportEvent::Frame(frame)).await.is_err() {
+                                        if sink.send(TransportEvent::Frame(Box::new(frame))).await.is_err() {
                                             break;
                                         }
                                     } else if let Some(cb) = message_callback.read().await.as_ref() {
@@ -787,7 +811,7 @@ impl WebSocketClient {
                                 if let Ok(signaling) = serde_json::from_str::<crate::protocol::SignalingMessage>(&text) {
                                     let frame = Frame::Signaling(signaling);
                                     if let Some(sink) = &event_sink {
-                                        if sink.send(TransportEvent::Frame(frame)).await.is_err() {
+                                        if sink.send(TransportEvent::Frame(Box::new(frame))).await.is_err() {
                                             break;
                                         }
                                     } else if let Some(cb) = message_callback.read().await.as_ref() {
@@ -969,7 +993,6 @@ impl WebSocketClient {
     pub fn channel_binding(&self) -> Option<[u8; 32]> {
         *self.channel_binding.lock()
     }
-
     #[cfg(test)]
     pub(crate) fn set_channel_binding_for_test(&self, b: Option<[u8; 32]>) {
         *self.channel_binding.lock() = b;
@@ -1040,6 +1063,12 @@ impl WebSocketClient {
         if let Some(handle) = self.reconnect_watcher_handle.write().await.take() {
             handle.abort();
         }
+    }
+
+    /// When the current socket last delivered any bytes (None before one
+    /// is open). Moves for every TLS record read, also mid-frame.
+    pub(crate) fn last_bytes_at(&self) -> Option<std::time::Instant> {
+        self.read_clock.lock().as_ref().map(|c| c.last().into_std())
     }
 
     /// Check if connection is healthy (received data recently)
@@ -1198,9 +1227,12 @@ mod tests {
         drop(tx);
         for n in 0..N {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Some(TransportEvent::Frame(Frame::Control(
-                    ControlMessage::QueuedMessage { payload },
-                )))) => assert_eq!(payload, (n as u32).to_be_bytes().to_vec()),
+                Ok(Some(TransportEvent::Frame(f))) => match *f {
+                    Frame::Control(ControlMessage::QueuedMessage { payload }) => {
+                        assert_eq!(payload, (n as u32).to_be_bytes().to_vec())
+                    }
+                    other => panic!("event {n}: {other:?}"),
+                },
                 other => panic!("event {n}: {other:?}"),
             }
         }

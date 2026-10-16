@@ -4,8 +4,13 @@
 # not configurable. Configure EXACTLY ONE certificate source below:
 #   [server.acme]  automatic Let's Encrypt certificates (recommended for a
 #                  server that owns public port 443 directly), or
-#   [server.tls]   a static certificate and key from disk.
-# Configuring both, or neither, makes the server refuse to start. The only way
+#   [server.tls]   a static certificate and key from disk (cert_path and
+#                  key_path; the block also holds session_tickets, which
+#                  applies to both sources).
+# cert_path and key_path go together: set both for a static certificate, or
+# neither (a [server.tls] block holding only session_tickets is fine beside
+# [server.acme]). A static certificate together with [server.acme], or no
+# certificate source at all, makes the server refuse to start. The only way
 # to run without TLS is the explicit development flag `--no-tls`.
 # A missing or unreadable config file is a startup error.
 
@@ -75,6 +80,13 @@ connection_timeout_secs = 300
 # The server REFUSES TO START while this still contains "CHANGE-ME".
 websocket_path = "/CHANGE-ME-to-a-long-random-path"
 
+# The port clients dial, for `rchat-server --print-invite` only. Set it when
+# that differs from bind_addr's port: behind NAT, a FreeBSD pf `rdr` rule or
+# a jail (e.g. bind_addr = "127.0.1.1:8443" with public_port = 443). 443 is
+# left out of the invite. Unset: 443 behind proxy_protocol, else the port
+# of bind_addr. 1-65535.
+# public_port = 443
+
 # A new connection must prove an identity (an authenticated key-bundle
 # publish; a hello alone does not count) within this many seconds or it is
 # closed (rchat_rejections_total{reason="identification_timeout"}).
@@ -89,13 +101,47 @@ identification_timeout_secs = 15
 # minutes with the sweep) or when its asker disconnects. When full, see
 # max_pending_per_source below; otherwise a new ask is refused with
 # RateLimited (rchat_rejections_total{reason="pending_targets"}).
-# 1-1000000. Default: 10000.
-max_pending_circuit_targets = 10000
+# Identity and blinded asks alike, about 1.6 KB each (an ask shares its
+# connection's bundle). Blinded asks fill most of it on a busy relay: about
+# online users x offline contacts x 2-4. A few hundred online users with many
+# offline contacts reach 18000. Pairing then slows (the app backs off and
+# asks again) rather than fails; watch
+# rchat_rejections_total{reason="pending_evicted"}. Raise it on larger relays
+# with the memory for it (100000 is about 160 MB).
+# 1-1000000. Default: 18000 (about 29 MB).
+max_pending_circuit_targets = 18000
+
+# Percent of max_pending_circuit_targets kept for identity asks (first contact
+# and the identity fallback): blinded asks never hold more than the rest, so
+# a flood of blinded asks cannot lock first contact out, even without
+# per-source accounting. Identity asks may use the whole table.
+# 0-90. Default: 25.
+# pending_identity_reserve_percent = 25
 
 # Most distinct targets ONE connection may ask without an answer within 540 s
 # (so one client cannot use up the global budget above). Re-asking the same
-# target is free. Default: 32.
+# target is free. Counts identity asks only (first contact, the daily
+# fallback); blinded asks have their own cap below. Default: 32.
 max_pending_per_connection = 32
+
+# Most distinct pair tokens ONE connection may hold blinded asks
+# (CircuitAskBlind) for within 540 s, counted apart from the identity asks
+# above. An app asks blind for every contact on every reconnect and holds
+# about four asks for each contact that is offline (current and previous
+# 10-minute slot, each with its +1 neighbour). The relay sees only unrelated
+# tokens, so it charges each one. 1..=max_pending_circuit_targets.
+# Default: 1024 (about 256 offline contacts).
+# max_pending_blind_per_connection = 1024
+
+# Blinded asks under NEW pair tokens one connection may send in a burst, then
+# blind_ask_refill_per_sec a second (a token bucket per connection). Asking
+# again under a token the connection already holds is free. Over it the ask
+# is refused with RateLimited (rchat_rejections_total{reason="blind_ask_rate"}
+# and reason="pending_targets"); the app sends at most 32 at once and then 8
+# a second, and backs off when refused. 1-65536 and 1-10000.
+# Defaults: 64 and 8.
+# blind_ask_burst = 64
+# blind_ask_refill_per_sec = 8
 
 # Most pending CircuitAsks all connections from ONE source (an IPv4 address or
 # an IPv6 /48) may hold at once. When max_pending_circuit_targets is reached,
@@ -106,7 +152,17 @@ max_pending_per_connection = 32
 # the asker-quota share) are OFF when max_connections_per_ip = 0 - behind a
 # layer-4 front end every connection has the front end's address - unless
 # proxy_protocol = true (below) supplies the client's address.
+# Counts identity asks only; blinded asks have their own share below, so they
+# never crowd out first-contact asks from a shared address.
 max_pending_per_source = 1024
+
+# Most pending blinded asks all connections from ONE source may hold at once,
+# counted apart from max_pending_per_source, so many people behind one
+# carrier-grade NAT address can hold blinded asks for their contacts. When
+# max_pending_circuit_targets is reached, the heaviest source's oldest ask (of
+# either kind) is evicted first. 1..=max_pending_circuit_targets.
+# Default: 4096 (or max_pending_circuit_targets if lower).
+# max_pending_blind_per_source = 4096
 
 # Behind a layer-4 (TCP passthrough) front end ON THIS HOST only: every
 # connection must start with a PROXY protocol v2 header (HAProxy
@@ -165,7 +221,10 @@ tls_handshake_timeout_secs = 10
 # Offline store (messages and message requests for recipients who are not
 # connected). Held in memory by default; nothing is written to disk.
 [server.offline_queue]
-# Lifetime of a queued message in seconds (3600-604800). Default 72 h.
+# Lifetime of a queued message in seconds (3600-259200). Default and maximum
+# 72 h: the app tells users that copies waiting here for an offline contact
+# expire within 72 hours (disappearing messages), so larger values are a
+# startup error.
 # Message requests ("knocks") live min(ttl_secs, 72 h).
 ttl_secs = 259200
 # Separate budget for knocks (2048 bytes each). One source may hold at most
@@ -204,9 +263,16 @@ cache_dir = "/var/lib/rchat/acme"
 # Start with true (untrusted certs, no rate-limit risk), then set false.
 staging = true
 
-# --- Option 2: static certificate --------------------------------------------
-# Remove [server.acme] above (or set enabled = false) and uncomment:
-# [server.tls]
+# --- TLS settings (both certificate sources) and Option 2 -------------------
+[server.tls]
+# TLS 1.3 resumption tickets (default true): a returning client reconnects
+# with one round trip less. Ticket keys are held only in memory and rotate
+# every 6 hours, so a restart invalidates every ticket and clients fall back
+# to a full handshake. There is never 0-RTT, and every connection, resumed or
+# not, still proves its identity. Applies to ACME and static certificates.
+session_tickets = true
+# Option 2: static certificate. Remove [server.acme] above (or set
+# enabled = false) and uncomment both lines:
 # cert_path = "/etc/rchat/tls/fullchain.pem"
 # key_path = "/etc/rchat/tls/privkey.pem"
 # Send SIGHUP (systemctl reload rchat-server) to load a renewed certificate.
@@ -227,13 +293,21 @@ bind_addr = "127.0.0.1:9090"
 # allow_public = false
 
 # Decoy website served to non-WebSocket HTTP requests (scanners, probes).
-# With no `root`, a small generic built-in page is served.
+# With no `root`, a built-in site is served, chosen from the relay identity
+# key and `host`, so nobody without the key can work out what it looks like.
 [server.decoy]
 enabled = true
 # Absolute path to a static site (index.html, css, images...). The directory
 # must exist at startup or the server refuses to start. Symlinks that point
 # outside it are never followed.
 # root = "/var/www/decoy"
+# Write this relay's site (the same one the built-in page shows), as the
+# service user, which can read the identity key:
+#   rchat-server --config <this file> --render-decoy <dir> [--host <hostname>]
+# Host name that, with the relay identity key, seeds the site (default: the
+# first [server.acme] domain; with neither, the key alone). Never shown on
+# the page.
+# host = "chat.example.com"
 # Value of the `Server` response header; keep it consistent with your site.
 server_header = "nginx/1.24.0"
 # Timeout for writing a whole decoy response.

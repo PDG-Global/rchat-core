@@ -2,8 +2,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_gauge, register_int_counter_vec, Counter, Encoder, Gauge,
-    IntCounterVec, TextEncoder,
+    register_counter, register_gauge, register_int_counter, register_int_counter_vec, Counter,
+    Encoder, Gauge, IntCounter, IntCounterVec, TextEncoder,
 };
 use std::convert::Infallible;
 
@@ -71,6 +71,49 @@ lazy_static! {
         "Connections refused, throttled or dropped by resource limits",
         &["reason"]
     ).unwrap();
+
+    // Blinded pairing (protocol v3 §C.2). Plain relay-wide counts: no
+    // labels, so nothing per user, token or pair.
+
+    /// Blind asks admitted to the pending table (a replay is not counted).
+    pub static ref BLIND_ASKS_ACCEPTED: IntCounter = register_int_counter!(
+        "rchat_blind_asks_accepted_total",
+        "Blinded pairing asks held as pending"
+    ).unwrap();
+    /// Blind asks that matched a held ask and created a circuit pair.
+    pub static ref BLIND_ASKS_MATCHED: IntCounter = register_int_counter!(
+        "rchat_blind_asks_matched_total",
+        "Blinded pairing asks that created a circuit pair"
+    ).unwrap();
+    /// Blind asks refused with `PairTokenBusy` (the token already paired).
+    pub static ref BLIND_ASKS_BUSY: IntCounter = register_int_counter!(
+        "rchat_blind_asks_busy_total",
+        "Blinded pairing asks refused because the token already paired"
+    ).unwrap();
+    /// Blinded rows ended when their member came back (ruling R21): at the
+    /// first ask of its new connection (final review L1; the name is kept
+    /// for existing dashboards).
+    pub static ref BLIND_ROWS_ENDED_AT_PUBLISH: IntCounter = register_int_counter!(
+        "rchat_blind_rows_ended_at_publish_total",
+        "Blinded pairs ended because a member asked again on a new connection"
+    ).unwrap();
+    /// Salvaged records of the steady sealed size kept although the queue
+    /// was at the R26 steady-size sub-cap (final review L3): they were
+    /// already acknowledged to their senders.
+    pub static ref SALVAGED_OVER_STEADY_SUBCAP: IntCounter = register_int_counter!(
+        "rchat_salvaged_over_steady_subcap_total",
+        "Salvaged steady-sized records kept over the steady-size sub-cap"
+    ).unwrap();
+    /// Held blind asks dropped after the ask TTL without a match.
+    pub static ref BLIND_ASKS_EXPIRED: IntCounter = register_int_counter!(
+        "rchat_blind_asks_expired_total",
+        "Blinded pairing asks that expired unmatched"
+    ).unwrap();
+    /// Blind asks refused because the connection had not proven an identity.
+    pub static ref BLIND_ASKS_REFUSED_UNPROVEN: IntCounter = register_int_counter!(
+        "rchat_blind_asks_refused_unproven_total",
+        "Blinded pairing asks refused from connections without an accepted publish"
+    ).unwrap();
 }
 
 /// New connection refused: `max_connections` reached.
@@ -108,6 +151,10 @@ pub const REJECT_KEY_AUTH: &str = "key_auth";
 /// A pending circuit request of the heaviest source was evicted to make
 /// room for one from a lighter source (relay-wide cap reached).
 pub const REJECT_PENDING_EVICTED: &str = "pending_evicted";
+/// A blind ask for a new pair token was refused: the connection's
+/// new-token bucket (`blind_ask_burst`, `blind_ask_refill_per_sec`) was
+/// empty (final re-review N-1 (a)). Also counted as `pending_targets`.
+pub const REJECT_BLIND_ASK_RATE: &str = "blind_ask_rate";
 /// Connection closed for exceeding its hello/publish signature budget.
 pub const REJECT_AUTH_RATE: &str = "auth_rate";
 /// A message was refused because the relay-wide outbound budget is spent.
@@ -133,6 +180,9 @@ pub const REJECT_PROXY_HEADER: &str = "proxy_header";
 /// `proxy_protocol` is on and a connection came from a non-loopback peer;
 /// it was refused before any read.
 pub const REJECT_PROXY_NOT_LOOPBACK: &str = "proxy_not_loopback";
+/// Connection closed for sending a frame with an unknown type prefix
+/// (0x05 is reserved for future media, protocol v3 §9a).
+pub const REJECT_UNKNOWN_FRAME: &str = "unknown_frame";
 
 /// Count one enforcement event.
 pub fn reject(reason: &str) {
@@ -157,6 +207,13 @@ pub fn init() {
     lazy_static::initialize(&RATE_LIMIT_HITS);
     lazy_static::initialize(&TLS_CERT_NOT_AFTER);
     lazy_static::initialize(&REJECTIONS);
+    lazy_static::initialize(&BLIND_ASKS_ACCEPTED);
+    lazy_static::initialize(&BLIND_ASKS_MATCHED);
+    lazy_static::initialize(&BLIND_ASKS_BUSY);
+    lazy_static::initialize(&BLIND_ASKS_EXPIRED);
+    lazy_static::initialize(&BLIND_ROWS_ENDED_AT_PUBLISH);
+    lazy_static::initialize(&SALVAGED_OVER_STEADY_SUBCAP);
+    lazy_static::initialize(&BLIND_ASKS_REFUSED_UNPROVEN);
     tracing::info!("Metrics initialized");
 }
 
@@ -279,6 +336,11 @@ mod tests {
             "rchat_relay_packets_total",
             "rchat_rate_limit_hits_total",
             "rchat_tls_cert_not_after_seconds",
+            "rchat_blind_asks_accepted_total",
+            "rchat_blind_asks_matched_total",
+            "rchat_blind_asks_busy_total",
+            "rchat_blind_asks_expired_total",
+            "rchat_blind_asks_refused_unproven_total",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

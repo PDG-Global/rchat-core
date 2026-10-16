@@ -4,6 +4,7 @@
 //! It uses bincode format to match the Rust server implementation.
 
 use crate::keyauth::{KeyAuthError, SignedBundle};
+use base64::Engine as _;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -77,12 +78,19 @@ pub struct Message {
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageType {
     Text,
     Binary,
     Voice,
     E2EEHandshake,
+    /// A file message (`0x07`, protocol v3 §E.2): the content is the
+    /// plaintext after its type byte (`file_msg::encode_file_body`).
+    File,
+    /// A disappearing-timer change (`0x09`, protocol v3 §I.2): the content
+    /// is the plaintext after its type byte. Sent, padded and ack-tracked
+    /// like a message; never delivered to the app as one.
+    Timer,
 }
 
 /// Delivery receipt - sent by recipient to confirm message received
@@ -356,9 +364,12 @@ pub enum ControlMessageVariant {
     MessageAck = 10,
     DeliveryReceipt = 11,
     ReadReceipt = 12,
-    CircuitCreatedV2 = 13,
+    CircuitCreatedV3 = 13,
     QueuedMessage = 14,
     CircuitAsk = 15,
+    CircuitAskBlind = 16,
+    PairTokenBusy = 17,
+    QueueHandedOver = 18,
 }
 
 /// Circuit close reasons
@@ -395,6 +406,19 @@ impl CircuitCloseReason {
 /// the core forget a circuit it still believes is live.
 pub const CIRCUIT_NOT_FOUND_PREFIX: &str = "Circuit not found: ";
 
+/// Text of the `RateLimited` error a relay sends when its offline queue
+/// refuses a relay packet: this prefix, then the message id prefix and
+/// "not stored" (final re-review N-3). Shared with the relay, which builds
+/// the text from it, so the core can tell this refusal (about a message)
+/// from an ask refused over a relay cap (`RateLimited` with any other text).
+pub const OFFLINE_QUEUE_FULL_PREFIX: &str = "Offline queue full; ";
+
+/// Whether a `RateLimited` error's text is the offline queue's refusal of
+/// a relay packet rather than an ask refusal.
+pub fn is_offline_queue_refusal(message: &str) -> bool {
+    message.starts_with(OFFLINE_QUEUE_FULL_PREFIX)
+}
+
 /// The circuit a `CircuitNotFound` error names, if its text carries one.
 pub fn circuit_not_found_id(message: &str) -> Option<CircuitId> {
     let hex_id = message.strip_prefix(CIRCUIT_NOT_FOUND_PREFIX)?;
@@ -418,6 +442,11 @@ pub enum ControlErrorCode {
     TargetOffline = 6,
     TargetNotFound = 7,
     InternalError = 8,
+    /// Protocol v3: a known message the relay does not serve yet.
+    NotImplemented = 9,
+    /// 10: reserved. A busy blinded token is answered with the typed
+    /// `ControlMessage::PairTokenBusy` (17, ruling R22), never this code.
+    PairTokenBusy = 10,
 }
 
 impl ControlErrorCode {
@@ -431,6 +460,8 @@ impl ControlErrorCode {
             5 => Self::AuthenticationFailed,
             6 => Self::TargetOffline,
             7 => Self::TargetNotFound,
+            9 => Self::NotImplemented,
+            10 => Self::PairTokenBusy,
             _ => Self::InternalError,
         }
     }
@@ -440,13 +471,14 @@ impl ControlErrorCode {
     }
 }
 
-/// A verified-by-the-client key bundle on the wire: four length-prefixed
-/// byte strings in this order (bincode). Lengths are checked by `to_signed`.
+/// A verified-by-the-client v3 key bundle on the wire: four length-prefixed
+/// byte strings in this order (bincode). Lengths are checked by `to_signed`
+/// (`kem_pk` exactly 1184 bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerBundle {
     pub identity_key: Vec<u8>,
     pub identity_agreement_key: Vec<u8>,
-    pub signed_pre_key: Vec<u8>,
+    pub kem_pk: Vec<u8>,
     pub bundle_signature: Vec<u8>,
 }
 
@@ -455,16 +487,16 @@ impl PeerBundle {
         Self {
             identity_key: b.identity_key.to_vec(),
             identity_agreement_key: b.identity_agreement_key.to_vec(),
-            signed_pre_key: b.signed_pre_key.to_vec(),
+            kem_pk: b.kem_pk.to_vec(),
             bundle_signature: b.bundle_signature.to_vec(),
         }
     }
 
     pub fn to_signed(&self) -> Result<SignedBundle, KeyAuthError> {
-        SignedBundle::from_slices(
+        SignedBundle::from_wire(
             &self.identity_key,
             &self.identity_agreement_key,
-            &self.signed_pre_key,
+            &self.kem_pk,
             &self.bundle_signature,
         )
     }
@@ -549,9 +581,11 @@ pub enum ControlMessage {
         read_at: u64,
         circuit_id: CircuitId,
     },
-    /// 13: both peers asked; carries the other side's verified bundle and
-    /// both asks' ephemeral keys.
-    CircuitCreatedV2 {
+    /// 13 (protocol v3, replaces v2's `CircuitCreatedV2` in the same slot):
+    /// both peers asked; carries the other side's verified bundle, both
+    /// asks' X25519 ephemerals and both asks' ML-KEM-768 ephemeral public
+    /// keys (1184 bytes each), forwarded by the relay unmodified (§A.3).
+    CircuitCreatedV3 {
         circuit_id: CircuitId,
         token: Vec<u8>,
         target_circuit_id: CircuitId,
@@ -560,17 +594,84 @@ pub enum ControlMessage {
         peer: PeerBundle,
         initiator_ephemeral_key: Vec<u8>,
         responder_ephemeral_key: Vec<u8>,
+        initiator_kem_ephemeral_pk: Vec<u8>,
+        responder_kem_ephemeral_pk: Vec<u8>,
+        /// Each asker's Ed25519 signature over its own ephemerals (ruling
+        /// R7, §A.3): `"rchat/ask-eph/v3\0" || asker_ik || ephemeral_key ||
+        /// kem_ephemeral_pk`, 64 bytes, forwarded unmodified.
+        initiator_ephemeral_sig: Vec<u8>,
+        responder_ephemeral_sig: Vec<u8>,
     },
     /// 14: offline or knock delivery of one sealed v2 payload.
     QueuedMessage { payload: Vec<u8> },
     /// 15: ask for a circuit with `target_identity`; replaces CreateCircuit.
+    /// v3 adds `kem_ephemeral_pk` (ML-KEM-768, 1184 bytes, fresh per ask).
     CircuitAsk {
         target_identity: Vec<u8>,
         ephemeral_key: Vec<u8>,
+        kem_ephemeral_pk: Vec<u8>,
+        /// The asker's identity signature over its ephemerals (R7), 64 bytes.
+        ephemeral_sig: Vec<u8>,
         knock: Vec<u8>,
         resume_circuit: Option<CircuitId>,
     },
+    /// 16 (protocol v3, §C.2): a blinded ask by rotating pair token, with no
+    /// target identity and no knock. `pad` is `BLIND_PAD_LEN` bytes, so the
+    /// encoding is exactly `ASK_WIRE_LEN` bytes, like an identity ask.
+    CircuitAskBlind {
+        pair_token: Vec<u8>,
+        ephemeral_key: Vec<u8>,
+        kem_ephemeral_pk: Vec<u8>,
+        /// As in `CircuitAsk` (R7), 64 bytes.
+        ephemeral_sig: Vec<u8>,
+        pad: Vec<u8>,
+    },
+    /// 17 (protocol v3 §C.2, ruling R22): the token of our blinded ask whose
+    /// X25519 ephemeral is `ephemeral_key` is already paired (spent).
+    PairTokenBusy { ephemeral_key: Vec<u8> },
+    /// 18 (protocol v3 §H.1, ruling R34a): the relay has handed over the
+    /// queue it took at this connection's publish (possibly empty). Sent
+    /// after every publish; `pad` is `QUEUE_HANDED_OVER_PAD_LEN` zero bytes.
+    QueueHandedOver { pad: Vec<u8> },
 }
+
+/// `QueueHandedOver.pad` length (the frame's one fixed size).
+pub const QUEUE_HANDED_OVER_PAD_LEN: usize = 32;
+
+/// The only protocol version this core speaks (v3, hard cutover): the hello
+/// offers `[PROTOCOL_VERSION]` and the relay must select it.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// bincode length prefix of a `Vec<u8>` (fixint encoding: u64 LE).
+const VEC_PREFIX: usize = 8;
+
+/// Encoded length (bincode, without the 0x03 frame byte) of a v3
+/// `CircuitAsk` as the core sends it: a knock and a resume id (the all-zero
+/// id when there is none, so the `Some` arm is always on the wire). Variant
+/// tag 4, target 8+32, EK 8+32, KEM ephemeral 8+1184, ephemeral signature
+/// 8+64 (R7), knock 8+knock, resume 1+16.
+pub const ASK_WIRE_LEN: usize = 4
+    + (VEC_PREFIX + 32)
+    + (VEC_PREFIX + 32)
+    + (VEC_PREFIX + crate::kem::KEM_PK_LEN)
+    + (VEC_PREFIX + ASK_EPH_SIG_LEN)
+    + (VEC_PREFIX + crate::sealed::KNOCK_PAYLOAD_LEN)
+    + (1 + 16);
+
+/// `CircuitAskBlind.pad` length that makes a blinded ask exactly
+/// `ASK_WIRE_LEN` bytes (§C.2): everything but the pad bytes is variant tag
+/// 4, token 8+32, EK 8+32, KEM ephemeral 8+1184, ephemeral signature 8+64,
+/// pad prefix 8. Derived from `KNOCK_PAYLOAD_LEN`, so it re-balances when
+/// the knock size changes.
+pub const BLIND_PAD_LEN: usize = ASK_WIRE_LEN
+    - (4 + (VEC_PREFIX + 32)
+        + (VEC_PREFIX + 32)
+        + (VEC_PREFIX + crate::kem::KEM_PK_LEN)
+        + (VEC_PREFIX + ASK_EPH_SIG_LEN)
+        + VEC_PREFIX);
+
+/// Length of an ask's ephemeral signature (Ed25519, ruling R7).
+pub const ASK_EPH_SIG_LEN: usize = 64;
 
 impl ControlMessage {
     /// Encode control message to bytes using bincode format (without frame type prefix)
@@ -693,6 +794,11 @@ impl KeepaliveMessage {
 }
 
 /// Unified frame types for WebSocket communication
+// `Control` is the large variant since `CircuitCreatedV3` carries both
+// asks' ephemeral signatures (R7). Frames are short-lived and travel boxed
+// through the transport (`TransportEvent::Frame(Box<Frame>)`), so the size
+// gap costs nothing worth an extra allocation per control frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Frame {
     /// Signaling message (JSON)
@@ -748,7 +854,7 @@ impl SignalingMessage {
         }
     }
 
-    /// Create a hello message (protocol v2 offers only `[2]`).
+    /// Create a hello message (protocol v3 offers only `[PROTOCOL_VERSION]`).
     pub fn hello(supported_versions: Vec<u32>) -> Self {
         let payload = serde_json::json!({
             "type": "hello",
@@ -765,7 +871,8 @@ impl SignalingMessage {
         Self::new("hello", SignalingPayload { inner: payload })
     }
 
-    /// Create a publish_key_bundle message (v2: signed bundle + connection proof).
+    /// Create a publish_key_bundle message (v3: signed bundle + connection
+    /// proof). `kem_pk` is standard base64 (§A.2).
     pub fn publish_key_bundle(bundle: &SignedBundle, conn_signature: &[u8; 64]) -> Self {
         let payload = serde_json::json!({
             "type": "publish_key_bundle",
@@ -773,8 +880,8 @@ impl SignalingMessage {
                 "key_bundle": {
                     "identity_key": hex::encode(bundle.identity_key),
                     "identity_agreement_key": hex::encode(bundle.identity_agreement_key),
-                    "signed_pre_key": hex::encode(bundle.signed_pre_key),
-                    "signed_pre_key_signature": hex::encode(bundle.bundle_signature),
+                    "kem_pk": base64::engine::general_purpose::STANDARD.encode(&bundle.kem_pk[..]),
+                    "bundle_signature": hex::encode(bundle.bundle_signature),
                     "one_time_pre_keys": []
                 },
                 "conn_signature": hex::encode(conn_signature)
@@ -1251,7 +1358,7 @@ mod tests {
         PeerBundle {
             identity_key: vec![1; 32],
             identity_agreement_key: vec![2; 32],
-            signed_pre_key: vec![3; 32],
+            kem_pk: vec![3; 1184],
             bundle_signature: vec![4; 64],
         }
     }
@@ -1265,10 +1372,11 @@ mod tests {
         )
     }
 
-    /// C1: CircuitCreatedV2 survives encode/decode with both EKs.
+    /// v3 (§A.3): CircuitCreatedV3 survives encode/decode with both EKs and
+    /// both KEM ephemerals.
     #[test]
-    fn c1_circuit_created_v2_round_trip() {
-        let msg = ControlMessage::CircuitCreatedV2 {
+    fn c1_circuit_created_v3_round_trip() {
+        let msg = ControlMessage::CircuitCreatedV3 {
             circuit_id: CircuitId([0xC1; 16]),
             token: vec![7; 32],
             target_circuit_id: CircuitId([0xC2; 16]),
@@ -1276,9 +1384,13 @@ mod tests {
             peer: sample_peer(),
             initiator_ephemeral_key: vec![0x61; 32],
             responder_ephemeral_key: vec![0x62; 32],
+            initiator_kem_ephemeral_pk: vec![0x71; 1184],
+            responder_kem_ephemeral_pk: vec![0x72; 1184],
+            initiator_ephemeral_sig: vec![0x81; 64],
+            responder_ephemeral_sig: vec![0x82; 64],
         };
         match ControlMessage::decode(&msg.encode_with_frame_type()) {
-            Some(ControlMessage::CircuitCreatedV2 {
+            Some(ControlMessage::CircuitCreatedV3 {
                 circuit_id,
                 token,
                 target_circuit_id,
@@ -1286,6 +1398,10 @@ mod tests {
                 peer,
                 initiator_ephemeral_key,
                 responder_ephemeral_key,
+                initiator_kem_ephemeral_pk,
+                responder_kem_ephemeral_pk,
+                initiator_ephemeral_sig,
+                responder_ephemeral_sig,
             }) => {
                 assert_eq!(circuit_id, CircuitId([0xC1; 16]));
                 assert_eq!(token, vec![7; 32]);
@@ -1294,12 +1410,16 @@ mod tests {
                 assert_eq!(peer, sample_peer());
                 assert_eq!(initiator_ephemeral_key, vec![0x61; 32]);
                 assert_eq!(responder_ephemeral_key, vec![0x62; 32]);
+                assert_eq!(initiator_kem_ephemeral_pk, vec![0x71; 1184]);
+                assert_eq!(responder_kem_ephemeral_pk, vec![0x72; 1184]);
+                assert_eq!(initiator_ephemeral_sig, vec![0x81; 64]);
+                assert_eq!(responder_ephemeral_sig, vec![0x82; 64]);
             }
             other => panic!("decoded {other:?}"),
         }
     }
 
-    /// C1: QueuedMessage and CircuitAsk (resume Some and None) round-trip.
+    /// C1: QueuedMessage and CircuitAsk v3 (resume Some and None) round-trip.
     #[test]
     fn c1_queued_message_and_circuit_ask_round_trip() {
         let queued = ControlMessage::QueuedMessage {
@@ -1313,19 +1433,25 @@ mod tests {
             let ask = ControlMessage::CircuitAsk {
                 target_identity: vec![0xAA; 32],
                 ephemeral_key: vec![0xEE; 32],
-                knock: vec![0x02; 2048],
+                kem_ephemeral_pk: vec![0xEF; 1184],
+                ephemeral_sig: vec![0xE5; 64],
+                knock: vec![crate::sealed::KNOCK_VERSION; crate::sealed::KNOCK_PAYLOAD_LEN],
                 resume_circuit: resume.clone(),
             };
             match ControlMessage::decode(&ask.encode_with_frame_type()) {
                 Some(ControlMessage::CircuitAsk {
                     target_identity,
                     ephemeral_key,
+                    kem_ephemeral_pk,
+                    ephemeral_sig,
                     knock,
                     resume_circuit,
                 }) => {
                     assert_eq!(target_identity, vec![0xAA; 32]);
                     assert_eq!(ephemeral_key, vec![0xEE; 32]);
-                    assert_eq!(knock.len(), 2048);
+                    assert_eq!(kem_ephemeral_pk, vec![0xEF; 1184]);
+                    assert_eq!(ephemeral_sig, vec![0xE5; 64]);
+                    assert_eq!(knock.len(), crate::sealed::KNOCK_PAYLOAD_LEN);
                     assert_eq!(resume_circuit, resume);
                 }
                 other => panic!("decoded {other:?}"),
@@ -1333,10 +1459,72 @@ mod tests {
         }
     }
 
-    /// C1: the new variants are appended — bincode tags 13, 14, 15; 0–12 unmoved.
+    /// v3 (§C.2): CircuitAskBlind round-trips.
     #[test]
-    fn c1_new_variants_use_indices_13_14_15() {
-        let created = ControlMessage::CircuitCreatedV2 {
+    fn c1_circuit_ask_blind_round_trip() {
+        let blind = ControlMessage::CircuitAskBlind {
+            pair_token: vec![0xB1; 32],
+            ephemeral_key: vec![0xB2; 32],
+            kem_ephemeral_pk: vec![0xB3; 1184],
+            ephemeral_sig: vec![0xB4; 64],
+            pad: vec![0; BLIND_PAD_LEN],
+        };
+        match ControlMessage::decode(&blind.encode_with_frame_type()) {
+            Some(ControlMessage::CircuitAskBlind {
+                pair_token,
+                ephemeral_key,
+                kem_ephemeral_pk,
+                ephemeral_sig,
+                pad,
+            }) => {
+                assert_eq!(pair_token, vec![0xB1; 32]);
+                assert_eq!(ephemeral_key, vec![0xB2; 32]);
+                assert_eq!(kem_ephemeral_pk, vec![0xB3; 1184]);
+                assert_eq!(ephemeral_sig, vec![0xB4; 64]);
+                assert_eq!(pad, vec![0; BLIND_PAD_LEN]);
+            }
+            other => panic!("decoded {other:?}"),
+        }
+    }
+
+    /// v3 (§C.2): a blinded ask and an identity ask carrying a knock have
+    /// the same encoded length, measured from the real encodings.
+    #[test]
+    fn blind_and_identity_asks_have_equal_wire_length() {
+        let ask = ControlMessage::CircuitAsk {
+            target_identity: vec![0xAA; 32],
+            ephemeral_key: vec![0xEE; 32],
+            kem_ephemeral_pk: vec![0xEF; crate::kem::KEM_PK_LEN],
+            ephemeral_sig: vec![0xE5; ASK_EPH_SIG_LEN],
+            knock: vec![crate::sealed::KNOCK_VERSION; crate::sealed::KNOCK_PAYLOAD_LEN],
+            resume_circuit: Some(CircuitId([0; 16])),
+        };
+        let blind = ControlMessage::CircuitAskBlind {
+            pair_token: vec![0xB1; 32],
+            ephemeral_key: vec![0xB2; 32],
+            kem_ephemeral_pk: vec![0xB3; crate::kem::KEM_PK_LEN],
+            ephemeral_sig: vec![0xB4; ASK_EPH_SIG_LEN],
+            pad: vec![0; BLIND_PAD_LEN],
+        };
+        assert_eq!(ask.encode().len(), ASK_WIRE_LEN, "identity ask");
+        assert_eq!(blind.encode().len(), ASK_WIRE_LEN, "blinded ask");
+        assert_eq!(
+            ask.encode_with_frame_type().len(),
+            blind.encode_with_frame_type().len()
+        );
+        // Derived from the knock size (§C.2): ASK_WIRE_LEN = knock + 1373,
+        // BLIND_PAD_LEN = knock + 17. The R7 signature adds 8+64 to both
+        // forms, so the pad is unchanged by it. Pinned for knock v3 (5120).
+        assert_eq!(crate::sealed::KNOCK_PAYLOAD_LEN + 1373, ASK_WIRE_LEN);
+        assert_eq!(BLIND_PAD_LEN, crate::sealed::KNOCK_PAYLOAD_LEN + 17);
+        assert_eq!((ASK_WIRE_LEN, BLIND_PAD_LEN), (6493, 5137));
+    }
+
+    /// v3: unchanged variants keep their bincode tags; CircuitCreatedV3
+    /// takes v2's slot 13 and CircuitAskBlind is appended as 16.
+    #[test]
+    fn c1_v3_variant_indices() {
+        let created = ControlMessage::CircuitCreatedV3 {
             circuit_id: CircuitId([0; 16]),
             token: vec![],
             target_circuit_id: CircuitId([0; 16]),
@@ -1344,6 +1532,10 @@ mod tests {
             peer: sample_peer(),
             initiator_ephemeral_key: vec![],
             responder_ephemeral_key: vec![],
+            initiator_kem_ephemeral_pk: vec![],
+            responder_kem_ephemeral_pk: vec![],
+            initiator_ephemeral_sig: vec![],
+            responder_ephemeral_sig: vec![],
         };
         assert_eq!(created.encode()[..4], 13u32.to_le_bytes());
         assert_eq!(
@@ -1353,19 +1545,84 @@ mod tests {
         let ask = ControlMessage::CircuitAsk {
             target_identity: vec![],
             ephemeral_key: vec![],
+            kem_ephemeral_pk: vec![],
+            ephemeral_sig: vec![],
             knock: vec![],
             resume_circuit: None,
         };
         assert_eq!(ask.encode()[..4], 15u32.to_le_bytes());
+        let blind = ControlMessage::CircuitAskBlind {
+            pair_token: vec![],
+            ephemeral_key: vec![],
+            kem_ephemeral_pk: vec![],
+            ephemeral_sig: vec![],
+            pad: vec![],
+        };
+        assert_eq!(blind.encode()[..4], 16u32.to_le_bytes());
         let read = ControlMessage::ReadReceipt {
             message_id: String::new(),
             read_at: 0,
             circuit_id: CircuitId([0; 16]),
         };
         assert_eq!(read.encode()[..4], 12u32.to_le_bytes());
-        assert_eq!(ControlMessageVariant::CircuitCreatedV2 as u32, 13);
+        assert_eq!(ControlMessageVariant::CircuitCreatedV3 as u32, 13);
         assert_eq!(ControlMessageVariant::QueuedMessage as u32, 14);
         assert_eq!(ControlMessageVariant::CircuitAsk as u32, 15);
+        assert_eq!(ControlMessageVariant::CircuitAskBlind as u32, 16);
+        assert_eq!(ControlMessageVariant::PairTokenBusy as u32, 17);
+        let busy = ControlMessage::PairTokenBusy {
+            ephemeral_key: vec![0xE1; 32],
+        };
+        assert_eq!(busy.encode()[..4], 17u32.to_le_bytes());
+        assert!(matches!(
+            ControlMessage::decode(&busy.encode_with_frame_type()),
+            Some(ControlMessage::PairTokenBusy { ephemeral_key }) if ephemeral_key == vec![0xE1; 32]
+        ));
+        let err = ControlMessage::Error {
+            code: ControlErrorCode::NotImplemented,
+            message: String::new(),
+        };
+        assert_eq!(err.encode()[4..8], 9u32.to_le_bytes());
+        assert_eq!(
+            ControlErrorCode::from_u8(9),
+            ControlErrorCode::NotImplemented
+        );
+        let busy = ControlMessage::Error {
+            code: ControlErrorCode::PairTokenBusy,
+            message: String::new(),
+        };
+        assert_eq!(busy.encode()[4..8], 10u32.to_le_bytes());
+        assert_eq!(
+            ControlErrorCode::from_u8(10),
+            ControlErrorCode::PairTokenBusy
+        );
+        assert_eq!(ControlErrorCode::PairTokenBusy.to_u8(), 10);
+    }
+
+    /// v3 §9a: unified-frame prefix 0x05 is reserved for future media. The
+    /// core's frame types are 0x01–0x04 only, every encoder starts with one
+    /// of them, and an incoming 0x05 frame is not decoded.
+    #[test]
+    fn core_never_uses_reserved_media_prefix_0x05() {
+        let types = [
+            FRAME_TYPE_SIGNALING,
+            FRAME_TYPE_RELAY,
+            FRAME_TYPE_CONTROL,
+            FRAME_TYPE_KEEPALIVE,
+        ];
+        assert_eq!(types, [1, 2, 3, 4]);
+        let encoded = [
+            signaling_frame(&SignalingMessage::hello(vec![PROTOCOL_VERSION])).unwrap(),
+            RelayPacket::new(CircuitId([1; 16]), vec![0; 8], PacketFlags::default()).encode(),
+            ControlMessage::QueuedMessage { payload: vec![] }.encode_with_frame_type(),
+            KeepaliveMessage::Ping { timestamp: 1 }.encode_with_frame_type(),
+        ];
+        for bytes in encoded {
+            assert!(types.contains(&bytes[0]));
+            assert_ne!(bytes[0], 0x05);
+        }
+        assert!(Frame::decode(&[0x05]).is_none());
+        assert!(Frame::decode(&[0x05, 0, 0, 0, 0]).is_none());
     }
 
     #[test]
@@ -1373,7 +1630,7 @@ mod tests {
         let signed = crate::keyauth::SignedBundle {
             identity_key: [1; 32],
             identity_agreement_key: [2; 32],
-            signed_pre_key: [3; 32],
+            kem_pk: Box::new([3; 1184]),
             bundle_signature: [4; 64],
         };
         let wire = PeerBundle::from_signed(&signed);
@@ -1385,14 +1642,24 @@ mod tests {
             short.to_signed(),
             Err(crate::keyauth::KeyAuthError::BadLength)
         );
+        for len in [0, 32, 1183, 1185] {
+            let mut odd = sample_peer();
+            odd.kem_pk = vec![3; len];
+            assert_eq!(
+                odd.to_signed(),
+                Err(crate::keyauth::KeyAuthError::BadLength),
+                "kem_pk of {len} bytes"
+            );
+        }
     }
 
     #[test]
-    fn hello_offers_v2_and_the_three_capabilities() {
-        let hello = SignalingMessage::hello(vec![2]);
+    fn hello_offers_v3_and_the_three_capabilities() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+        let hello = SignalingMessage::hello(vec![PROTOCOL_VERSION]);
         assert_eq!(hello.msg_type, "hello");
         let data = &hello.payload.inner["data"];
-        assert_eq!(data["supported_versions"], serde_json::json!([2]));
+        assert_eq!(data["supported_versions"], serde_json::json!([3]));
         assert_eq!(
             data["capabilities"],
             serde_json::json!(["key-auth-v1", "sealed-relay-v1", "mutual-circuits-v1"])
@@ -1405,7 +1672,7 @@ mod tests {
         let msg = signaling(
             "hello_response",
             serde_json::json!({
-                "selected_version": 2,
+                "selected_version": 3,
                 "server_info": { "version": "x", "capabilities": [] },
                 "auth_challenge": "4e".repeat(32),
                 "knock_ttl_hours": 72
@@ -1414,7 +1681,7 @@ mod tests {
         assert_eq!(
             classify_signaling(&msg),
             SignalingEvent::HelloResponse {
-                selected_version: 2,
+                selected_version: 3,
                 auth_challenge: Some([0x4e; 32]),
                 knock_ttl_hours: Some(72),
                 relay_identity: None,
@@ -1503,7 +1770,7 @@ mod tests {
 
     #[test]
     fn binary_signaling_frame_round_trips_through_frame_decode() {
-        let hello = SignalingMessage::hello(vec![2]);
+        let hello = SignalingMessage::hello(vec![PROTOCOL_VERSION]);
         let bytes = signaling_frame(&hello).unwrap();
         assert_eq!(bytes[0], FRAME_TYPE_SIGNALING);
         match Frame::decode(&bytes) {

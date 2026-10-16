@@ -7,8 +7,19 @@
 //!
 //! Every traffic handshake is TLS 1.3 only, ring provider, no 0-RTT and no
 //! ALPN (unchanged from before: clients offer `http/1.1`, the WebSocket and
-//! decoy paths run after the handshake). The ACME challenge configuration is
+//! decoy paths run after the handshake). Key exchange prefers the hybrid
+//! post-quantum group X25519MLKEM768 (`tls_pq`), falling back to X25519,
+//! P-256 or P-384 for a client that does not offer it. The ACME challenge configuration is
 //! also TLS 1.3 only and answers nothing but `acme-tls/1`.
+//!
+//! Resumption (spec §D.1): with `[server.tls] session_tickets` on (the
+//! default, for static and ACME certificates alike) traffic handshakes issue
+//! 2 stateless TLS 1.3 tickets, sealed by rustls's ring `Ticketer`, whose
+//! keys exist only in memory and rotate every 6 hours. There is no
+//! server-side session cache in either mode, and early data is never
+//! accepted. A resumed connection is still only a TLS session: the client
+//! must still prove its identity over this connection's exporter, which
+//! differs per connection, resumed or not.
 //!
 //! Before the first ACME certificate exists, the resolver has nothing to
 //! serve, so traffic handshakes fail until issuance completes.
@@ -23,7 +34,9 @@ use parking_lot::RwLock;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{Acceptor, ClientHello, ResolvesServerCert};
+use rustls::server::{
+    Acceptor, ClientHello, NoServerSessionStorage, ProducesTickets, ResolvesServerCert,
+};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig as RustlsServerConfig, SupportedProtocolVersion};
 use sha2::{Digest, Sha256};
@@ -41,29 +54,91 @@ static TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 /// ALPN protocol id for TLS-ALPN-01 (RFC 8737).
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
+/// ring's provider unchanged: the ACME account client and key loading.
 fn ring_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// Server config for normal traffic: TLS 1.3 only, no ALPN, no early data.
-pub fn traffic_config(resolver: Arc<dyn ResolvesServerCert>) -> Result<Arc<RustlsServerConfig>> {
-    let mut config = RustlsServerConfig::builder_with_provider(ring_provider())
+/// The server handshakes' provider: ring with X25519MLKEM768 preferred
+/// (ruling R37, `tls_pq`), X25519, P-256 and P-384 after it.
+fn server_provider() -> Arc<CryptoProvider> {
+    Arc::new(crate::tls_pq::traffic_provider())
+}
+
+/// TLS 1.3 tickets issued after each traffic handshake (spec §D.1).
+pub const TICKETS_PER_HANDSHAKE: usize = 2;
+
+/// How traffic handshakes offer resumption.
+#[derive(Clone, Debug)]
+pub enum Resumption {
+    /// Stateless TLS 1.3 tickets sealed by this in-memory ticketer.
+    Tickets(Arc<dyn ProducesTickets>),
+    /// No tickets: every handshake is a full one.
+    Off,
+}
+
+impl Resumption {
+    /// The relay's resumption for `[server.tls] session_tickets`: rustls's
+    /// ring `Ticketer` (ChaCha20-Poly1305 keys from the system RNG, held in
+    /// memory only, a new key every 6 hours, the previous one accepted for
+    /// one more period: tickets live at most 12 hours) or none.
+    pub fn for_setting(session_tickets: bool) -> Result<Self> {
+        if !session_tickets {
+            return Ok(Self::Off);
+        }
+        let ticketer = rustls::crypto::ring::Ticketer::new()
+            .map_err(|e| anyhow!("cannot create the TLS ticketer: {e}"))?;
+        Ok(Self::Tickets(ticketer))
+    }
+
+    /// The resumption `config` asks for (tests may hand several relays one
+    /// shared ticketer).
+    fn from_config(config: &ServerConfig) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(shared) = &config.test_ticketer {
+            return Ok(Self::Tickets(shared.clone()));
+        }
+        Self::for_setting(config.session_tickets())
+    }
+}
+
+/// Server config for normal traffic: TLS 1.3 only, no ALPN, no early data,
+/// no server-side session cache; tickets per `resumption`.
+pub fn traffic_config(
+    resolver: Arc<dyn ResolvesServerCert>,
+    resumption: &Resumption,
+) -> Result<Arc<RustlsServerConfig>> {
+    let mut config = RustlsServerConfig::builder_with_provider(server_provider())
         .with_protocol_versions(TLS13_ONLY)
         .context("failed to configure TLS 1.3")?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    // Never 0-RTT: tickets carry no early-data allowance and none is read.
     config.max_early_data_size = 0;
+    // Nothing about a session is kept on the relay: the rustls default (a
+    // 256-entry stateful cache, resumable by session id) is replaced.
+    config.session_storage = Arc::new(NoServerSessionStorage {});
+    match resumption {
+        Resumption::Tickets(ticketer) => {
+            config.ticketer = ticketer.clone();
+            config.send_tls13_tickets = TICKETS_PER_HANDSHAKE;
+        }
+        Resumption::Off => config.send_tls13_tickets = 0,
+    }
     Ok(Arc::new(config))
 }
 
-/// Server config used only for TLS-ALPN-01 validation handshakes.
+/// Server config used only for TLS-ALPN-01 validation handshakes (no
+/// tickets, no session cache).
 fn challenge_config(resolver: Arc<dyn ResolvesServerCert>) -> Result<Arc<RustlsServerConfig>> {
-    let mut config = RustlsServerConfig::builder_with_provider(ring_provider())
+    let mut config = RustlsServerConfig::builder_with_provider(server_provider())
         .with_protocol_versions(TLS13_ONLY)
         .context("failed to configure TLS 1.3")?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     config.max_early_data_size = 0;
+    config.session_storage = Arc::new(NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
     Ok(Arc::new(config))
 }
@@ -149,7 +224,16 @@ impl TlsFront {
     /// plaintext.
     pub async fn from_config(config: &ServerConfig) -> Result<Option<Self>> {
         let timeout = config.tls_handshake_timeout();
-        match config.tls_mode()? {
+        let mode = config.tls_mode()?;
+        let resumption = match mode {
+            TlsMode::Plaintext => Resumption::Off,
+            _ => Resumption::from_config(config)?,
+        };
+        let tickets = match resumption {
+            Resumption::Tickets(_) => "on",
+            Resumption::Off => "off",
+        };
+        match mode {
             TlsMode::Plaintext => {
                 spawn_sighup_reload(None);
                 Ok(None)
@@ -166,8 +250,11 @@ impl TlsFront {
                 )?);
                 spawn_expiry_monitor(expiry);
                 spawn_sighup_reload(Some(resolver.clone()));
-                let acceptor = TlsAcceptor::from(traffic_config(resolver)?);
-                info!("TLS 1.3 enabled with static certificate (SIGHUP reloads it)");
+                let acceptor = TlsAcceptor::from(traffic_config(resolver, &resumption)?);
+                info!(
+                    "TLS 1.3 enabled with static certificate (SIGHUP reloads it); \
+                     resumption tickets {tickets}"
+                );
                 Ok(Some(Self::new(FrontKind::Static(acceptor), timeout)))
             }
             TlsMode::Acme(acme) => {
@@ -179,7 +266,8 @@ impl TlsFront {
                         config.bind_addr.port()
                     );
                 }
-                let (challenge, traffic) = start_acme(&acme).await?;
+                let (challenge, traffic) = start_acme(&acme, &resumption).await?;
+                info!("ACME: resumption tickets {tickets}");
                 spawn_sighup_reload(None);
                 Ok(Some(Self::new(
                     FrontKind::Acme { challenge, traffic },
@@ -444,6 +532,7 @@ fn spawn_expiry_monitor(expiry: Arc<CertExpiry>) {
 
 async fn start_acme(
     acme: &AcmeConfig,
+    resumption: &Resumption,
 ) -> Result<(Arc<RustlsServerConfig>, Arc<RustlsServerConfig>)> {
     acme.validate()?;
     let contacts = acme.normalized_contacts()?;
@@ -500,7 +589,7 @@ async fn start_acme(
 
     let resolver = state.resolver();
     let challenge = challenge_config(resolver.clone())?;
-    let traffic = traffic_config(resolver)?;
+    let traffic = traffic_config(resolver, resumption)?;
 
     spawn_expiry_monitor(expiry.clone());
     tokio::spawn(drive_acme(state, have_cert, retry_floor, expiry));
@@ -937,11 +1026,17 @@ mod tests {
     }
 
     fn static_front(timeout: Duration) -> TlsFront {
+        static_front_with(timeout, &Resumption::for_setting(true).unwrap())
+    }
+
+    fn static_front_with(timeout: Duration, resumption: &Resumption) -> TlsFront {
         let dir = scratch_dir("static");
         let (cert, key) = self_signed(&dir);
         let resolver = Arc::new(StaticCertResolver::load(cert, key).unwrap());
         TlsFront::new(
-            FrontKind::Static(TlsAcceptor::from(traffic_config(resolver).unwrap())),
+            FrontKind::Static(TlsAcceptor::from(
+                traffic_config(resolver, resumption).unwrap(),
+            )),
             timeout,
         )
     }
@@ -956,9 +1051,62 @@ mod tests {
         TlsFront::new(
             FrontKind::Acme {
                 challenge: challenge_config(resolver.clone()).unwrap(),
-                traffic: traffic_config(resolver).unwrap(),
+                traffic: traffic_config(resolver, &Resumption::for_setting(true).unwrap()).unwrap(),
             },
             Duration::from_secs(5),
+        )
+    }
+
+    /// Serve every connection with `front` (ping/pong, as `serve_once`).
+    async fn serve_all(front: TlsFront) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let front = front.clone();
+                tokio::spawn(async move {
+                    if let Ok(Accepted::Traffic(mut tls)) = front.accept(tcp).await {
+                        let mut buf = [0u8; 4];
+                        if tls.read_exact(&mut buf).await.is_ok() {
+                            let _ = tls.write_all(b"pong").await;
+                            let _ = tls.flush().await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A TLS 1.3 client that keeps tickets in memory (rustls's default
+    /// resumption store), optionally willing to send early data.
+    fn resuming_client(early_data: bool) -> TlsConnector {
+        let provider = ring_provider();
+        let mut config = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        config.enable_early_data = early_data;
+        TlsConnector::from(Arc::new(config)).early_data(early_data)
+    }
+
+    /// One ping/pong exchange (reading the pong also takes in the tickets
+    /// the relay sent after the handshake); returns how it was set up.
+    async fn exchange(
+        addr: std::net::SocketAddr,
+        connector: &TlsConnector,
+    ) -> (rustls::HandshakeKind, bool) {
+        let mut tls = connect(addr, connector.clone()).await.expect("handshake");
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+        let conn = tls.get_ref().1;
+        (
+            conn.handshake_kind().expect("handshake done"),
+            conn.is_early_data_accepted(),
         )
     }
 
@@ -1028,6 +1176,452 @@ mod tests {
         }
     }
 
+    /// §D.1, rVPN's three-connection shape: conn 1 is a full handshake,
+    /// conn 2 resumes with its ticket, and a relay with tickets off (conn 3,
+    /// offered the same client's ticket) does a full handshake instead.
+    #[tokio::test]
+    async fn tickets_resume_the_next_connection_and_off_means_full() {
+        let on = serve_all(static_front(Duration::from_secs(5))).await;
+        let client = resuming_client(false);
+        assert_eq!(exchange(on, &client).await.0, rustls::HandshakeKind::Full);
+        assert_eq!(
+            exchange(on, &client).await.0,
+            rustls::HandshakeKind::Resumed
+        );
+
+        let off = serve_all(static_front_with(Duration::from_secs(5), &Resumption::Off)).await;
+        assert_eq!(exchange(off, &client).await.0, rustls::HandshakeKind::Full);
+        // Off really is off: no ticket, no session cache, so the next
+        // connection to it is a full handshake too.
+        assert_eq!(exchange(off, &client).await.0, rustls::HandshakeKind::Full);
+    }
+
+    /// The ticket keys are this relay's alone and live only in memory: a
+    /// relay with a fresh ticketer (a restart) cannot open the old ticket,
+    /// and the client falls back to a full handshake without an error.
+    #[tokio::test]
+    async fn fresh_ticket_keys_refuse_old_tickets_and_fall_back() {
+        let first = serve_all(static_front(Duration::from_secs(5))).await;
+        let client = resuming_client(false);
+        exchange(first, &client).await;
+        let restarted = serve_all(static_front(Duration::from_secs(5))).await;
+        assert_eq!(
+            exchange(restarted, &client).await.0,
+            rustls::HandshakeKind::Full
+        );
+    }
+
+    /// No 0-RTT, ever: a client willing to send early data resumes, but the
+    /// relay accepts none (its tickets allow none).
+    #[tokio::test]
+    async fn resumed_connections_never_accept_early_data() {
+        let addr = serve_all(static_front(Duration::from_secs(5))).await;
+        let client = resuming_client(true);
+        exchange(addr, &client).await;
+        let (kind, early) = exchange(addr, &client).await;
+        assert_eq!(kind, rustls::HandshakeKind::Resumed);
+        assert!(!early, "early data must never be accepted");
+    }
+
+    // -- Hybrid post-quantum key exchange (ruling R37) ---------------------
+
+    /// A TLS 1.3 client on `provider` (memory ticket store), trusting any
+    /// certificate.
+    fn client_on(provider: CryptoProvider, alpn: &[&[u8]]) -> TlsConnector {
+        let provider = Arc::new(provider);
+        let mut config = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        TlsConnector::from(Arc::new(config))
+    }
+
+    /// A rustls client that offers X25519MLKEM768 (then ring's groups).
+    fn hybrid_client() -> TlsConnector {
+        client_on(crate::tls_pq::traffic_provider(), &[b"http/1.1"])
+    }
+
+    /// A classical-only client: ring restricted to X25519.
+    fn x25519_only_client() -> TlsConnector {
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
+        client_on(provider, &[b"http/1.1"])
+    }
+
+    const EXPORTER: &[u8] = b"EXPORTER-rchat-conn-auth-v1";
+
+    /// Accept one traffic connection; report the group the relay negotiated
+    /// and its exporter value (the one connection proofs are bound to).
+    async fn serve_once_kx(
+        front: TlsFront,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<(Option<rustls::NamedGroup>, [u8; 32])>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let Accepted::Traffic(mut tls) = front.accept(tcp).await.unwrap() else {
+                panic!("expected a traffic handshake");
+            };
+            let conn = tls.get_ref().1;
+            let group = conn.negotiated_key_exchange_group().map(|g| g.name());
+            let mut ekm = [0u8; 32];
+            conn.export_keying_material(&mut ekm, EXPORTER, Some(&[]))
+                .unwrap();
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.unwrap();
+            tls.write_all(b"pong").await.unwrap();
+            tls.flush().await.unwrap();
+            (group, ekm)
+        });
+        (addr, task)
+    }
+
+    /// Handshake with `connector`; returns the client's negotiated group and
+    /// exporter value, and the relay's.
+    async fn kx_of(
+        front: TlsFront,
+        connector: TlsConnector,
+    ) -> (
+        (Option<rustls::NamedGroup>, [u8; 32]),
+        (Option<rustls::NamedGroup>, [u8; 32]),
+    ) {
+        let (addr, server) = serve_once_kx(front).await;
+        let mut tls = connect(addr, connector).await.expect("handshake");
+        let conn = tls.get_ref().1;
+        let group = conn.negotiated_key_exchange_group().map(|g| g.name());
+        let mut ekm = [0u8; 32];
+        conn.export_keying_material(&mut ekm, EXPORTER, Some(&[]))
+            .unwrap();
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        ((group, ekm), server.await.unwrap())
+    }
+
+    /// Both sides support it: X25519MLKEM768 is negotiated, on the static
+    /// and the ACME traffic paths, and the exporter still agrees.
+    #[tokio::test]
+    async fn hybrid_client_negotiates_x25519mlkem768() {
+        for front in [static_front(Duration::from_secs(5)), acme_shaped_front()] {
+            let (client, server) = kx_of(front, hybrid_client()).await;
+            assert_eq!(client.0, Some(rustls::NamedGroup::X25519MLKEM768));
+            assert_eq!(server.0, Some(rustls::NamedGroup::X25519MLKEM768));
+            assert_eq!(client.1, server.1, "exporter values must match");
+        }
+    }
+
+    /// A classical-only client still connects, over X25519.
+    #[tokio::test]
+    async fn classical_only_client_falls_back_to_x25519() {
+        let (client, server) =
+            kx_of(static_front(Duration::from_secs(5)), x25519_only_client()).await;
+        assert_eq!(client.0, Some(rustls::NamedGroup::X25519));
+        assert_eq!(server.0, Some(rustls::NamedGroup::X25519));
+        assert_eq!(client.1, server.1);
+    }
+
+    /// A P-256-only client (no X25519 at all) also still connects.
+    #[tokio::test]
+    async fn p256_only_client_still_connects() {
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP256R1];
+        let (client, server) = kx_of(
+            static_front(Duration::from_secs(5)),
+            client_on(provider, &[b"http/1.1"]),
+        )
+        .await;
+        assert_eq!(client.0, Some(rustls::NamedGroup::secp256r1));
+        assert_eq!(server.0, Some(rustls::NamedGroup::secp256r1));
+    }
+
+    /// A ticket from a hybrid handshake resumes, still with a fresh hybrid
+    /// exchange (TLS 1.3 psk_dhe_ke), and never with early data.
+    #[tokio::test]
+    async fn hybrid_handshakes_resume() {
+        let addr = serve_all(static_front(Duration::from_secs(5))).await;
+        let client = hybrid_client();
+        assert_eq!(exchange(addr, &client).await.0, rustls::HandshakeKind::Full);
+        let mut tls = connect(addr, client.clone()).await.expect("handshake");
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        let conn = tls.get_ref().1;
+        assert_eq!(conn.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
+        assert_eq!(
+            conn.negotiated_key_exchange_group().map(|g| g.name()),
+            Some(rustls::NamedGroup::X25519MLKEM768)
+        );
+        assert!(!conn.is_early_data_accepted());
+    }
+
+    /// Interop with the real client stack: the core's BoringSSL connector
+    /// (the default profile; `None` cannot take a test trust root) against this relay negotiates
+    /// X25519MLKEM768 on both sides, and both derive the same exporter.
+    #[tokio::test]
+    async fn core_boringssl_client_negotiates_x25519mlkem768() {
+        use rchat_core::tls_boring::{connect_resumable, TlsFingerprint, GROUP_X25519_MLKEM768};
+        use rchat_core::tls_resumption::{RelayKey, ResumptionStore};
+        for fingerprint in [TlsFingerprint::Chrome, TlsFingerprint::Safari] {
+            let dir = scratch_dir("boring-pq");
+            let (cert, key) = self_signed(&dir);
+            let pem = std::fs::read(&cert).unwrap();
+            let resolver = Arc::new(StaticCertResolver::load(cert, key).unwrap());
+            let front = TlsFront::new(
+                FrontKind::Static(TlsAcceptor::from(
+                    traffic_config(resolver, &Resumption::for_setting(true).unwrap()).unwrap(),
+                )),
+                Duration::from_secs(5),
+            );
+            let (addr, server) = serve_once_kx(front).await;
+            let store = ResumptionStore::new();
+            store.set_test_trust_pem(&pem);
+            store.bind(RelayKey {
+                host: "localhost".into(),
+                port: addr.port(),
+                pin: None,
+            });
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut tls = connect_resumable(tcp, "localhost", addr.port(), fingerprint, &store)
+                .await
+                .expect("BoringSSL handshake");
+            assert_eq!(tls.negotiated_group(), Some(GROUP_X25519_MLKEM768));
+            assert_eq!(store.last_group(), Some(GROUP_X25519_MLKEM768));
+            let ekm = tls.export_channel_binding().unwrap();
+            tls.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.unwrap();
+            let (server_group, server_ekm) = server.await.unwrap();
+            assert_eq!(
+                server_group,
+                Some(rustls::NamedGroup::X25519MLKEM768),
+                "{fingerprint:?}"
+            );
+            assert_eq!(ekm, server_ekm, "exporter values must match");
+        }
+    }
+
+    /// A rustls client "group" that claims to be X25519MLKEM768 but sends a
+    /// share mangled by `.0` (a hostile ClientHello on the wire).
+    #[derive(Debug)]
+    struct MangledHybridShare(fn(&mut Vec<u8>));
+
+    struct MangledActive(Vec<u8>);
+
+    impl rustls::crypto::SupportedKxGroup for MangledHybridShare {
+        fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+            let mut share = crate::tls_pq::X25519MLKEM768.start()?.pub_key().to_vec();
+            (self.0)(&mut share);
+            Ok(Box::new(MangledActive(share)))
+        }
+        fn name(&self) -> rustls::NamedGroup {
+            rustls::NamedGroup::X25519MLKEM768
+        }
+    }
+
+    impl rustls::crypto::ActiveKeyExchange for MangledActive {
+        fn complete(
+            self: Box<Self>,
+            _: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            Err(rustls::Error::General("never completes".into()))
+        }
+        fn pub_key(&self) -> &[u8] {
+            &self.0
+        }
+        fn group(&self) -> rustls::NamedGroup {
+            rustls::NamedGroup::X25519MLKEM768
+        }
+    }
+
+    fn truncate_share(share: &mut Vec<u8>) {
+        share.pop();
+    }
+
+    /// First ML-KEM coefficient 0xfff >= q (FIPS 203 §7.2).
+    #[allow(clippy::ptr_arg)] // same signature as `truncate_share`
+    fn unreduce_share(share: &mut Vec<u8>) {
+        share[0] = 0xff;
+        share[1] |= 0x0f;
+    }
+
+    static TRUNCATED: MangledHybridShare = MangledHybridShare(truncate_share);
+    static UNREDUCED: MangledHybridShare = MangledHybridShare(unreduce_share);
+
+    /// A malformed 0x11EC key share on the wire: the relay answers with a
+    /// fatal alert, its accept fails without a panic, and the next, good
+    /// hybrid handshake on the same front succeeds.
+    #[tokio::test]
+    async fn malformed_hybrid_share_on_the_wire_is_refused() {
+        for bad in [&TRUNCATED, &UNREDUCED] {
+            let front = static_front(Duration::from_secs(5));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let first = front.accept(tcp).await.map(|_| ());
+                let (tcp, _) = listener.accept().await.unwrap();
+                let Accepted::Traffic(mut tls) = front.accept(tcp).await.unwrap() else {
+                    panic!("expected traffic");
+                };
+                let group = tls
+                    .get_ref()
+                    .1
+                    .negotiated_key_exchange_group()
+                    .map(|g| g.name());
+                let mut buf = [0u8; 4];
+                tls.read_exact(&mut buf).await.unwrap();
+                tls.write_all(b"pong").await.unwrap();
+                tls.flush().await.unwrap();
+                (first, group)
+            });
+
+            let mut provider = rustls::crypto::ring::default_provider();
+            provider.kx_groups = vec![bad];
+            let err = connect(addr, client_on(provider, &[b"http/1.1"]))
+                .await
+                .expect_err("a malformed share must be refused");
+            assert!(
+                err.to_string().contains("IllegalParameter"),
+                "fatal alert expected, got {err}"
+            );
+
+            let mut tls = connect(addr, hybrid_client())
+                .await
+                .expect("good handshake");
+            tls.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.unwrap();
+
+            let (first, group) = server.await.expect("accept task must not panic");
+            assert!(first.is_err(), "the bad handshake's accept errors");
+            assert_eq!(group, Some(rustls::NamedGroup::X25519MLKEM768));
+        }
+    }
+
+    /// A session store that tells the client to lead with an X25519 share
+    /// (rustls's kx hint), whatever its group preference.
+    #[derive(Debug)]
+    struct LeadWithX25519(Arc<rustls::client::ClientSessionMemoryCache>);
+
+    impl rustls::client::ClientSessionStore for LeadWithX25519 {
+        fn set_kx_hint(&self, _: ServerName<'static>, _: rustls::NamedGroup) {}
+        fn kx_hint(&self, _: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+            Some(rustls::NamedGroup::X25519)
+        }
+        fn set_tls12_session(
+            &self,
+            name: ServerName<'static>,
+            value: rustls::client::Tls12ClientSessionValue,
+        ) {
+            self.0.set_tls12_session(name, value)
+        }
+        fn tls12_session(
+            &self,
+            name: &ServerName<'_>,
+        ) -> Option<rustls::client::Tls12ClientSessionValue> {
+            self.0.tls12_session(name)
+        }
+        fn remove_tls12_session(&self, name: &ServerName<'static>) {
+            self.0.remove_tls12_session(name)
+        }
+        fn insert_tls13_ticket(
+            &self,
+            name: ServerName<'static>,
+            value: rustls::client::Tls13ClientSessionValue,
+        ) {
+            self.0.insert_tls13_ticket(name, value)
+        }
+        fn take_tls13_ticket(
+            &self,
+            name: &ServerName<'static>,
+        ) -> Option<rustls::client::Tls13ClientSessionValue> {
+            self.0.take_tls13_ticket(name)
+        }
+    }
+
+    /// supported_groups lists X25519MLKEM768 first but the only key share is
+    /// X25519: the relay sends a HelloRetryRequest for the hybrid group and
+    /// the handshake completes over it.
+    #[tokio::test]
+    async fn hybrid_listed_but_x25519_share_gets_hello_retry() {
+        use rustls::client::{ClientSessionMemoryCache, Resumption as ClientResumption};
+        let provider = Arc::new(crate::tls_pq::traffic_provider());
+        let mut config = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        config.resumption = ClientResumption::store(Arc::new(LeadWithX25519(Arc::new(
+            ClientSessionMemoryCache::new(8),
+        ))));
+        let (addr, server) = serve_once_kx(static_front(Duration::from_secs(5))).await;
+        let mut tls = connect(addr, TlsConnector::from(Arc::new(config)))
+            .await
+            .expect("handshake after HRR");
+        let conn = tls.get_ref().1;
+        assert_eq!(
+            conn.handshake_kind(),
+            Some(rustls::HandshakeKind::FullWithHelloRetryRequest)
+        );
+        assert_eq!(
+            conn.negotiated_key_exchange_group().map(|g| g.name()),
+            Some(rustls::NamedGroup::X25519MLKEM768)
+        );
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        let (server_group, _) = server.await.unwrap();
+        assert_eq!(server_group, Some(rustls::NamedGroup::X25519MLKEM768));
+    }
+
+    /// The ACME validation path takes the hybrid group too, and a classical
+    /// validator still gets through.
+    #[tokio::test]
+    async fn acme_challenge_path_accepts_hybrid_and_classical() {
+        for provider in [crate::tls_pq::traffic_provider(), {
+            let mut p = rustls::crypto::ring::default_provider();
+            p.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
+            p
+        }] {
+            let (addr, server) = serve_once(acme_shaped_front()).await;
+            let tls = connect(addr, client_on(provider, &[ACME_TLS_ALPN]))
+                .await
+                .expect("validation handshake");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(ACME_TLS_ALPN));
+            drop(tls);
+            assert_eq!(server.await.unwrap().unwrap(), "challenge");
+        }
+    }
+
+    #[test]
+    fn traffic_config_issues_two_tickets_or_none_and_caches_nothing() {
+        let dir = scratch_dir("cfg");
+        let (cert, key) = self_signed(&dir);
+        let resolver = Arc::new(StaticCertResolver::load(cert, key).unwrap());
+        let on = traffic_config(resolver.clone(), &Resumption::for_setting(true).unwrap()).unwrap();
+        assert_eq!(on.send_tls13_tickets, 2);
+        assert!(on.ticketer.enabled());
+        assert_eq!(
+            on.ticketer.lifetime(),
+            12 * 3600,
+            "6 h keys, kept one more period"
+        );
+        assert_eq!(on.max_early_data_size, 0);
+        assert!(!on.session_storage.can_cache());
+        let off = traffic_config(resolver, &Resumption::for_setting(false).unwrap()).unwrap();
+        assert_eq!(off.send_tls13_tickets, 0);
+        assert!(!off.ticketer.enabled());
+        assert!(!off.session_storage.can_cache());
+        assert_eq!(off.max_early_data_size, 0);
+    }
+
     #[tokio::test]
     async fn handshake_timeout_drops_silent_connections() {
         let (addr, server) = serve_once(static_front(Duration::from_millis(200))).await;
@@ -1080,10 +1674,10 @@ mod tests {
     #[tokio::test]
     async fn from_config_refuses_unloadable_static_cert() {
         let cfg = ServerConfig {
-            tls: Some(crate::config::TlsConfig {
-                cert_path: "/nonexistent/cert.pem".into(),
-                key_path: "/nonexistent/key.pem".into(),
-            }),
+            tls: Some(crate::config::TlsConfig::static_cert(
+                "/nonexistent/cert.pem",
+                "/nonexistent/key.pem",
+            )),
             ..ServerConfig::default()
         };
         assert!(TlsFront::from_config(&cfg).await.is_err());
