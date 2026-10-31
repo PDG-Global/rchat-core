@@ -400,7 +400,17 @@ async fn unsent_relayed_messages_of_a_dead_connection_are_requeued() {
         .unwrap();
     tx.send(relay(3)).unwrap();
 
-    salvage_unsent(None, rx, tags::id_tag(&x.bytes), &state).await;
+    salvage_unsent(
+        Vec::new(),
+        Some(WriterRest {
+            in_flight: None,
+            rx,
+        }),
+        tags::id_tag(&x.bytes),
+        None,
+        &state,
+    )
+    .await;
 
     let q = state.message_queues.get(&tags::id_tag(&x.bytes)).unwrap();
     let payloads: Vec<Vec<u8>> = q.pending.iter().map(|m| m.payload.clone()).collect();
@@ -439,7 +449,17 @@ async fn salvage_is_admitted_through_the_offline_budget() {
         tx.send(relay_frame(b, 200)).unwrap(); // 264 budget bytes each
     }
 
-    salvage_unsent(None, rx, tags::id_tag(&x.bytes), &state).await;
+    salvage_unsent(
+        Vec::new(),
+        Some(WriterRest {
+            in_flight: None,
+            rx,
+        }),
+        tags::id_tag(&x.bytes),
+        None,
+        &state,
+    )
+    .await;
 
     assert!(
         state.offline_budget.used() <= 2_000,
@@ -470,7 +490,17 @@ async fn salvage_respects_the_per_recipient_cap_and_keeps_knocks_as_knocks() {
     tx.send(FrameBuilder::queued_message(super::test_support::knock(0x33)).encode())
         .unwrap();
 
-    salvage_unsent(None, rx, tags::id_tag(&x.bytes), &state).await;
+    salvage_unsent(
+        Vec::new(),
+        Some(WriterRest {
+            in_flight: None,
+            rx,
+        }),
+        tags::id_tag(&x.bytes),
+        None,
+        &state,
+    )
+    .await;
 
     let q = state.message_queues.get(&tags::id_tag(&x.bytes)).unwrap();
     let messages = q.pending.iter().filter(|m| !m.is_knock).count();

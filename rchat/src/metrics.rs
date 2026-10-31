@@ -2,12 +2,58 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter, register_gauge, register_int_counter, register_int_counter_vec, Counter,
-    Encoder, Gauge, IntCounter, IntCounterVec, TextEncoder,
+    register_counter, register_gauge, register_int_counter, register_int_counter_vec,
+    register_int_gauge, Counter, Encoder, Gauge, IntCounter, IntCounterVec, IntGauge, TextEncoder,
 };
 use std::convert::Infallible;
 
 lazy_static! {
+    // Android calls (spec §5). Relay-wide counts only: no labels except a
+    // fixed reason, nothing per user, token or call.
+
+    /// Media tokens held (granted by at least one member, not expired).
+    pub static ref MEDIA_TOKENS_ACTIVE: IntGauge = register_int_gauge!(
+        "rchat_media_tokens_active",
+        "Call relay tokens currently held"
+    ).unwrap();
+    /// Call connections joined to a token.
+    pub static ref MEDIA_CONNECTIONS_ACTIVE: IntGauge = register_int_gauge!(
+        "rchat_media_connections_active",
+        "Call connections currently joined"
+    ).unwrap();
+    /// `MediaJoin`s refused (unknown, one-sided or expired token, or not a fresh connection).
+    /// Media frames forwarded from one call connection to the other side.
+    pub static ref MEDIA_FRAMES_FORWARDED: IntCounter = register_int_counter!(
+        "rchat_media_frames_forwarded_total",
+        "Call media frames forwarded"
+    ).unwrap();
+    /// Media frames dropped, by reason (`full`, `rate`).
+    pub static ref MEDIA_FRAMES_DROPPED: IntCounterVec = register_int_counter_vec!(
+        "rchat_media_frames_dropped_total",
+        "Call media frames dropped",
+        &["reason"]
+    ).unwrap();
+    /// Video call connections (lanes 2 and 3) joined; a subset of `MEDIA_CONNECTIONS_ACTIVE`.
+    pub static ref MEDIA_VIDEO_CONNECTIONS_ACTIVE: IntGauge = register_int_gauge!(
+        "rchat_media_video_connections_active",
+        "Video call connections currently joined"
+    ).unwrap();
+    /// Video frames forwarded from one call connection to the other side.
+    pub static ref MEDIA_VIDEO_FRAMES_FORWARDED: IntCounter = register_int_counter!(
+        "rchat_media_video_frames_forwarded_total",
+        "Call video frames forwarded"
+    ).unwrap();
+    /// Video frames dropped, by reason (`full`, `rate`).
+    pub static ref MEDIA_VIDEO_FRAMES_DROPPED: IntCounterVec = register_int_counter_vec!(
+        "rchat_media_video_frames_dropped_total",
+        "Call video frames dropped",
+        &["reason"]
+    ).unwrap();
+    pub static ref MEDIA_JOIN_REFUSED: IntCounter = register_int_counter!(
+        "rchat_media_join_refused_total",
+        "Call connection joins refused"
+    ).unwrap();
+
     /// Total active connections
     pub static ref CONNECTIONS_TOTAL: Gauge = register_gauge!(
         "rchat_connections_total",
@@ -104,6 +150,28 @@ lazy_static! {
         "rchat_salvaged_over_steady_subcap_total",
         "Salvaged steady-sized records kept over the steady-size sub-cap"
     ).unwrap();
+    /// Held copies of relayed records put back into their recipient's
+    /// offline queue because the connection ended before the client showed
+    /// it had received them (Task 8 B).
+    pub static ref HELD_COPIES_REQUEUED: IntCounter = register_int_counter!(
+        "rchat_held_copies_requeued_total",
+        "Relayed records re-queued because their connection ended unconfirmed"
+    ).unwrap();
+    /// Checks of the held copies' TCP acknowledgement that had no answer:
+    /// a platform without a source (the timing fallback then applies to
+    /// client frames) or a connection TCP had already dropped (its copies
+    /// are kept and re-queued). Task 8 re-review H1.
+    pub static ref HELD_ACK_UNAVAILABLE: IntCounter = register_int_counter!(
+        "rchat_held_ack_unavailable_total",
+        "Held-copy acknowledgement checks with no kernel answer (fallback or dropped connection)"
+    ).unwrap();
+    /// Keepalive pings the relay sent. Since Task 8 C only connections
+    /// that went quiet for about 240 s are pinged, so this counts quiet
+    /// connections, not connections times time.
+    pub static ref KEEPALIVE_PINGS: IntCounter = register_int_counter!(
+        "rchat_keepalive_pings_total",
+        "Keepalive pings sent to connections that had gone quiet"
+    ).unwrap();
     /// Held blind asks dropped after the ask TTL without a match.
     pub static ref BLIND_ASKS_EXPIRED: IntCounter = register_int_counter!(
         "rchat_blind_asks_expired_total",
@@ -184,6 +252,36 @@ pub const REJECT_PROXY_NOT_LOOPBACK: &str = "proxy_not_loopback";
 /// (0x05 is reserved for future media, protocol v3 §9a).
 pub const REJECT_UNKNOWN_FRAME: &str = "unknown_frame";
 
+/// A member published again on a new connection; its older foreground
+/// connection (stale, often dead without a FIN) was closed (Task 8 A).
+pub const REJECT_REPLACED: &str = "replaced";
+
+/// A held copy of a relayed record (written, not yet shown received) was
+/// dropped to stay within the offline budget or the per-recipient caps
+/// (Task 8 B).
+pub const REJECT_HELD_COPY_DROPPED: &str = "held_copy_dropped";
+/// A call connection sent something other than media or a keepalive and
+/// was closed (Android calls §5).
+pub const REJECT_CALL_FRAME: &str = "call_connection_frame";
+
+/// `rchat_media_frames_dropped_total` reasons: the target's queue was full
+/// or there was no target (D7), or the sender was over 64 kbps.
+pub const MEDIA_DROP_FULL: &str = "full";
+pub const MEDIA_DROP_RATE: &str = "rate";
+/// A video frame waited in the target's queue past its age cap.
+pub const MEDIA_DROP_STALE: &str = "stale";
+
+pub fn media_dropped(reason: &str) {
+    MEDIA_FRAMES_DROPPED.with_label_values(&[reason]).inc();
+}
+
+/// As `media_dropped`, for a frame on a video lane.
+pub fn media_video_dropped(reason: &str) {
+    MEDIA_VIDEO_FRAMES_DROPPED
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// Count one enforcement event.
 pub fn reject(reason: &str) {
     REJECTIONS.with_label_values(&[reason]).inc();
@@ -213,7 +311,18 @@ pub fn init() {
     lazy_static::initialize(&BLIND_ASKS_EXPIRED);
     lazy_static::initialize(&BLIND_ROWS_ENDED_AT_PUBLISH);
     lazy_static::initialize(&SALVAGED_OVER_STEADY_SUBCAP);
+    lazy_static::initialize(&HELD_COPIES_REQUEUED);
+    lazy_static::initialize(&KEEPALIVE_PINGS);
+    lazy_static::initialize(&HELD_ACK_UNAVAILABLE);
     lazy_static::initialize(&BLIND_ASKS_REFUSED_UNPROVEN);
+    lazy_static::initialize(&MEDIA_TOKENS_ACTIVE);
+    lazy_static::initialize(&MEDIA_CONNECTIONS_ACTIVE);
+    lazy_static::initialize(&MEDIA_JOIN_REFUSED);
+    lazy_static::initialize(&MEDIA_FRAMES_FORWARDED);
+    lazy_static::initialize(&MEDIA_FRAMES_DROPPED);
+    lazy_static::initialize(&MEDIA_VIDEO_CONNECTIONS_ACTIVE);
+    lazy_static::initialize(&MEDIA_VIDEO_FRAMES_FORWARDED);
+    lazy_static::initialize(&MEDIA_VIDEO_FRAMES_DROPPED);
     tracing::info!("Metrics initialized");
 }
 
@@ -323,6 +432,11 @@ mod tests {
     /// fixed `reason` value - nothing per user, address or circuit.
     #[test]
     fn init_registers_every_metric() {
+        media_dropped(MEDIA_DROP_FULL);
+        media_dropped(MEDIA_DROP_RATE);
+        media_video_dropped(MEDIA_DROP_FULL);
+        media_video_dropped(MEDIA_DROP_RATE);
+        media_video_dropped(MEDIA_DROP_STALE);
         init();
         let names: Vec<String> = prometheus::gather()
             .iter()
@@ -341,6 +455,14 @@ mod tests {
             "rchat_blind_asks_busy_total",
             "rchat_blind_asks_expired_total",
             "rchat_blind_asks_refused_unproven_total",
+            "rchat_media_tokens_active",
+            "rchat_media_connections_active",
+            "rchat_media_join_refused_total",
+            "rchat_media_frames_forwarded_total",
+            "rchat_media_frames_dropped_total",
+            "rchat_media_video_connections_active",
+            "rchat_media_video_frames_forwarded_total",
+            "rchat_media_video_frames_dropped_total",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

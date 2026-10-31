@@ -493,16 +493,16 @@ async fn a_well_formed_blinded_ask_is_held_silently() {
     assert_alive(srv.addr).await;
 }
 
-/// Protocol v3 §9a: unified-frame prefix 0x05 is reserved for future media.
-/// The relay refuses it like any unknown prefix and closes the connection,
-/// before and after identification; the relay itself stays up.
+/// Android calls §5: a 0x05 media frame from a connection that joined no
+/// call is refused like an unknown prefix and closes the connection, before
+/// and after identification; the relay itself stays up.
 #[tokio::test]
-async fn reserved_media_prefix_0x05_is_refused_and_closed() {
-    use crate::protocol::unified::FRAME_TYPE_RESERVED_MEDIA;
+async fn media_prefix_0x05_from_a_non_call_connection_is_refused_and_closed() {
+    use crate::protocol::unified::FRAME_TYPE_MEDIA;
     let before = crate::metrics::rejections(crate::metrics::REJECT_UNKNOWN_FRAME);
     let srv = start(test_config()).await;
     let (mut ws, _id) = published_peer(srv.addr).await;
-    ws.send(Message::Binary(vec![FRAME_TYPE_RESERVED_MEDIA, 1, 2, 3]))
+    ws.send(Message::Binary(vec![FRAME_TYPE_MEDIA, 1, 2, 3]))
         .await
         .unwrap();
     assert!(
@@ -514,7 +514,7 @@ async fn reserved_media_prefix_0x05_is_refused_and_closed() {
     );
 
     let mut anon = connect(srv.addr).await;
-    anon.send(Message::Binary(vec![FRAME_TYPE_RESERVED_MEDIA]))
+    anon.send(Message::Binary(vec![FRAME_TYPE_MEDIA]))
         .await
         .unwrap();
     assert!(

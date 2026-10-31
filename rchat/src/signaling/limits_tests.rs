@@ -285,14 +285,47 @@ fn message_id_extraction_reads_only_the_v2_header() {
     assert_eq!(extract_message_id(&[]), None);
 }
 
-/// TM6b: ping waits are 25-35 s.
+/// Task 8 C (replaces TM6b's 25-35 s), review L4/L5: the relay pings
+/// after 262 s ± 8 s of silence, above the client's 248 s background
+/// maximum, never under 60 s, and always at least 30 s before the idle
+/// timeout.
 #[test]
-fn tm6b_ping_wait_is_jittered_between_25_and_35_seconds() {
-    assert_eq!(super::ping_wait(0.0), Duration::from_secs(25));
-    assert_eq!(super::ping_wait(1.0), Duration::from_secs(35));
-    assert_eq!(super::ping_wait(0.5), Duration::from_secs(30));
-    assert_eq!(super::ping_wait(7.0), Duration::from_secs(35), "clamped");
-    assert_eq!(super::ping_wait(-1.0), Duration::from_secs(25), "clamped");
+fn idle_ping_is_262_s_jittered_and_leaves_30_s_to_answer() {
+    let t = |s: u64| Duration::from_secs(s);
+    assert_eq!(super::idle_ping_after(0.5, t(300)), t(262));
+    assert_eq!(super::idle_ping_after(0.0, t(300)), t(254));
+    assert_eq!(super::idle_ping_after(1.0, t(300)), t(270));
+    assert_eq!(super::idle_ping_after(7.0, t(300)), t(270), "clamped");
+    assert_eq!(super::idle_ping_after(-1.0, t(300)), t(254), "clamped");
+    assert!(
+        super::idle_ping_after(0.0, t(300)) > t(248),
+        "above the client's maximum"
+    );
+    // Capped 30 s before the idle timeout.
+    assert_eq!(super::idle_ping_after(1.0, t(270)), t(240));
+    assert_eq!(super::idle_ping_after(0.5, t(120)), t(90));
+    assert_eq!(super::idle_ping_after(0.5, t(90)), t(60));
+    // Under 90 s the 30 s answer window wins over the 60 s floor.
+    assert_eq!(super::idle_ping_after(0.5, t(75)), t(45));
+    assert_eq!(super::idle_ping_after(0.5, t(60)), t(30));
+    for timeout in [60u64, 61, 75, 89, 90, 120, 270, 300, 86_400] {
+        for r in [0.0, 0.5, 1.0] {
+            let at = super::idle_ping_after(r, t(timeout));
+            assert!(t(timeout) - at >= t(30), "timeout {timeout}: {at:?}");
+        }
+    }
+    // A long timeout does not stretch it.
+    assert_eq!(super::idle_ping_after(0.5, t(86_400)), t(262));
+}
+
+/// Review L5: a timeout under 300 s warns at startup; 300 s and up do not.
+#[test]
+fn a_low_connection_timeout_warns() {
+    let t = |s: u64| Duration::from_secs(s);
+    assert!(super::timeout_warning(t(299)).is_some_and(|w| w.contains("240 s")));
+    assert!(super::timeout_warning(t(60)).is_some());
+    assert!(super::timeout_warning(t(300)).is_none());
+    assert!(super::timeout_warning(t(3600)).is_none());
 }
 
 /// TM6b: an all-zero resume circuit is no resume.

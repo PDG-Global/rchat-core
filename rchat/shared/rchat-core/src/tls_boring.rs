@@ -97,6 +97,11 @@ impl BoringTlsStream {
         Self { inner: stream }
     }
 
+    /// The TCP connection underneath.
+    pub(crate) fn tcp(&self) -> &TcpStream {
+        self.inner.get_ref()
+    }
+
     /// Whether this connection resumed a TLS session from a ticket.
     pub fn session_reused(&self) -> bool {
         self.inner.ssl().session_reused()
@@ -225,9 +230,9 @@ fn build_chrome_connector(
     #[cfg(not(target_os = "ios"))]
     {
         builder.set_verify(boring::ssl::SslVerifyMode::PEER);
-        match trust {
+        match trust.or_else(crate::android_roots::platform_store) {
             Some(store) => builder.set_verify_cert_store(store),
-            None => builder.set_default_verify_paths(),
+            None => default_trust(&mut builder),
         }
         .map_err(|e| {
             std::io::Error::new(
@@ -438,7 +443,11 @@ async fn connect_standard(
     #[cfg(not(target_os = "ios"))]
     {
         builder.set_verify(boring::ssl::SslVerifyMode::PEER);
-        builder.set_default_verify_paths().map_err(|e| {
+        match crate::android_roots::platform_store() {
+            Some(store) => builder.set_verify_cert_store(store),
+            None => default_trust(&mut builder),
+        }
+        .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to set default verify paths: {}", e),
@@ -463,6 +472,23 @@ async fn connect_standard(
     })?;
 
     Ok(BoringTlsStream::new(stream))
+}
+
+/// No store given: BoringSSL's default paths, except on Android, where they
+/// hold nothing and an unreadable system store must fail closed, so an
+/// explicit empty store is installed.
+#[cfg(not(target_os = "ios"))]
+fn default_trust(
+    builder: &mut boring::ssl::SslConnectorBuilder,
+) -> Result<(), boring::error::ErrorStack> {
+    #[cfg(target_os = "android")]
+    {
+        builder.set_verify_cert_store(boring::x509::store::X509StoreBuilder::new()?.build())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        builder.set_default_verify_paths()
+    }
 }
 
 /// On iOS the Network Extension sandbox blocks filesystem access to /etc/ssl/,

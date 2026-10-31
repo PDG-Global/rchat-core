@@ -404,6 +404,8 @@ pub(crate) enum Ev {
     Message(String, Vec<u8>, String),
     /// `on_file_received`.
     File(FileEv),
+    /// `on_file_blocked`.
+    FileBlocked(crate::BlockedFile),
     Error(String),
     Request(crate::MessageRequest),
     /// (old identity hex, new identity hex, new agreement hex, new KEM
@@ -444,6 +446,9 @@ impl RChatCallbacks for EventLog {
             expire_secs: f.expire_secs,
             bytes: f.bytes,
         }));
+    }
+    fn on_file_blocked(&self, f: crate::BlockedFile) {
+        self.0.lock().unwrap().push(Ev::FileBlocked(f));
     }
     fn on_message_delivered(&self, message_id: String) {
         self.0.lock().unwrap().push(Ev::Delivered(message_id));
@@ -641,14 +646,29 @@ pub(crate) fn queued(payload: Vec<u8>) -> Frame {
 /// drive the public async API.
 pub(crate) fn wrap(inner: ClientInner) -> Arc<RChatClient> {
     let connected_mirror = inner.connected_mirror.clone();
+    let keepalive = inner.keepalive.clone();
+    let keepalive_foreground_secs = keepalive.get();
+    let (call_events, call_audio, call_muted) = (
+        inner.call.events.clone(),
+        inner.call.audio.clone(),
+        inner.call.muted.clone(),
+    );
+    let (call_video, call_video_prefs) = (inner.call.video.clone(), inner.call.video_prefs.clone());
     Arc::new(RChatClient {
         runtime: Arc::new(crate::ClientRuntime::new().unwrap()),
         inner: Arc::new(tokio::sync::RwLock::new(inner)),
         callback_hub: crate::CallbackHub::new(),
         cover_wanted: Default::default(),
         steady_wanted: Default::default(),
+        keepalive,
+        keepalive_foreground_secs,
         connected_mirror,
         retired: Default::default(),
+        call_events,
+        call_audio,
+        call_muted,
+        call_video,
+        call_video_prefs,
         pre_lock_delay_for_test: Default::default(),
     })
 }

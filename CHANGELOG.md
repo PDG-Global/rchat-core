@@ -1,6 +1,19 @@
 # Changelog
 
-## 2.0.0 (unreleased)
+## 2.1.0 (2026-10-31)
+
+Voice and video calls through your own relay. Calls need a 2.1.0 relay and an app with calls (Android today); messaging stays compatible with 2.0.0 apps and relays.
+
+- Voice calls: end-to-end encrypted with keys derived inside the conversation's session (HKDF) and ChaCha20-Poly1305 media frames. Opus voice (libopus through `opus-codec`, behind the core's `calls-codec` feature): 48 kHz mono, 16 or 24 kbps CBR, in-band FEC. Each phone opens two call connections to the relay, on the same HTTPS port as messages, and sends every frame on both; an adaptive playout buffer conceals loss.
+- No STUN, TURN or other call servers: the relay passes on frames it can't read. It can see that a call is happening, roughly when, for how long and how much data.
+- Video calls: signalling in a new `0x0E` plaintext (Caps, Request, Accept, Decline, Camera), separate video keys, stream frames `0x81` (video) and `0x82` (control) with a 1024-frame replay window, fragmenting and reassembly. A quality ladder from 240p to 1080p with pause and resume, health notes and an unstable-connection notice. Video only starts from a local action (Accept, or tapping the camera). Video data volume changes with movement, so the relay can tell that a call has video and roughly when there is movement on camera.
+- Relay protocol: media frame prefix `0x05`; control messages `MediaGrant`, `MediaJoin`, `MediaJoined`, `MediaPeerGone` (19-22); capabilities `calls-v1` and `video-v1`. A media token is usable only once both members of a conversation grant it; at most one per circuit and two per chat connection; it expires 60 s after the grants if nobody joins, and 30 s after its last call connection leaves.
+- Relay: call lanes 0-1 carry audio (64 kbps each) and 2-3 video (about 4 Mbps, a 256 KiB queue, video waiting over 500 ms is dropped). Call connections keep little unsent data (`TCP_NOTSENT_LOWAT` 16 KiB on Linux, a 32 KiB send buffer on FreeBSD and macOS). New call and video metrics.
+- Relay: pings only connections that have gone quiet (above the app's background keepalive, 30 s to answer); holds relayed records until the app's TCP acknowledgement shows they arrived, with a budget of their own, and saves them with the offline queue on shutdown; closes a member's stale connections when it publishes again.
+- Core: `rchat_call_*` and `rchat_call_video_*` C functions with JNI wrappers and error codes 31-36; `rchat_set_background_keepalive`; `rchat_verify_ed25519`, a stateless Ed25519 check; a stale identity circuit closes at once, also during a call; pinning a requester answers its knock.
+- Building: minimum Rust 1.88. The core's `calls-codec` feature needs CMake; the relay never builds it.
+
+## 2.0.0 (2026-10-16)
 
 Protocol v3, a hard cutover: update the relay and the app together; v2 apps are refused.
 

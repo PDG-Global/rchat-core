@@ -13,6 +13,15 @@ pub const FRAME_TYPE_SIGNALING: u8 = 0x01;
 pub const FRAME_TYPE_RELAY: u8 = 0x02;
 pub const FRAME_TYPE_CONTROL: u8 = 0x03;
 pub const FRAME_TYPE_KEEPALIVE: u8 = 0x04;
+/// The media frame of a call connection (Android calls §4). Never a
+/// `Frame` on the chat connection: `Frame::decode` returns None for it.
+pub const FRAME_TYPE_MEDIA: u8 = 0x05;
+/// The relay's refusal text for a `MediaGrant` (D5).
+pub const MEDIA_GRANT_REFUSED: &str = "media grant refused";
+/// `hello_response` capability of a relay that pairs call connections (D8).
+pub const CALLS_CAPABILITY: &str = "calls-v1";
+/// `hello_response` capability of a relay that carries video lanes 2 and 3.
+pub const VIDEO_CAPABILITY: &str = "video-v1";
 
 /// Magics that start a binary (type 0x02) plaintext: what the app put in
 /// it. Media travel as binary, never as an in-band text prefix, so a text
@@ -370,6 +379,10 @@ pub enum ControlMessageVariant {
     CircuitAskBlind = 16,
     PairTokenBusy = 17,
     QueueHandedOver = 18,
+    MediaGrant = 19,
+    MediaJoin = 20,
+    MediaJoined = 21,
+    MediaPeerGone = 22,
 }
 
 /// Circuit close reasons
@@ -633,6 +646,19 @@ pub enum ControlMessage {
     /// queue it took at this connection's publish (possibly empty). Sent
     /// after every publish; `pad` is `QUEUE_HANDED_OVER_PAD_LEN` zero bytes.
     QueueHandedOver { pad: Vec<u8> },
+    /// 19 (c→s, Android calls §5): a published member of `circuit_id`
+    /// grants the call's relay token. Usable once both members granted it.
+    MediaGrant {
+        circuit_id: CircuitId,
+        token: [u8; 32],
+    },
+    /// 20 (c→s): a fresh, unpublished call connection joins a usable token
+    /// on `lane` (0 or 1) of side `role` (0 caller, 1 callee; D1).
+    MediaJoin { token: [u8; 32], lane: u8, role: u8 },
+    /// 21 (s→c): the other side has a call connection on this token.
+    MediaJoined,
+    /// 22 (s→c): the other side has no call connection left.
+    MediaPeerGone,
 }
 
 /// `QueueHandedOver.pad` length (the frame's one fixed size).
@@ -919,6 +945,8 @@ pub enum SignalingEvent {
         auth_challenge: Option<[u8; 32]>,
         knock_ttl_hours: Option<u32>,
         relay_identity: Option<crate::relay_pin::RelayIdentityOffer>,
+        calls: bool,
+        video: bool,
     },
     PublishOk {
         next_challenge: Option<[u8; 32]>,
@@ -927,6 +955,14 @@ pub enum SignalingEvent {
     AuthenticationFailed,
     VersionMismatch,
     Other,
+}
+
+/// Whether `server_info.capabilities` (a list) names `cap`.
+fn has_capability(server_info: Option<&serde_json::Value>, cap: &str) -> bool {
+    server_info
+        .and_then(|s| s.get("capabilities"))
+        .and_then(|c| c.as_array())
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some(cap)))
 }
 
 /// Exactly 64 lowercase hex characters -> 32 bytes.
@@ -993,6 +1029,8 @@ pub fn classify_signaling(msg: &SignalingMessage) -> SignalingEvent {
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok()),
             relay_identity: parse_relay_identity(field("relay_identity")),
+            calls: has_capability(field("server_info"), CALLS_CAPABILITY),
+            video: has_capability(field("server_info"), VIDEO_CAPABILITY),
         },
         "publish_key_bundle_response" => {
             if field("status").and_then(|v| v.as_str()) == Some("ok") {
@@ -1570,6 +1608,8 @@ mod tests {
         assert_eq!(ControlMessageVariant::CircuitAsk as u32, 15);
         assert_eq!(ControlMessageVariant::CircuitAskBlind as u32, 16);
         assert_eq!(ControlMessageVariant::PairTokenBusy as u32, 17);
+        assert_eq!(ControlMessageVariant::MediaGrant as u32, 19);
+        assert_eq!(ControlMessageVariant::MediaPeerGone as u32, 22);
         let busy = ControlMessage::PairTokenBusy {
             ephemeral_key: vec![0xE1; 32],
         };
@@ -1685,6 +1725,8 @@ mod tests {
                 auth_challenge: Some([0x4e; 32]),
                 knock_ttl_hours: Some(72),
                 relay_identity: None,
+                calls: false,
+                video: false,
             }
         );
     }
@@ -1720,6 +1762,8 @@ mod tests {
                 auth_challenge: None,
                 knock_ttl_hours: None,
                 relay_identity: None,
+                calls: false,
+                video: false,
             }
         );
     }
@@ -1790,5 +1834,66 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 34]);
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(RelayPacket::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn hello_response_reports_calls_only_with_the_capability() {
+        let with = |caps: serde_json::Value| {
+            SignalingMessage::new(
+                "hello_response",
+                SignalingPayload {
+                    inner: serde_json::json!({
+                        "type": "hello_response",
+                        "data": {
+                            "selected_version": 3,
+                            "server_info": { "version": "2.0.1", "capabilities": caps }
+                        }
+                    }),
+                },
+            )
+        };
+        let calls_of = |m: &SignalingMessage| match classify_signaling(m) {
+            SignalingEvent::HelloResponse { calls, .. } => calls,
+            other => panic!("not a hello response: {other:?}"),
+        };
+        assert!(calls_of(&with(serde_json::json!([
+            "websocket-relay",
+            "calls-v1"
+        ]))));
+        assert!(!calls_of(&with(serde_json::json!(["websocket-relay"]))));
+        assert!(
+            !calls_of(&with(serde_json::json!("calls-v1"))),
+            "not a list"
+        );
+    }
+
+    #[test]
+    fn hello_response_reads_video_v1() {
+        let with = |caps: serde_json::Value| {
+            signaling(
+                "hello_response",
+                serde_json::json!({
+                    "selected_version": 3,
+                    "server_info": { "version": "2.0.1", "capabilities": caps }
+                }),
+            )
+        };
+        let video_of = |m: &SignalingMessage| match classify_signaling(m) {
+            SignalingEvent::HelloResponse { video, .. } => video,
+            other => panic!("not a hello response: {other:?}"),
+        };
+        assert!(video_of(&with(serde_json::json!(["calls-v1", "video-v1"]))));
+        assert!(!video_of(&with(serde_json::json!(["calls-v1"]))));
+        assert!(
+            !video_of(&with(serde_json::json!("video-v1"))),
+            "not a list"
+        );
+    }
+
+    #[test]
+    fn media_frame_prefix_is_not_a_frame_on_the_chat_connection() {
+        let mut bin = vec![FRAME_TYPE_MEDIA];
+        bin.extend_from_slice(&[0u8; 40]);
+        assert!(Frame::decode(&bin).is_none());
     }
 }

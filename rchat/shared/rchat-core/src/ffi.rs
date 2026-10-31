@@ -63,6 +63,9 @@ struct GlobalState {
     /// Steady traffic (enabled, slot ms, foreground), applied to each new
     /// client like `cover`.
     steady: (bool, u32, bool),
+    /// Android background receiving (keepalive at 240 s), applied to each
+    /// new client like `cover`.
+    background: bool,
     /// The state key and writer from `rchat_set_state_store`, applied to
     /// each new client at `rchat_connect` (spec §18.4 D27). Dropped (the
     /// key wiped) by `rchat_disconnect`: they belong to one account.
@@ -78,6 +81,25 @@ struct GlobalState {
     device_signer: Option<CDeviceSigner>,
 }
 
+/// The installed client's call audio (D37): the PCM functions run every
+/// 20 ms on the app's audio thread and take only this lock, never
+/// `GLOBAL_STATE` (which `rchat_disconnect` holds while it drops the
+/// runtime) and never the client lock.
+static CALL_AUDIO: parking_lot::Mutex<Option<crate::call::CallAudioHandle>> =
+    parking_lot::Mutex::new(None);
+
+/// The installed client's call video (Android video calls spec §6): the
+/// per-frame video functions take only this lock and the media's own, never
+/// `GLOBAL_STATE` and never the client lock.
+static CALL_VIDEO: parking_lot::Mutex<Option<crate::call::CallVideoHandle>> =
+    parking_lot::Mutex::new(None);
+
+/// The video prefs the app set, kept for the whole process: set with or
+/// without a client, and copied into each client at install, so a setting
+/// made before `rchat_connect` (or kept across a reconnect) is not lost.
+static VIDEO_PREFS: Lazy<crate::call::machine::VideoPrefs> =
+    Lazy::new(crate::call::machine::VideoPrefs::default);
+
 static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
     Mutex::new(GlobalState {
         runtime: None,
@@ -88,12 +110,46 @@ static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
         connecting_kems: Vec::new(),
         cover: (false, false),
         steady: (false, crate::steady::STEADY_DEFAULT_SLOT_MS, false),
+        background: false,
         state_key: None,
         state_write: None,
         staged_records: Vec::new(),
         device_signer: None,
     })
 });
+
+/// Call events of a client retired or dropped during a call (final review
+/// I2): its `call_abort` ended the call (media stopped, keys dropped), but
+/// the Ended went into its own queue after its callbacks were gone. Moved
+/// here by `hand_over_call_events`; `rchat_call_poll_event` returns these
+/// first, whichever client is current (or none). Bounded: a retire leaves
+/// at most a call's last few events.
+static RETIRED_CALL_EVENTS: parking_lot::Mutex<std::collections::VecDeque<String>> =
+    parking_lot::Mutex::new(std::collections::VecDeque::new());
+const MAX_RETIRED_CALL_EVENTS: usize = 32;
+
+/// Move a retired client's waiting call events to `RETIRED_CALL_EVENTS`
+/// and tell the app (status 11) through the registered callbacks, as the
+/// retired client can no longer. Call with no lock held.
+fn hand_over_call_events(previous: &RChatClient) {
+    let mut moved = false;
+    {
+        let mut q = RETIRED_CALL_EVENTS.lock();
+        while let Some(json) = previous.call_poll_event() {
+            if q.len() >= MAX_RETIRED_CALL_EVENTS {
+                q.pop_front();
+            }
+            q.push_back(json);
+            moved = true;
+        }
+    }
+    if moved {
+        let callbacks = lock_state().callbacks.clone();
+        if let Some(cb) = callbacks {
+            cb.on_status_event(crate::status::StatusEvent::CallEvents);
+        }
+    }
+}
 
 /// Serialises `rchat_connect`: two overlapping connects (a foreground and a
 /// network-restored reconnect) would otherwise each move the peer book and
@@ -142,6 +198,15 @@ static DISCONNECT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 ///      refused before anything is sent, protocol v3 §E.2)
 /// 29 = A client is connected (ForegroundConnected: `rchat_background_drain`
 ///      only, returned as -29; protocol v3 §H.1)
+/// 30 = File blocked (FileBlocked: a kind of file rChat never sends: apps,
+///      installers, scripts, web pages, documents with macros, archives it
+///      can't check; refused before anything is sent, file-safety spec §3)
+/// 31 = The relay needs an update for calls (RelayNoCalls: no `calls-v1`)
+/// 32 = A call is already in progress (CallInProgress)
+/// 33 = No such call (NoSuchCall)
+/// 34 = Video is unavailable (VideoUnavailable: the call cannot start video)
+/// 35 = The relay needs an update for video (RelayNoVideo: no `video-v1`)
+/// 36 = Video was asked for too soon (VideoTooSoon)
 ///
 /// `rchat_set_steady_traffic` returns 9 (Invalid parameter) for a slot
 /// length other than 500, 1000 or 2000 ms.
@@ -150,10 +215,13 @@ static DISCONNECT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// returns the message id as a heap string (free with `rchat_free_string`)
 /// or NULL with the code recorded: 9 for a NULL or non-UTF-8 recipient,
 /// name or MIME, `bytes` NULL with `len > 0`, or a MIME that is not
-/// printable ASCII of at most 255 bytes; 28 for a file too large; 7 when
+/// printable ASCII of at most 255 bytes; 28 for a file too large; 30 for
+/// a kind of file rChat never sends; 7 when
 /// not connected; otherwise the send's code as `rchat_send_binary_with_id`.
 /// Received files arrive only through `on_file` (12th callback of
-/// `rchat_register_callbacks`), never through `on_message`.
+/// `rchat_register_callbacks`), never through `on_message`. A file of a
+/// blocked kind arrives only through `on_file_blocked` (14th), with no
+/// bytes; the core has already queued its delivered receipt.
 ///
 /// `rchat_last_error_code` returns the code of the most recent failing call
 /// on the calling thread; every error return records the code it returns.
@@ -177,7 +245,7 @@ thread_local! {
 
 /// Record a failure on the calling thread and return its code, so every
 /// error return reports the code `rchat_last_error_code` then gives.
-fn record_error(code: c_int, message: String) -> c_int {
+pub(crate) fn record_error(code: c_int, message: String) -> c_int {
     LAST_ERROR.with(|e| *e.borrow_mut() = (code, message));
     code
 }
@@ -332,7 +400,14 @@ fn error_code_from_err(e: &RChatError) -> c_int {
         RChatError::ResendRefused { .. } => 26,
         RChatError::NoKemKey { .. } => 27,
         RChatError::FileTooLarge { .. } => 28,
+        RChatError::FileBlocked { .. } => 30,
         RChatError::ForegroundConnected => 29,
+        RChatError::RelayNoCalls => 31,
+        RChatError::CallInProgress => 32,
+        RChatError::NoSuchCall => 33,
+        RChatError::VideoUnavailable => 34,
+        RChatError::RelayNoVideo => 35,
+        RChatError::VideoTooSoon => 36,
     }
 }
 
@@ -389,6 +464,14 @@ pub type FileReceivedFn = extern "C" fn(
     u64,
 );
 
+/// `on_file_blocked(peer_hex, message_id_hex, name, expire_secs,
+/// timestamp_ms)`: a received file of a kind rChat blocks (file-safety spec
+/// §3). `name` is cleaned as for `on_file`; there are no bytes (the core
+/// wiped them). The core has marked it seen and queued its delivered
+/// receipt: the app shows "A file was blocked" and never calls
+/// `rchat_mark_message_seen` for it. Arguments are valid only for the call.
+pub type FileBlockedFn = extern "C" fn(*const c_char, *const c_char, *const c_char, u32, u64);
+
 /// `on_message(sender_hex, content_hex, timestamp_ms, message_id_hex, kind,
 /// expire_secs)`: `kind` is `MESSAGE_KIND_TEXT` or `MESSAGE_KIND_BINARY`;
 /// `expire_secs` is the sender's disappearing timer for this message (0 =
@@ -417,6 +500,7 @@ struct CCallbackPointers {
     on_status_event: extern "C" fn(c_int, *const c_char, *const c_char, c_int),
     on_file: FileReceivedFn,
     on_timer_changed: TimerChangedFn,
+    on_file_blocked: FileBlockedFn,
 }
 
 #[derive(Clone)]
@@ -501,6 +585,22 @@ impl RChatCallbacks for CCallbackBridge {
             );
         }
         zeroize::Zeroize::zeroize(&mut file.bytes);
+    }
+
+    fn on_file_blocked(&self, file: crate::BlockedFile) {
+        if let (Ok(peer), Ok(id), Ok(name)) = (
+            CString::new(file.sender_identity),
+            CString::new(file.id),
+            CString::new(file.name),
+        ) {
+            (self.ptrs.on_file_blocked)(
+                peer.as_ptr(),
+                id.as_ptr(),
+                name.as_ptr(),
+                file.expire_secs,
+                file.timestamp_ms,
+            );
+        }
     }
 
     fn on_peer_key_event(&self, identity_hex: String, code: u8, agreement_hex: String) {
@@ -791,6 +891,7 @@ unsafe fn connect_with(
     client.set_cover_traffic(cover_on, cover_fg);
     let (steady_on, steady_ms, steady_fg) = lock_state().steady;
     let _ = client.set_steady_traffic(steady_on, steady_ms, steady_fg);
+    client.set_keepalive_background(lock_state().background);
 
     // Connect (block_on via the runtime handle) — no lock held during this call
     let client_for_connect = client.clone();
@@ -937,15 +1038,20 @@ pub extern "C" fn rchat_disconnect() -> c_int {
         // from this client, even if a reconnect races with this (N-5).
         client.flush_callbacks();
         client.retire();
+        // A call on it ended with the disconnect: its Ended still reaches the app.
+        hand_over_call_events(&client);
     }
 
     let mut guard = lock_state();
     guard.client = None;
+    *CALL_AUDIO.lock() = None;
+    *CALL_VIDEO.lock() = None;
     guard.runtime = None;
     guard.staged = PeerBook::default();
     guard.connecting_kems.clear();
     guard.cover = (false, false);
     guard.steady = (false, crate::steady::STEADY_DEFAULT_SLOT_MS, false);
+    guard.background = false;
     // The account's state key (wiped on drop), writer and staged records.
     guard.state_key = None;
     guard.state_write = None;
@@ -996,8 +1102,16 @@ fn apply_store_and_signer(client: &RChatClient, generation: u64) {
 /// into the staged book (anything already staged applied on top), and
 /// silence and disconnect it.
 fn retire_previous_client() {
-    let Some(previous) = lock_state().client.take() else {
-        return;
+    let previous = {
+        let mut guard = lock_state();
+        let Some(previous) = guard.client.take() else {
+            return;
+        };
+        // Under the state lock, as `rchat_disconnect` does: no moment where
+        // the audio handle outlives the installed client.
+        *CALL_AUDIO.lock() = None;
+        *CALL_VIDEO.lock() = None;
+        previous
     };
     let mut book = previous.export_peer_book();
     {
@@ -1013,6 +1127,8 @@ fn retire_previous_client() {
     // It stops writing first: the new client restores and owns the records.
     previous.detach_state_store();
     previous.retire_delivering_queued();
+    // A call on it ended with the retire: its Ended still reaches the app.
+    hand_over_call_events(&previous);
 }
 
 /// `install_client`, unless `rchat_disconnect` ran since `generation` was
@@ -1040,6 +1156,14 @@ fn install_client_locked(
     client: Arc<RChatClient>,
 ) {
     guard.client = Some(client.clone());
+    *CALL_AUDIO.lock() = Some(client.call_audio_handle());
+    {
+        // Adopt and store under one CALL_VIDEO guard, so a concurrent
+        // configure/set_thermal lands on the old or the new client whole.
+        let mut video = CALL_VIDEO.lock();
+        client.call_video_adopt_prefs(&VIDEO_PREFS);
+        *video = Some(client.call_video_handle());
+    }
     // The client holds the identity now: the one loaded before the first
     // connect goes, wiped on drop (its keys zeroize), so a retired identity
     // can never sign again (Task 9b re-review).
@@ -1051,6 +1175,7 @@ fn install_client_locked(
     client.set_cover_traffic(cover_on, cover_fg);
     let (steady_on, steady_ms, steady_fg) = guard.steady;
     let _ = client.set_steady_traffic(steady_on, steady_ms, steady_fg);
+    client.set_keepalive_background(guard.background);
 }
 
 /// A connect failed: hand the book `adopt_staged` gave the client back to
@@ -1324,6 +1449,8 @@ fn uninstall_client(client: &Arc<RChatClient>) {
     let installed = {
         let mut g = lock_state();
         if g.client.as_ref().is_some_and(|c| Arc::ptr_eq(c, client)) {
+            *CALL_AUDIO.lock() = None;
+            *CALL_VIDEO.lock() = None;
             g.client.take()
         } else {
             None
@@ -1600,6 +1727,130 @@ pub unsafe extern "C" fn rchat_sanitise_file_name(name: *const c_char) -> *mut c
     }
 }
 
+/// `len` bytes at `bytes` as a slice, or `None` (the caller records 9) for
+/// `bytes` NULL with `len > 0` or a `len` no Rust slice can have (over
+/// `isize::MAX`, reachable on a 32-bit target). `len` 0 is the empty slice
+/// whatever `bytes` is.
+///
+/// # Safety
+///
+/// `bytes` must be NULL or valid for reads of `len` bytes, unmodified for
+/// the lifetime `'a` the caller picks (at most the call).
+unsafe fn byte_view<'a>(bytes: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if bytes.is_null() || isize::try_from(len).is_err() {
+        return None;
+    }
+    // SAFETY: non-null, `len` ≤ isize::MAX, valid for `len` bytes per the
+    // contract.
+    Some(unsafe { std::slice::from_raw_parts(bytes, len) })
+}
+
+/// File safety (spec §3): the verdict for a file named `name`, cleaned here
+/// first as both send and receive paths clean it, holding `len` bytes at
+/// `bytes`: 0 allowed; 1 Android app, 2 iPhone app or profile, 3 program or
+/// script, 4 web page or SVG, 5 document with macros, 6 an archive that
+/// can't be checked. The app refuses any non-zero result with one sentence
+/// and never names the category. With `len` 0 only the name is checked
+/// (the review step, before the file is read). -1 with code 9 for a NULL or
+/// non-UTF-8 `name`, or `bytes` NULL with `len > 0`. Needs no client.
+///
+/// # Safety
+///
+/// `name` must be NULL or a NUL-terminated string, and `bytes` NULL or
+/// valid for reads of `len` bytes; both stay valid and unmodified for the
+/// duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_file_check(
+    name: *const c_char,
+    bytes: *const u8,
+    len: usize,
+) -> c_int {
+    let (Some(name), Some(view)) = (arg(name), byte_view(bytes, len)) else {
+        record_error(9, "Invalid parameter".to_string());
+        return -1;
+    };
+    crate::file_check::classify(&crate::file_msg::sanitise_name(name.as_bytes()), view).code()
+}
+
+/// File safety (spec §4): whether `len` bytes at `bytes` may reach the
+/// platform's decoder as `kind` (1 photo: JPEG, PNG, WebP or HEIF within
+/// 16 Mpx; 2 voice: MPEG-4 AAC audio whose boxes chain to a `moov`). 0
+/// passes, 1 refused, -1 with code 9 for another kind or `bytes` NULL with
+/// `len > 0`. Needs no client.
+///
+/// # Safety
+///
+/// `bytes` must be NULL or valid for reads of `len` bytes, unmodified for
+/// the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_media_check(kind: c_int, bytes: *const u8, len: usize) -> c_int {
+    let Some(view) = byte_view(bytes, len) else {
+        record_error(9, "Invalid parameter".to_string());
+        return -1;
+    };
+    match crate::media_check::check(kind, view) {
+        Some(true) => 0,
+        Some(false) => 1,
+        None => {
+            record_error(9, "Unknown media kind".to_string());
+            -1
+        }
+    }
+}
+
+/// Ed25519 signature check over raw bytes (RFC 8032, strict: small-order
+/// keys and non-canonical signatures are refused). `public_key` is 32
+/// bytes, `signature` 64, `message` any length. 0 valid; 1 the signature
+/// does not hold (or the key is not a valid point); -1 with code 9 for a
+/// NULL pointer (with a non-zero length) or a wrong key or signature
+/// length. Pure and stateless: needs no client. The Android updater uses it
+/// because some phones have no software Ed25519 provider.
+///
+/// # Safety
+///
+/// Every non-NULL pointer must be valid for reads of its length, unmodified
+/// for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_verify_ed25519(
+    public_key: *const u8,
+    public_key_len: usize,
+    message: *const u8,
+    message_len: usize,
+    signature: *const u8,
+    signature_len: usize,
+) -> c_int {
+    // SAFETY: the caller's contract above; `byte_view` rejects NULL with a length.
+    let views = unsafe {
+        (
+            byte_view(public_key, public_key_len),
+            byte_view(message, message_len),
+            byte_view(signature, signature_len),
+        )
+    };
+    let parsed = (|| {
+        let (Some(k), Some(m), Some(s)) = views else {
+            return None;
+        };
+        let k: [u8; 32] = k.try_into().ok()?;
+        let s: [u8; 64] = s.try_into().ok()?;
+        Some((k, m, s))
+    })();
+    let Some((k, m, s)) = parsed else {
+        record_error(9, "Invalid parameter".to_string());
+        return -1;
+    };
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&k) else {
+        return 1;
+    };
+    match vk.verify_strict(m, &ed25519_dalek::Signature::from_bytes(&s)) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 /// A file send's checked arguments (`file_args`).
 struct FileArgs {
     recipient: String,
@@ -1612,8 +1863,9 @@ struct FileArgs {
 
 /// The file sends' shared checks, in order, before anything is copied:
 /// the strings (9), `bytes` NULL with `len > 0` (9), the MIME (9), then the
-/// size (28). `Err(code)`, recorded, otherwise; on success the bytes are
-/// copied (the client wipes the copy).
+/// size (28), then the kind (30, file-safety spec §3: the receiver's
+/// classifier on the cleaned name and the bytes). `Err(code)`, recorded,
+/// otherwise; on success the bytes are copied (the client wipes the copy).
 ///
 /// # Safety
 ///
@@ -1628,9 +1880,10 @@ unsafe fn file_args(
     let (Some(recipient), Some(name), Some(mime)) = (arg(recipient), arg(name), arg(mime)) else {
         return Err(record_error(9, "Invalid parameter".to_string()));
     };
-    if bytes.is_null() && len != 0 {
+    // SAFETY: as `rchat_send_file`: NULL or valid for `len` bytes.
+    let Some(view) = (unsafe { byte_view(bytes, len) }) else {
         return Err(record_error(9, "Invalid parameter".to_string()));
-    }
+    };
     if !crate::file_msg::mime_ok(mime.as_bytes()) {
         return Err(record_error(
             9,
@@ -1643,12 +1896,16 @@ unsafe fn file_args(
     if len > crate::file_msg::MAX_FILE_PLAINTEXT.saturating_sub(fixed) {
         return Err(record_error(28, "File too large".to_string()));
     }
-    let data = zeroize::Zeroizing::new(if len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: non-null and valid for `len` bytes per the contract.
-        unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
-    });
+    // File safety §3: a blocked kind is refused before anything is copied.
+    if crate::file_check::classify(&crate::file_msg::sanitise_name(name.as_bytes()), view)
+        .is_blocked()
+    {
+        return Err(record_error(
+            30,
+            "rChat doesn't send this kind of file".to_string(),
+        ));
+    }
+    let data = zeroize::Zeroizing::new(view.to_vec());
     Ok(FileArgs {
         recipient,
         name,
@@ -1734,7 +1991,7 @@ unsafe fn file_using_id(
 /// first send with an id the app picked, carrying the contact's current
 /// timer (`expire_out`, when not NULL, receives it). A Retry of a file
 /// already sent uses `rchat_retry_file_using_id`. 0 ok, else an error code:
-/// as `rchat_send_file` (9, 28 before anything is copied, 7), and 9 for a
+/// as `rchat_send_file` (9, 28, 30 before anything is copied, 7), and 9 for a
 /// NULL or malformed id.
 ///
 /// # Safety
@@ -2306,6 +2563,9 @@ pub unsafe extern "C" fn rchat_validate_identity(identity_content: *const c_char
 /// `on_message` (1st) carries the message's `expire_secs` last, as
 /// `MessageFn` documents; `on_timer_changed` (13th, protocol v3 §I.2): a
 /// contact's disappearing timer changed, as `TimerChangedFn` documents.
+///
+/// `on_file_blocked` (14th, file-safety spec §3): a received file of a
+/// blocked kind, as `FileBlockedFn` documents.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn rchat_register_callbacks(
@@ -2322,6 +2582,7 @@ pub extern "C" fn rchat_register_callbacks(
     on_status_event: Option<extern "C" fn(c_int, *const c_char, *const c_char, c_int)>,
     on_file: Option<FileReceivedFn>,
     on_timer_changed: Option<TimerChangedFn>,
+    on_file_blocked: Option<FileBlockedFn>,
 ) -> c_int {
     refuse_reentry!(-1);
     let (
@@ -2338,6 +2599,7 @@ pub extern "C" fn rchat_register_callbacks(
         Some(on_status_event),
         Some(on_file),
         Some(on_timer_changed),
+        Some(on_file_blocked),
     ) = (
         on_message,
         on_state_change,
@@ -2352,6 +2614,7 @@ pub extern "C" fn rchat_register_callbacks(
         on_status_event,
         on_file,
         on_timer_changed,
+        on_file_blocked,
     )
     else {
         record_error(9, "A callback pointer is NULL".to_string());
@@ -2372,6 +2635,7 @@ pub extern "C" fn rchat_register_callbacks(
             on_status_event,
             on_file,
             on_timer_changed,
+            on_file_blocked,
         },
     };
     let client = {
@@ -3511,13 +3775,14 @@ pub unsafe extern "C" fn rchat_parse_relay_invite(link: *const c_char) -> *mut c
 /// `rchat_parse_relay_invite` that also accepts `ws://` to this device
 /// (`127.0.0.1`, `::1`, `localhost`): for the app's debug builds and a local
 /// test relay only. Exported only with the `dev-invite` feature, which
-/// `ios/build_rust.sh` sets for Debug builds: a release library has no
-/// such symbol.
+/// `ios/build_rust.sh` sets for Debug builds and `android/build_rust.sh`
+/// for the debug variant's libraries: a release library has no such
+/// symbol (both build scripts check it).
 ///
 /// # Safety
 ///
 /// As `rchat_parse_relay_invite`.
-#[cfg(feature = "dev-invite")]
+#[cfg(any(feature = "dev-invite", test))]
 #[no_mangle]
 pub unsafe extern "C" fn rchat_parse_relay_invite_dev(link: *const c_char) -> *mut c_char {
     let Some(link) = (unsafe { arg(link) }) else {
@@ -3612,6 +3877,430 @@ pub extern "C" fn rchat_set_cover_traffic(enabled: c_int, foreground: c_int) -> 
         client.set_cover_traffic(on, fg);
     }
     0
+}
+
+/// Android background receiving (spec 2026-10-26 §3): nonzero `background`
+/// stretches the keepalive to `KEEPALIVE_BACKGROUND_SECS` (240 s), zero
+/// returns it to the configured interval (30 s). Reaches the live connection
+/// at once. Kept until `rchat_connect` when there is no client; a full
+/// disconnect resets it. Always 0.
+#[no_mangle]
+pub extern "C" fn rchat_set_background_keepalive(background: c_int) -> c_int {
+    refuse_reentry!(8);
+    let bg = background != 0;
+    // Staged flag and live value change under one lock, so concurrent calls
+    // can't leave them disagreeing (set_keepalive_background neither waits
+    // nor locks).
+    let mut guard = lock_state();
+    guard.background = bg;
+    if let Some(client) = guard.client.as_ref() {
+        client.set_keepalive_background(bg);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Voice calls (Android voice calls spec §6 "API")
+// ---------------------------------------------------------------------------
+
+/// Place a call to an accepted contact (`peer_hex`, 64 hex). Returns the
+/// call id (32 hex; free with `rchat_free_string`) or NULL with the code:
+/// 9 bad identity, 7 not connected, 10-13 the contact's key state, 27 no
+/// ML-KEM key, 31 the relay needs an update for calls, 32 a call is in
+/// progress. Events follow through `rchat_call_poll_event`.
+///
+/// # Safety
+///
+/// `peer_hex` is NULL or a NUL-terminated string valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_place(peer_hex: *const c_char) -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    let Some(peer) = unsafe { arg(peer_hex) }
+        .map(|s| s.to_lowercase())
+        .filter(|s| key_from_hex(s).is_some())
+    else {
+        record_error(9, "Invalid identity".to_string());
+        return std::ptr::null_mut();
+    };
+    let Ok(client) = client_or_7() else {
+        return std::ptr::null_mut();
+    };
+    match client.call_place(peer) {
+        Ok(id) => CString::new(id).map_or(std::ptr::null_mut(), CString::into_raw),
+        Err(e) => {
+            record_rchat_error(&e, "Place call");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The call id argument of answer/decline/end: Err(9) when NULL or not 32 hex.
+unsafe fn call_id_arg(call_id: *const c_char) -> Result<String, c_int> {
+    unsafe { arg(call_id) }
+        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| record_error(9, "Invalid call id".to_string()))
+}
+
+fn call_result(r: Result<(), RChatError>, what: &str) -> c_int {
+    match r {
+        Ok(()) => 0,
+        Err(e) => record_rchat_error(&e, what),
+    }
+}
+
+/// Answer the ringing call. 0, 9, 7, or 33 (no such call).
+///
+/// # Safety
+///
+/// `call_id` is NULL or a NUL-terminated string valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_answer(call_id: *const c_char) -> c_int {
+    refuse_reentry!(8);
+    let id = match unsafe { call_id_arg(call_id) } {
+        Ok(id) => id,
+        Err(c) => return c,
+    };
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    call_result(client.call_answer(id), "Answer call")
+}
+
+/// Decline the ringing call; nonzero `busy` tells the caller "Busy" (the
+/// phone is on a regular call). 0, 9, 7, or 33.
+///
+/// # Safety
+///
+/// `call_id` is NULL or a NUL-terminated string valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_decline(call_id: *const c_char, busy: c_int) -> c_int {
+    refuse_reentry!(8);
+    let id = match unsafe { call_id_arg(call_id) } {
+        Ok(id) => id,
+        Err(c) => return c,
+    };
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    call_result(client.call_decline(id, busy != 0), "Decline call")
+}
+
+/// End (or cancel) the call. 0, 9, 7, or 33.
+///
+/// # Safety
+///
+/// `call_id` is NULL or a NUL-terminated string valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_end(call_id: *const c_char) -> c_int {
+    refuse_reentry!(8);
+    let id = match unsafe { call_id_arg(call_id) } {
+        Ok(id) => id,
+        Err(c) => return c,
+    };
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    call_result(client.call_end(id), "End call")
+}
+
+/// Mute or unmute the microphone (encoded silence keeps the rate; applied
+/// until stable, so it ends up matching the last value). 0. Goes through the
+/// call's audio handle only: no global state lock, no client lock, so it is
+/// safe from any thread, including inside a synchronous callback.
+#[no_mangle]
+pub extern "C" fn rchat_call_set_muted(muted: c_int) -> c_int {
+    let audio = CALL_AUDIO.lock().clone();
+    if let Some(audio) = audio {
+        audio.set_muted(muted != 0);
+    }
+    0
+}
+
+/// One 20 ms frame of captured PCM: exactly 960 signed 16-bit mono samples
+/// at 48 kHz. Returns 960 (taken), 0 (no call), or -9 (NULL or another
+/// size; code 9). Takes only the call's audio lock (`CALL_AUDIO`, then
+/// the call's own media lock): never `GLOBAL_STATE`, the client lock or
+/// the network.
+///
+/// # Safety
+///
+/// `pcm` is NULL or points to `samples` readable `int16_t`s.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_push_pcm(pcm: *const i16, samples: usize) -> c_int {
+    if pcm.is_null() || samples != crate::call::FRAME_SAMPLES {
+        return -record_error(9, "pcm must be 960 samples".to_string());
+    }
+    let Some(audio) = CALL_AUDIO.lock().clone() else {
+        return 0;
+    };
+    // SAFETY: checked non-NULL; the caller guarantees `samples` readable values.
+    let frame = unsafe { std::slice::from_raw_parts(pcm, samples) };
+    audio.push_pcm(frame) as c_int
+}
+
+/// The next 20 ms frame to play into `out` (960 samples). Returns 960, 0
+/// (no call: `out` is silence), or -9 (NULL or another size; code 9).
+/// Takes only the call's audio lock, as `rchat_call_push_pcm`.
+///
+/// # Safety
+///
+/// `out` is NULL or points to `samples` writable `int16_t`s.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_pull_pcm(out: *mut i16, samples: usize) -> c_int {
+    if out.is_null() || samples != crate::call::FRAME_SAMPLES {
+        return -record_error(9, "pcm must be 960 samples".to_string());
+    }
+    // SAFETY: checked non-NULL; the caller guarantees `samples` writable values.
+    let frame = unsafe { std::slice::from_raw_parts_mut(out, samples) };
+    let audio = CALL_AUDIO.lock().clone();
+    match audio {
+        Some(audio) => audio.pull_pcm(frame) as c_int,
+        None => {
+            frame.fill(0);
+            0
+        }
+    }
+}
+
+/// Place a video call from the chat header: the call id (32 hex; free with
+/// `rchat_free_string`) or NULL with the code: 9 bad identity, 7 not
+/// connected, 10-13 the contact's key state, 27 no ML-KEM key, 31 the relay
+/// needs an update for calls, 32 a call is in progress, 8 refused inside a
+/// synchronous callback. Events follow through `rchat_call_poll_event`.
+///
+/// # Safety
+///
+/// `peer_hex` is NULL or a NUL-terminated string valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_place_video(peer_hex: *const c_char) -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    let Some(peer) = unsafe { arg(peer_hex) }
+        .map(|s| s.to_lowercase())
+        .filter(|s| key_from_hex(s).is_some())
+    else {
+        record_error(9, "Invalid identity".to_string());
+        return std::ptr::null_mut();
+    };
+    let Ok(client) = client_or_7() else {
+        return std::ptr::null_mut();
+    };
+    match client.call_place_video(peer) {
+        Ok(id) => CString::new(id).map_or(std::ptr::null_mut(), CString::into_raw),
+        Err(e) => {
+            record_rchat_error(&e, "Place video call");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// My camera on (nonzero) or off in the current call. 0, 8 refused inside a
+/// synchronous callback, 7 not connected,
+/// 33 no such call, 34 video unavailable, 35 the relay needs an update for
+/// video, 36 asked for too soon.
+#[no_mangle]
+pub extern "C" fn rchat_call_video_set_camera(on: c_int) -> c_int {
+    refuse_reentry!(8);
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    call_result(client.call_video_set_camera(on != 0), "Set camera")
+}
+
+/// Accept (nonzero) or Not now (0) for the peer's video request. 0, 8
+/// refused inside a synchronous callback, 7 not connected, 33 no pending request.
+#[no_mangle]
+pub extern "C" fn rchat_call_video_respond(accept: c_int) -> c_int {
+    refuse_reentry!(8);
+    let client = match client_or_7() {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    call_result(client.call_video_respond(accept != 0), "Respond to video")
+}
+
+/// This phone's video Caps for the next call: `codec_mask` (bit 0 H.265,
+/// bit 1 H.264), 1080p wanted, software encoder. 0, 8 refused inside a
+/// synchronous callback, or 9 when the mask is over 3. Works with no client: the values are kept process-wide and
+/// copied into each client at install.
+#[no_mangle]
+pub extern "C" fn rchat_call_video_configure(
+    codec_mask: c_int,
+    receive_1080: c_int,
+    software_encoder: c_int,
+) -> c_int {
+    refuse_reentry!(8);
+    let Ok(mask) = u8::try_from(codec_mask).ok().filter(|m| *m <= 3).ok_or(()) else {
+        return record_error(9, "codec_mask must be 0 to 3".to_string());
+    };
+    // Both writes under the CALL_VIDEO guard (as install's adopt), so two
+    // configures can't leave the process prefs and the client disagreeing.
+    let video = CALL_VIDEO.lock();
+    VIDEO_PREFS.set(mask, receive_1080 != 0, software_encoder != 0);
+    if let Some(handle) = video.as_ref() {
+        handle.configure(mask, receive_1080 != 0, software_encoder != 0);
+    }
+    0
+}
+
+/// `PowerManager` thermal status 0..=6. 0, or 9 for another value. Kept
+/// process-wide and applied to the running call; takes only the video lock,
+/// never `GLOBAL_STATE`.
+#[no_mangle]
+pub extern "C" fn rchat_call_video_set_thermal(level: c_int) -> c_int {
+    let Some(level) = u8::try_from(level).ok().filter(|l| *l <= 6) else {
+        return record_error(9, "thermal level must be 0 to 6".to_string());
+    };
+    let video = {
+        let guard = CALL_VIDEO.lock();
+        VIDEO_PREFS.set_thermal(level);
+        guard.clone()
+    };
+    if let Some(video) = video {
+        video.set_thermal(level);
+    }
+    0
+}
+
+/// The encoder's current hint into `out` (7 `int32_t`): generation, width,
+/// height, fps, bitrate, keyframe wanted (0/1), active (0/1; 0 while paused
+/// or the camera is off). Returns 1 (written, whenever the call has video
+/// media), 0 (no video media: `out` untouched), or -9 (NULL or `n` != 7;
+/// code 9). Takes only the video lock, never `GLOBAL_STATE`.
+///
+/// # Safety
+///
+/// `out` is NULL or points to `n` writable `int32_t`s.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_video_encoder_hint(out: *mut i32, n: usize) -> c_int {
+    if out.is_null() || n != 7 {
+        return -record_error(9, "hint needs 7 values".to_string());
+    }
+    let video = CALL_VIDEO.lock().clone();
+    let Some(hint) = video.and_then(|v| v.encoder_hint_if_media()) else {
+        return 0;
+    };
+    // SAFETY: checked non-NULL; the caller guarantees `n` (7) writable values.
+    unsafe { std::ptr::copy_nonoverlapping(hint.to_ints().as_ptr(), out, 7) };
+    1
+}
+
+/// One encoded frame from the camera encoder. Returns the fragments queued
+/// (>= 1), 0 (no call, or not sending), or -9 (NULL, `len` 0 or over
+/// 393216, or `rotation_deg` not 0/90/180/270; code 9). Takes only the
+/// video lock, never `GLOBAL_STATE`; nothing allocates.
+///
+/// # Safety
+///
+/// `data` is NULL or points to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_video_send(
+    data: *const u8,
+    len: usize,
+    keyframe: c_int,
+    rotation_deg: c_int,
+) -> c_int {
+    if data.is_null()
+        || len == 0
+        || len > crate::call::video::VIDEO_MAX_FRAME
+        || !matches!(rotation_deg, 0 | 90 | 180 | 270)
+    {
+        return -record_error(9, "Invalid video frame".to_string());
+    }
+    let video = CALL_VIDEO.lock().clone();
+    let Some(video) = video else {
+        return 0;
+    };
+    // SAFETY: checked non-NULL; the caller guarantees `len` readable bytes.
+    let frame = unsafe { std::slice::from_raw_parts(data, len) };
+    video.send_frame(frame, keyframe != 0, rotation_deg as u16)
+}
+
+/// The next received frame into `out` (`cap` bytes) and `meta` (4
+/// `int32_t`: keyframe 0/1, codec 0 H.265 / 1 H.264, rotation_deg, hold_ms).
+/// Returns the frame length, 0 (none waiting, or no call), or -9 (NULL, `n`
+/// != 4, or `cap` smaller than the frame: that frame is dropped and a
+/// keyframe asked for; code 9). Takes only the video lock, never
+/// `GLOBAL_STATE`.
+///
+/// # Safety
+///
+/// `out` is NULL or points to `cap` writable bytes; `meta` is NULL or points
+/// to `n` writable `int32_t`s.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_call_video_take(
+    out: *mut u8,
+    cap: usize,
+    meta: *mut i32,
+    n: usize,
+) -> c_int {
+    if out.is_null() || meta.is_null() || n != 4 {
+        return -record_error(9, "take needs a buffer and 4 meta values".to_string());
+    }
+    let video = CALL_VIDEO.lock().clone();
+    let Some(video) = video else {
+        return 0;
+    };
+    // SAFETY: checked non-NULL; the caller guarantees `cap` writable bytes.
+    let buf = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+    match video.take(buf) {
+        Ok(None) => 0,
+        Ok(Some(f)) => {
+            let m = [
+                i32::from(f.keyframe),
+                match f.codec {
+                    crate::call::video::VideoCodec::H265 => 0,
+                    crate::call::video::VideoCodec::H264 => 1,
+                },
+                i32::from(f.rotation_deg),
+                i32::try_from(f.hold_ms).unwrap_or(i32::MAX),
+            ];
+            // SAFETY: checked non-NULL; the caller guarantees 4 writable values.
+            unsafe { std::ptr::copy_nonoverlapping(m.as_ptr(), meta, 4) };
+            c_int::try_from(f.len).unwrap_or(0)
+        }
+        Err(_) => -record_error(9, "video buffer too small".to_string()),
+    }
+}
+
+/// The decoder failed: ask the sender for a keyframe. 0 (also with no
+/// call). Takes only the video lock, never `GLOBAL_STATE`.
+#[no_mangle]
+pub extern "C" fn rchat_call_video_need_keyframe() -> c_int {
+    let video = CALL_VIDEO.lock().clone();
+    if let Some(video) = video {
+        video.need_keyframe();
+    }
+    0
+}
+
+/// The next call event as JSON (free with `rchat_free_string`), or NULL
+/// when none is waiting (code 0). Poll after a status event of kind 11
+/// (`CallEvents`) until NULL. Events of a client retired or dropped during
+/// a call (its Ended) come first, then the current client's. Takes the
+/// global state lock only to find the client, then the event queue's own
+/// lock; never the client lock. From
+/// inside a synchronous callback it returns NULL with code 8 (not 0).
+#[no_mangle]
+pub extern "C" fn rchat_call_poll_event() -> *mut c_char {
+    refuse_reentry!(std::ptr::null_mut());
+    record_error(0, String::new());
+    // A retired client's events first: they came before the current one's.
+    let retired = RETIRED_CALL_EVENTS.lock().pop_front();
+    if let Some(json) = retired {
+        return CString::new(json).map_or(std::ptr::null_mut(), CString::into_raw);
+    }
+    let client = lock_state().client.clone();
+    let Some(client) = client else {
+        return std::ptr::null_mut();
+    };
+    match client.call_poll_event() {
+        Some(json) => CString::new(json).map_or(std::ptr::null_mut(), CString::into_raw),
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// Steady traffic on/off (`enabled` nonzero), its slot length and whether
@@ -3768,6 +4457,18 @@ pub unsafe extern "C" fn rchat_import_state_record(
     // SAFETY: non-null and `len` (≤ 2 MiB) readable bytes per the contract.
     let bytes = unsafe { std::slice::from_raw_parts(sealed, len) }.to_vec();
     g.staged_records.push((key, bytes));
+    0
+}
+
+/// Forget the platform trust roots read so far (Android's system CA store,
+/// without the CAs the user disabled): the next TLS handshake reads them
+/// again, so a CA disabled in the system settings stops being trusted
+/// without a restart. Call when the app comes to the foreground. Touches no
+/// connection and no file; does nothing where the roots aren't kept
+/// (iOS, desktop). Always 0.
+#[no_mangle]
+pub extern "C" fn rchat_refresh_trust_store() -> c_int {
+    crate::android_roots::forget_platform_store();
     0
 }
 
@@ -3967,14 +4668,130 @@ pub unsafe extern "C" fn rchat_pin_device_key(
     }
 }
 
+/// Whether a card's device-key binding verifies (spec §18.14 D43): `dks_hex`
+/// (128 hex) must be the identity `ik_hex`'s signature over `dk_hex` (130-hex
+/// uncompressed P-256 point) and the `hardware` flag. Pure: needs no
+/// `rchat_initialize`. 1 valid; 0 refused (bad signature, or `dk` not a
+/// valid P-256 point); -1 malformed arguments (code 9). For apps whose
+/// platform has no Ed25519 (Android): the app never checks signatures itself.
+///
+/// # Safety
+///
+/// Every non-NULL pointer must be a NUL-terminated string valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_verify_device_key_binding(
+    ik_hex: *const c_char,
+    dk_hex: *const c_char,
+    hardware: c_int,
+    dks_hex: *const c_char,
+) -> c_int {
+    let parsed = (|| {
+        let ik = key_from_hex(&arg(ik_hex)?.to_lowercase())?;
+        let dk: [u8; 65] = hex::decode(arg(dk_hex)?).ok()?.try_into().ok()?;
+        let dks: [u8; 64] = hex::decode(arg(dks_hex)?).ok()?.try_into().ok()?;
+        Some((ik, dk, dks))
+    })();
+    let Some((ik, dk, dks)) = parsed else {
+        record_error(9, "Invalid parameter".to_string());
+        return -1;
+    };
+    match crate::keyauth::verify_device_key(&ik, &dk, hardware != 0, &dks) {
+        Ok(()) => 1,
+        Err(_) => 0,
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// The real Android update manifest (2.3.1) and its release signature, against the
+    /// release key embedded in the app's UpdateChecker.kt: the path phones now take.
+    #[test]
+    fn verify_ed25519_accepts_the_published_android_update_manifest() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key = b64
+            .decode("/3r+3RcVWHYm3/S1ShcnkDNb9wuRXLXsbfVZqNIWaAc=")
+            .unwrap();
+        let manifest = include_bytes!("testdata/android-update-2.3.1.json");
+        let sig = b64
+            .decode(include_str!("testdata/android-update-2.3.1.json.sig").trim())
+            .unwrap();
+        let v = |m: &[u8]| unsafe {
+            rchat_verify_ed25519(
+                key.as_ptr(),
+                key.len(),
+                m.as_ptr(),
+                m.len(),
+                sig.as_ptr(),
+                sig.len(),
+            )
+        };
+        assert_eq!(v(manifest), 0);
+        let mut changed = manifest.to_vec();
+        changed[20] ^= 1;
+        assert_eq!(v(&changed), 1, "one changed byte of the manifest");
+    }
+
+    #[test]
+    fn verify_ed25519_rfc8032_vector_and_refusals() {
+        // RFC 8032 section 7.1, test 1 (empty message).
+        let pk = hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+            .unwrap();
+        let sig = hex::decode("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b").unwrap();
+        let v = |k: &[u8], m: &[u8], s: &[u8]| unsafe {
+            rchat_verify_ed25519(
+                k.as_ptr(),
+                k.len(),
+                m.as_ptr(),
+                m.len(),
+                s.as_ptr(),
+                s.len(),
+            )
+        };
+        assert_eq!(v(&pk, b"", &sig), 0);
+        assert_eq!(v(&pk, b"x", &sig), 1, "other message");
+        let mut bad = sig.clone();
+        bad[10] ^= 1;
+        assert_eq!(v(&pk, b"", &bad), 1, "flipped signature byte");
+        assert_eq!(v(&pk[..31], b"", &sig), -1);
+        assert_eq!(v(&pk, b"", &sig[..63]), -1);
+        let n = std::ptr::null();
+        unsafe {
+            assert_eq!(
+                rchat_verify_ed25519(n, 32, b"".as_ptr(), 0, sig.as_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                rchat_verify_ed25519(pk.as_ptr(), 32, n, 3, sig.as_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                rchat_verify_ed25519(pk.as_ptr(), 32, b"".as_ptr(), 0, n, 64),
+                -1
+            );
+            assert_eq!(rchat_verify_ed25519(n, 0, n, 0, n, 0), -1);
+        }
+    }
+
     use super::*;
     use std::sync::Mutex as StdMutex;
 
     /// GLOBAL_STATE is process-wide; FFI tests run one at a time.
-    static FFI_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    pub(crate) static FFI_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Installs (or, with None, removes) the live client, for tests of
+    /// other modules that need one (hold `FFI_TEST_LOCK`).
+    pub(crate) fn set_test_client(client: Option<Arc<RChatClient>>) {
+        lock_state().client = client;
+    }
     static CALLS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+    #[test]
+    fn video_errors_map_to_34_35_36() {
+        assert_eq!(error_code_from_err(&RChatError::VideoUnavailable), 34);
+        assert_eq!(error_code_from_err(&RChatError::RelayNoVideo), 35);
+        assert_eq!(error_code_from_err(&RChatError::VideoTooSoon), 36);
+    }
 
     fn c(s: &str) -> CString {
         CString::new(s).unwrap()
@@ -4088,6 +4905,21 @@ mod tests {
         ));
     }
 
+    extern "C" fn t_on_file_blocked(
+        peer: *const c_char,
+        id: *const c_char,
+        name: *const c_char,
+        expire_secs: u32,
+        ts: u64,
+    ) {
+        record(format!(
+            "blocked {} {} [{}] e{expire_secs} {ts}",
+            s(peer),
+            s(id),
+            s(name)
+        ));
+    }
+
     fn bridge() -> CCallbackBridge {
         CCallbackBridge {
             ptrs: CCallbackPointers {
@@ -4104,6 +4936,7 @@ mod tests {
                 on_status_event: t_on_status,
                 on_file: t_on_file,
                 on_timer_changed: t_on_timer,
+                on_file_blocked: t_on_file_blocked,
             },
         }
     }
@@ -4140,11 +4973,12 @@ mod tests {
                 Some(t_on_status as extern "C" fn(_, _, _, _)),
                 Some(t_on_file as FileReceivedFn),
                 Some(t_on_timer as TimerChangedFn),
+                Some(t_on_file_blocked as FileBlockedFn),
             )
         };
-        let (m, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc) = all();
+        let (m, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc, fb) = all();
         // Each position NULL in turn.
-        for null_at in 0..13 {
+        for null_at in 0..14 {
             let code = rchat_register_callbacks(
                 m.filter(|_| null_at != 0),
                 st.filter(|_| null_at != 1),
@@ -4159,18 +4993,19 @@ mod tests {
                 se.filter(|_| null_at != 10),
                 fi.filter(|_| null_at != 11),
                 tc.filter(|_| null_at != 12),
+                fb.filter(|_| null_at != 13),
             );
             assert_eq!(code, -1, "NULL at {null_at} refused");
             assert_eq!(rchat_last_error_code(), 9);
             assert!(lock_state().callbacks.is_none(), "nothing registered");
         }
         assert_eq!(
-            rchat_register_callbacks(m, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc),
+            rchat_register_callbacks(m, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc, fb),
             0
         );
         assert!(lock_state().callbacks.is_some());
         assert_eq!(
-            rchat_register_callbacks(None, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc),
+            rchat_register_callbacks(None, st, e, ci, d, r, k, rq, rc, ro, se, fi, tc, fb),
             -1
         );
         assert!(
@@ -4178,6 +5013,144 @@ mod tests {
             "a refused call keeps the earlier registration"
         );
         lock_state().callbacks = saved;
+    }
+
+    /// Review Focus 3: the name is cleaned before it is classified, so
+    /// case, a trailing dot or space and a double extension don't help.
+    #[test]
+    fn file_check_cleans_the_name_first() {
+        let check = |name: &str, bytes: &[u8]| unsafe {
+            rchat_file_check(c(name).as_ptr(), bytes.as_ptr(), bytes.len())
+        };
+        assert_eq!(check("x.APK", b"hi"), 1);
+        assert_eq!(check("invoice.pdf.apk", b"%PDF"), 1);
+        assert_eq!(check("Setup.Exe", b""), 3);
+        assert_eq!(check("evil.apk.", b"hi"), 1, "a trailing dot is stripped");
+        assert_eq!(check("evil.apk ", b"hi"), 1, "a trailing space is stripped");
+        assert_eq!(check("photo.jpg", b"MZ\x90\x00"), 3, "the content");
+        assert_eq!(
+            check("x.ap\u{200B}k", b"hi"),
+            0,
+            "becomes x.ap_k: no listed extension, harmless content"
+        );
+        assert_eq!(check("report.pdf", b"%PDF-1.7"), 0);
+        assert_eq!(check("a.txt", b""), 0, "the name alone (the review step)");
+        assert_eq!(
+            unsafe { rchat_file_check(std::ptr::null(), std::ptr::null(), 0) },
+            -1
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(
+            unsafe { rchat_file_check(c("a").as_ptr(), std::ptr::null(), 3) },
+            -1
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(
+            unsafe { rchat_file_check(c("a.txt").as_ptr(), std::ptr::null(), 0) },
+            0
+        );
+        let bad_utf8 = CString::new(vec![b'a', 0xFF]).unwrap();
+        assert_eq!(
+            unsafe { rchat_file_check(bad_utf8.as_ptr(), b"x".as_ptr(), 1) },
+            -1
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+    }
+
+    /// A length no slice can have is refused before any slice is made
+    /// (32-bit targets: `usize` is 32 bits there).
+    #[test]
+    fn checks_refuse_an_impossible_length() {
+        let b = [0u8; 4];
+        let huge = isize::MAX as usize + 1;
+        assert_eq!(
+            unsafe { rchat_file_check(c("a.txt").as_ptr(), b.as_ptr(), huge) },
+            -1
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(unsafe { rchat_media_check(1, b.as_ptr(), huge) }, -1);
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(unsafe { rchat_media_check(1, b.as_ptr(), usize::MAX) }, -1);
+    }
+
+    #[test]
+    fn media_check_by_kind() {
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0];
+        let run = |kind: c_int, b: &[u8]| unsafe { rchat_media_check(kind, b.as_ptr(), b.len()) };
+        assert_eq!(run(1, &jpeg), 0);
+        assert_eq!(run(2, &jpeg), 1);
+        assert_eq!(run(1, b"GIF89a"), 1);
+        assert_eq!(run(7, &jpeg), -1);
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(unsafe { rchat_media_check(1, std::ptr::null(), 4) }, -1);
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(unsafe { rchat_media_check(1, std::ptr::null(), 0) }, 1);
+    }
+
+    /// Code 30 is recorded before a client is needed (`file_args`), on
+    /// every send entry.
+    #[test]
+    fn send_file_refuses_a_blocked_file_with_30() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let bytes = b"MZ\x90\x00";
+        let id = unsafe {
+            rchat_send_file(
+                c(ID_A).as_ptr(),
+                c("report.pdf").as_ptr(),
+                c("application/pdf").as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(id.is_null());
+        assert_eq!(rchat_last_error_code(), 30);
+        let mid = c(&"ab".repeat(16));
+        assert_eq!(
+            unsafe {
+                rchat_retry_file_using_id(
+                    c(ID_A).as_ptr(),
+                    c("Setup.EXE.").as_ptr(),
+                    c("").as_ptr(),
+                    b"x".as_ptr(),
+                    1,
+                    0,
+                    mid.as_ptr(),
+                )
+            },
+            30
+        );
+        // The MIME (9) and the size (28) come first.
+        let big = vec![0u8; crate::file_msg::MAX_FILE_PLAINTEXT];
+        let id = unsafe {
+            rchat_send_file(
+                c(ID_A).as_ptr(),
+                c("x.exe").as_ptr(),
+                c("").as_ptr(),
+                big.as_ptr(),
+                big.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(id.is_null());
+        assert_eq!(rchat_last_error_code(), 28);
+    }
+
+    #[test]
+    fn the_bridge_hands_a_blocked_file_over_without_bytes() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        CALLS.lock().unwrap().clear();
+        bridge().on_file_blocked(crate::BlockedFile {
+            id: "0123".into(),
+            sender_identity: "aa".into(),
+            name: "x.apk".into(),
+            expire_secs: 60,
+            timestamp_ms: 7,
+        });
+        assert_eq!(
+            CALLS.lock().unwrap().last().cloned(),
+            Some("blocked aa 0123 [x.apk] e60 7".to_string())
+        );
     }
 
     /// R1-3: the identity check and the connect config read the seed into
@@ -4383,6 +5356,7 @@ mod tests {
         let big = vec![0u8; crate::file_msg::MAX_FILE_PLAINTEXT];
         let bad_mime = c("text/plain\u{7f}");
         let bad_id = c("zz");
+        let apk = c("x.apk");
         for f in entries {
             let call = |r, n, m, d, len, i| unsafe { f(r, n, m, d, len, i) };
             assert_eq!(
@@ -4467,6 +5441,19 @@ mod tests {
             assert_eq!(
                 call(
                     to.as_ptr(),
+                    apk.as_ptr(),
+                    mime.as_ptr(),
+                    body.as_ptr(),
+                    2,
+                    id.as_ptr()
+                ),
+                30,
+                "a blocked kind, before the client is needed"
+            );
+            assert_eq!(rchat_last_error_code(), 30);
+            assert_eq!(
+                call(
+                    to.as_ptr(),
                     name.as_ptr(),
                     mime.as_ptr(),
                     body.as_ptr(),
@@ -4522,7 +5509,7 @@ mod tests {
         let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         rchat_disconnect();
         let needle: [u8; 32] = rand::random();
-        let (a, name, mime) = (c(ID_A), c("f.bin"), c(""));
+        let (a, name, mime) = (c(ID_A), c("f.dat"), c(""));
         let mut out: *mut c_char = std::ptr::null_mut();
         let hits = crate::alloc_probe::freed_containing(needle, || {
             out = unsafe {
@@ -6326,6 +7313,36 @@ mod tests {
         rchat_disconnect();
     }
 
+    /// Android background receiving: the flag is kept until a client exists,
+    /// applied when it is installed, reaches the live client, and a full
+    /// disconnect resets it.
+    #[test]
+    fn background_keepalive_is_staged_applied_and_reset() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_initialize(), 0);
+        assert_eq!(
+            rchat_set_background_keepalive(1),
+            0,
+            "staged before connect"
+        );
+        let client = RChatClient::new(ClientConfig::default()).unwrap();
+        let live = |c: &RChatClient| c.inner.try_read().unwrap().keepalive.get();
+        assert_eq!(live(&client), 30, "the configured interval until applied");
+        install_client(client.clone());
+        assert_eq!(
+            live(&client),
+            crate::KEEPALIVE_BACKGROUND_SECS,
+            "applied on install"
+        );
+        assert_eq!(rchat_set_background_keepalive(0), 0);
+        assert_eq!(live(&client), 30, "back in the foreground");
+        assert_eq!(rchat_set_background_keepalive(1), 0);
+        assert_eq!(live(&client), 240, "later calls reach the client");
+        rchat_disconnect();
+        assert!(!lock_state().background, "a full disconnect resets it");
+    }
+
     /// Final review I-1: `rchat_reconnect` keeps the live client (its
     /// callbacks, sessions and pins) and, like a connect, applies whatever
     /// is staged and the cover setting once the transport is back.
@@ -6431,8 +7448,10 @@ mod tests {
 
         let dev = format!("rchat://relay?u=ws%3A%2F%2F127.0.0.1%3A18443&pin={pin}");
         assert_eq!(call(rchat_parse_relay_invite, &dev), None);
-        #[cfg(feature = "dev-invite")]
         assert!(call(rchat_parse_relay_invite_dev, &dev).is_some());
+        // Loopback only: a remote ws:// relay is refused by both parsers.
+        let remote = format!("rchat://relay?u=ws%3A%2F%2F10.0.0.5%2Fp&pin={pin}");
+        assert_eq!(call(rchat_parse_relay_invite_dev, &remote), None);
 
         assert!(unsafe { rchat_parse_relay_invite(std::ptr::null()) }.is_null());
         let ws = c("ws://relay.example.com/p");
@@ -7417,6 +8436,345 @@ mod tests {
             "the kept client ran the drain and left drain mode"
         );
         assert!(drain_lock_is_free());
+        rchat_disconnect();
+    }
+
+    /// `rchat_verify_device_key_binding` (Android: no platform Ed25519 in
+    /// Kotlin, so the card's binding is checked here, spec §2 "no security
+    /// logic in Kotlin").
+    #[test]
+    fn verify_device_key_binding_matches_the_binding_the_identity_makes() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seed = [0u8; 64];
+        assert_eq!(
+            unsafe { rchat_generate_identity_seed(seed.as_mut_ptr(), 64) },
+            1
+        );
+        let ik = s(rchat_get_identity_pubkey());
+        let dk = crate::device_key::test_keys::soft_dk(7).1.dk_pub.to_vec();
+        assert_eq!(dk.len(), 65);
+        let dks_ptr = unsafe { rchat_device_key_binding(dk.as_ptr(), 65, 1) };
+        assert!(!dks_ptr.is_null());
+        let dks = s(dks_ptr);
+        unsafe { rchat_free_string(dks_ptr) };
+        let (ik_c, dk_c, dks_c) = (c(&ik), c(&hex::encode(&dk)), c(&dks));
+        let ok = unsafe {
+            rchat_verify_device_key_binding(ik_c.as_ptr(), dk_c.as_ptr(), 1, dks_c.as_ptr())
+        };
+        assert_eq!(ok, 1);
+        // The hardware flag is covered by the signature.
+        let flipped = unsafe {
+            rchat_verify_device_key_binding(ik_c.as_ptr(), dk_c.as_ptr(), 0, dks_c.as_ptr())
+        };
+        assert_eq!(flipped, 0);
+        // Malformed: code 9, -1.
+        let short = c("abcd");
+        let bad = unsafe {
+            rchat_verify_device_key_binding(ik_c.as_ptr(), short.as_ptr(), 1, dks_c.as_ptr())
+        };
+        assert_eq!(bad, -1);
+        assert_eq!(rchat_last_error_code(), 9);
+        let null = unsafe {
+            rchat_verify_device_key_binding(std::ptr::null(), dk_c.as_ptr(), 1, dks_c.as_ptr())
+        };
+        assert_eq!(null, -1);
+        seed.fill(0);
+    }
+
+    /// Android calls (spec §6 API): without a client the call functions
+    /// report "not connected" or refuse bad buffers; nothing panics.
+    #[test]
+    fn call_functions_without_a_client() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect(); // no client from an earlier test
+        let peer = CString::new("ab".repeat(32)).unwrap();
+        assert!(unsafe { rchat_call_place(peer.as_ptr()) }.is_null());
+        assert_eq!(rchat_last_error_code(), 7);
+        let bad = CString::new("not hex").unwrap();
+        assert!(unsafe { rchat_call_place(bad.as_ptr()) }.is_null());
+        assert_eq!(rchat_last_error_code(), 9);
+        let id = CString::new("00".repeat(16)).unwrap();
+        assert_eq!(unsafe { rchat_call_answer(id.as_ptr()) }, 7);
+        assert_eq!(unsafe { rchat_call_decline(id.as_ptr(), 1) }, 7);
+        assert_eq!(unsafe { rchat_call_end(id.as_ptr()) }, 7);
+        assert_eq!(unsafe { rchat_call_answer(std::ptr::null()) }, 9);
+        assert_eq!(rchat_call_set_muted(1), 0);
+        let pcm = [0i16; 960];
+        let mut out = [7i16; 960];
+        assert_eq!(unsafe { rchat_call_push_pcm(pcm.as_ptr(), 960) }, 0);
+        assert_eq!(unsafe { rchat_call_pull_pcm(out.as_mut_ptr(), 960) }, 0);
+        assert!(out.iter().all(|s| *s == 0), "silence without a call");
+        assert_eq!(unsafe { rchat_call_push_pcm(pcm.as_ptr(), 100) }, -9);
+        assert_eq!(unsafe { rchat_call_push_pcm(std::ptr::null(), 960) }, -9);
+        assert_eq!(
+            unsafe { rchat_call_pull_pcm(std::ptr::null_mut(), 960) },
+            -9
+        );
+        assert!(rchat_call_poll_event().is_null());
+        assert_eq!(rchat_last_error_code(), 0, "no event is not an error");
+    }
+
+    /// Android video calls (spec §6): the nine video functions without a
+    /// client or a call report, refuse bad buffers and never panic.
+    #[test]
+    fn video_functions_without_a_client_or_call() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        let peer = CString::new("ab".repeat(32)).unwrap();
+        assert!(unsafe { rchat_call_place_video(peer.as_ptr()) }.is_null());
+        assert_eq!(rchat_last_error_code(), 7);
+        assert!(unsafe { rchat_call_place_video(std::ptr::null()) }.is_null());
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(rchat_call_video_set_camera(1), 7);
+        assert_eq!(rchat_call_video_respond(1), 7);
+        assert_eq!(rchat_call_video_configure(4, 0, 0), 9);
+        assert_eq!(rchat_call_video_configure(3, 1, 0), 0);
+        assert_eq!(rchat_call_video_set_thermal(7), 9);
+        assert_eq!(rchat_call_video_set_thermal(-1), 9);
+        assert_eq!(rchat_call_video_set_thermal(3), 0);
+        let mut hint = [0i32; 7];
+        assert_eq!(
+            unsafe { rchat_call_video_encoder_hint(hint.as_mut_ptr(), 7) },
+            0
+        );
+        assert_eq!(
+            unsafe { rchat_call_video_encoder_hint(hint.as_mut_ptr(), 6) },
+            -9
+        );
+        assert_eq!(
+            unsafe { rchat_call_video_encoder_hint(std::ptr::null_mut(), 7) },
+            -9
+        );
+        let buf = [0u8; 128];
+        let big = vec![0u8; 393_217];
+        assert_eq!(unsafe { rchat_call_video_send(buf.as_ptr(), 100, 1, 0) }, 0);
+        assert_eq!(
+            unsafe { rchat_call_video_send(buf.as_ptr(), 100, 1, 45) },
+            -9
+        );
+        assert_eq!(
+            unsafe { rchat_call_video_send(std::ptr::null(), 100, 1, 0) },
+            -9
+        );
+        assert_eq!(unsafe { rchat_call_video_send(buf.as_ptr(), 0, 1, 0) }, -9);
+        assert_eq!(
+            unsafe { rchat_call_video_send(big.as_ptr(), 393_217, 1, 0) },
+            -9
+        );
+        let mut out = [0u8; 64];
+        let mut meta = [0i32; 4];
+        assert_eq!(
+            unsafe { rchat_call_video_take(out.as_mut_ptr(), out.len(), meta.as_mut_ptr(), 4) },
+            0
+        );
+        assert_eq!(
+            unsafe { rchat_call_video_take(out.as_mut_ptr(), out.len(), meta.as_mut_ptr(), 3) },
+            -9
+        );
+        assert_eq!(
+            unsafe { rchat_call_video_take(std::ptr::null_mut(), 64, meta.as_mut_ptr(), 4) },
+            -9
+        );
+        assert_eq!(
+            unsafe { rchat_call_video_take(out.as_mut_ptr(), 64, std::ptr::null_mut(), 4) },
+            -9
+        );
+        assert_eq!(rchat_call_video_need_keyframe(), 0);
+    }
+
+    /// The prefs set with no client are copied into the next client at install.
+    #[test]
+    fn video_prefs_set_before_connect_reach_the_installed_client() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        assert_eq!(rchat_call_video_configure(2, 1, 1), 0);
+        assert_eq!(rchat_call_video_set_thermal(4), 0);
+        let client = RChatClient::new(ClientConfig::default()).unwrap();
+        install_client(client.clone());
+        assert_eq!(client.call_video_prefs_snapshot(), (2, true, true, 4));
+        rchat_disconnect();
+        assert!(CALL_VIDEO.lock().is_none(), "disconnect clears CALL_VIDEO");
+    }
+
+    /// The per-frame video functions never take the global state lock.
+    #[test]
+    fn video_frame_calls_never_take_the_global_lock() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for installed in [false, true] {
+            rchat_disconnect();
+            if installed {
+                install_client(RChatClient::new(ClientConfig::default()).unwrap());
+                assert!(CALL_VIDEO.lock().is_some(), "install fills CALL_VIDEO");
+            }
+            let held = lock_state();
+            let done = std::thread::spawn(|| {
+                let buf = [0u8; 64];
+                let mut out = [0u8; 64];
+                let mut meta = [0i32; 4];
+                let mut hint = [0i32; 7];
+                (
+                    unsafe { rchat_call_video_send(buf.as_ptr(), 64, 0, 0) },
+                    unsafe { rchat_call_video_take(out.as_mut_ptr(), 64, meta.as_mut_ptr(), 4) },
+                    unsafe { rchat_call_video_encoder_hint(hint.as_mut_ptr(), 7) },
+                    rchat_call_video_set_thermal(2),
+                    rchat_call_video_need_keyframe(),
+                )
+            });
+            let start = std::time::Instant::now();
+            while !done.is_finished() && start.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let finished = done.is_finished();
+            drop(held);
+            assert!(finished, "a video frame call waited on GLOBAL_STATE");
+            assert_eq!(done.join().unwrap(), (0, 0, 0, 0, 0));
+        }
+        rchat_disconnect();
+    }
+
+    /// D37: the PCM path never takes the global state lock, so a 20 ms
+    /// audio thread can't wait behind a disconnect holding it. Run both
+    /// without a client and with one installed (CALL_AUDIO holds a handle).
+    #[test]
+    fn pcm_functions_do_not_take_the_global_state_lock() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for installed in [false, true] {
+            rchat_disconnect();
+            if installed {
+                install_client(RChatClient::new(ClientConfig::default()).unwrap());
+                assert!(CALL_AUDIO.lock().is_some(), "install fills CALL_AUDIO");
+            }
+            let held = lock_state(); // a thread holding GLOBAL_STATE
+            let done = std::thread::spawn(|| {
+                let pcm = [0i16; 960];
+                let mut out = [7i16; 960];
+                let pushed = unsafe { rchat_call_push_pcm(pcm.as_ptr(), 960) };
+                let pulled = unsafe { rchat_call_pull_pcm(out.as_mut_ptr(), 960) };
+                let muted = rchat_call_set_muted(1);
+                (pushed, pulled, muted, out.iter().all(|s| *s == 0))
+            });
+            let start = std::time::Instant::now();
+            while !done.is_finished() && start.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let finished = done.is_finished();
+            drop(held);
+            assert!(finished, "push/pull/mute waited on GLOBAL_STATE");
+            assert_eq!(done.join().unwrap(), (0, 0, 0, true));
+        }
+        rchat_disconnect();
+        assert!(CALL_AUDIO.lock().is_none(), "disconnect clears CALL_AUDIO");
+    }
+
+    /// Entries that take the state lock refuse inside a synchronous
+    /// callback: poll_event returns NULL with code 8 (not the no-event 0).
+    #[test]
+    fn call_poll_event_refuses_inside_a_sync_callback() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        rchat_disconnect();
+        let _scope = SyncCallbackScope::enter();
+        assert!(rchat_call_poll_event().is_null());
+        assert_eq!(rchat_last_error_code(), 8);
+        let id = CString::new("00".repeat(16)).unwrap();
+        assert_eq!(unsafe { rchat_call_answer(id.as_ptr()) }, 8);
+    }
+
+    static CALL_STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    extern "C" fn call_status(kind: c_int, _: *const c_char, _: *const c_char, _: c_int) {
+        if kind == crate::status::StatusEvent::CallEvents.code() {
+            CALL_STATUS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct StopFlag(std::sync::atomic::AtomicBool);
+    impl crate::call::machine::MediaControl for StopFlag {
+        fn push_pcm(&self, _: &[i16]) -> usize {
+            0
+        }
+        fn pull_pcm(&self, _: &mut [i16]) -> usize {
+            0
+        }
+        fn set_muted(&self, _: bool) {}
+        fn status(&self, _: std::time::Instant) -> crate::call::engine::MediaStatus {
+            Default::default()
+        }
+        fn stop(&self) {
+            self.0.store(true, Ordering::SeqCst)
+        }
+    }
+
+    /// A connected call on `client` with media that records its stop.
+    fn live_call_on(client: &RChatClient, id: [u8; 16]) -> Arc<StopFlag> {
+        use crate::call::machine::{ActiveCall, Direction, Phase};
+        let media = Arc::new(StopFlag::default());
+        let now = std::time::Instant::now();
+        let mut inner = client.inner.try_write().unwrap();
+        inner.call.active = Some(ActiveCall {
+            id: crate::call::CallId(id),
+            peer: "ab".repeat(32),
+            direction: Direction::Outgoing,
+            placed_at: now,
+            started_at_ms: 1,
+            phase: Phase::Connected {
+                at: now,
+                last_status: now,
+            },
+            media: Some(media.clone()),
+            video: Default::default(),
+        });
+        *inner.call.audio.lock() = Some(media.clone());
+        media
+    }
+
+    fn polled_ended(id: [u8; 16]) -> bool {
+        let mut found = false;
+        loop {
+            let p = rchat_call_poll_event();
+            if p.is_null() {
+                return found;
+            }
+            let json = s(p);
+            unsafe { rchat_free_string(p) };
+            found |= json.contains("\"ended\"") && json.contains(&hex::encode(id));
+        }
+    }
+
+    /// Final review I2: a client replaced during a call (a full reconnect)
+    /// or dropped by `rchat_disconnect` finishes the call (media stopped)
+    /// and its Ended still reaches the app: the app is told (status 11)
+    /// and `rchat_call_poll_event` returns it, whichever client is current.
+    #[test]
+    fn a_call_on_a_retired_client_ends_and_the_app_hears_it() {
+        let _g = FFI_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for logout in [false, true] {
+            rchat_disconnect();
+            assert_eq!(rchat_initialize(), 0);
+            lock_state().callbacks = Some(CCallbackBridge {
+                ptrs: CCallbackPointers {
+                    on_status_event: call_status,
+                    ..noop_pointers()
+                },
+            });
+            let id = [0x5a; 16];
+            let old = RChatClient::new(ClientConfig::default()).unwrap();
+            let media = live_call_on(&old, id);
+            install_client(old.clone());
+            CALL_STATUS.store(0, Ordering::SeqCst);
+            if logout {
+                rchat_disconnect();
+            } else {
+                // The steps `rchat_connect` takes around its network call.
+                retire_previous_client();
+                install_client(RChatClient::new(ClientConfig::default()).unwrap());
+            }
+            assert!(media.0.load(Ordering::SeqCst), "media stopped");
+            assert!(old.inner.try_read().unwrap().call.active.is_none());
+            assert!(CALL_STATUS.load(Ordering::SeqCst) >= 1, "the app was told");
+            assert!(polled_ended(id), "the Ended reached the app");
+            assert!(rchat_call_poll_event().is_null(), "once");
+        }
+        lock_state().callbacks = None;
         rchat_disconnect();
     }
 }

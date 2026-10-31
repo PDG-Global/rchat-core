@@ -75,7 +75,7 @@ Areas where contributions are especially welcome:
 
 ### Prerequisites
 
-- Rust 1.75+ (install via [rustup](https://rustup.rs/))
+- Rust 1.88+ (install via [rustup](https://rustup.rs/))
 - Cargo
 - Git
 - cmake and a C toolchain (the client library builds BoringSSL)

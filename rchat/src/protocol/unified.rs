@@ -20,9 +20,15 @@ pub const FRAME_TYPE_SIGNALING: u8 = 0x01;
 pub const FRAME_TYPE_RELAY: u8 = 0x02;
 pub const FRAME_TYPE_CONTROL: u8 = 0x03;
 pub const FRAME_TYPE_KEEPALIVE: u8 = 0x04;
-/// Reserved for a future real-time media frame (protocol v3 §9a). No v3
-/// client sends it and the v3 relay refuses it like any unknown prefix.
-pub const FRAME_TYPE_RESERVED_MEDIA: u8 = 0x05;
+/// The real-time media frame (Android calls spec §4): sent and received
+/// only by call connections (`signaling::media`); refused anywhere else.
+pub const FRAME_TYPE_MEDIA: u8 = 0x05;
+/// Text of the `Error { InvalidMessage }` refusal of a `MediaGrant` (D5).
+pub const MEDIA_GRANT_REFUSED: &str = "media grant refused";
+/// `hello_response` capability: this relay pairs call connections (D8).
+pub const CALLS_CAPABILITY: &str = "calls-v1";
+/// `hello_response` capability: this relay also carries video on lanes 2 and 3.
+pub const VIDEO_CAPABILITY: &str = "video-v1";
 
 /// Unified frame that can be sent over a single WebSocket connection
 // `Control` is the large variant since `CircuitCreatedV3` carries both
@@ -148,9 +154,10 @@ impl UnifiedFrame {
                             Err(e) => Err(FrameError::InvalidJson(e.to_string())),
                         }
                     }
-                    // Reserved for future media (§9a): refused like any
-                    // unknown prefix; never decoded by a v3 relay.
-                    FRAME_TYPE_RESERVED_MEDIA => Err(FrameError::UnknownFrameType(frame_type)),
+                    // The media frame is taken by the read loop from call
+                    // connections before decoding (`signaling::media`);
+                    // anything that reaches here is refused.
+                    FRAME_TYPE_MEDIA => Err(FrameError::UnknownFrameType(frame_type)),
                     _ => {
                         tracing::debug!(
                             "UnifiedFrame::decode: Unknown frame type: 0x{:02x}",
@@ -369,6 +376,19 @@ pub enum ControlMessage {
     /// Sent after every publish, so it says nothing about what was queued;
     /// `pad` is always `QUEUE_HANDED_OVER_PAD_LEN` zero bytes.
     QueueHandedOver { pad: Vec<u8> },
+    /// 19 (c→s, Android calls §5): a published member of `circuit_id`
+    /// grants the call's relay token. Usable once both members granted it.
+    MediaGrant {
+        circuit_id: CircuitId,
+        token: [u8; 32],
+    },
+    /// 20 (c→s): a fresh, unpublished call connection joins a usable token
+    /// on `lane` (0 or 1) of side `role` (0 caller, 1 callee; D1).
+    MediaJoin { token: [u8; 32], lane: u8, role: u8 },
+    /// 21 (s→c): the other side has a call connection on this token.
+    MediaJoined,
+    /// 22 (s→c): the other side has no call connection left.
+    MediaPeerGone,
 }
 
 /// `QueueHandedOver.pad` length: the frame has one fixed size.
@@ -830,16 +850,42 @@ mod tests {
     }
 
     #[test]
-    fn test_reserved_media_prefix_0x05_is_unknown() {
-        // Protocol v3 §9a: 0x05 is reserved for future media and refused.
-        assert_eq!(FRAME_TYPE_RESERVED_MEDIA, 0x05);
-        for payload in [vec![], vec![0u8; 64]] {
-            let mut bin = vec![FRAME_TYPE_RESERVED_MEDIA];
-            bin.extend_from_slice(&payload);
-            assert!(matches!(
-                UnifiedFrame::decode(&Message::Binary(bin)),
-                Err(FrameError::UnknownFrameType(0x05))
-            ));
+    fn media_prefix_0x05_is_not_a_unified_frame() {
+        // Android calls spec §4: 0x05 is the media frame. It never reaches
+        // `UnifiedFrame::decode` from a call connection (the read loop takes
+        // it first); anywhere else it is refused like an unknown prefix.
+        assert_eq!(FRAME_TYPE_MEDIA, 0x05);
+        let mut bin = vec![FRAME_TYPE_MEDIA];
+        bin.extend_from_slice(&7u64.to_be_bytes());
+        bin.extend_from_slice(&[0u8; 24]);
+        assert!(matches!(
+            UnifiedFrame::decode(&Message::Binary(bin)),
+            Err(FrameError::UnknownFrameType(0x05))
+        ));
+    }
+
+    #[test]
+    fn media_control_messages_take_indices_19_to_22() {
+        let grant = ControlMessage::MediaGrant {
+            circuit_id: CircuitId([1; 16]),
+            token: [2; 32],
+        };
+        let join = ControlMessage::MediaJoin {
+            token: [3; 32],
+            lane: 1,
+            role: 0,
+        };
+        for (msg, index, len) in [
+            (grant, 19u32, 4 + 16 + 32),
+            (join, 20, 4 + 32 + 1 + 1),
+            (ControlMessage::MediaJoined, 21, 4),
+            (ControlMessage::MediaPeerGone, 22, 4),
+        ] {
+            let bytes = msg.encode();
+            assert_eq!(&bytes[..4], &index.to_le_bytes(), "{msg:?}");
+            assert_eq!(bytes.len(), len, "fixed size: {msg:?}");
+            let back = ControlMessage::decode(&bytes).expect("round trip");
+            assert_eq!(back.encode(), bytes);
         }
     }
 

@@ -442,6 +442,8 @@ pub(super) fn bare_connection(
             has_asked: false,
             blind_ask_bucket: None,
             peer_bundle: None,
+            held: None,
+            media: None,
         },
         rx,
     )
@@ -832,4 +834,121 @@ pub(super) async fn pair_up(
     assert_eq!(ca.target_circuit_id, cb.circuit_id);
     assert_eq!(cb.target_circuit_id, ca.circuit_id);
     (wa, wb, ca, cb)
+}
+
+/// A call connection: hello only, never a publish (Android calls §5).
+pub(super) async fn call_connection(addr: SocketAddr) -> Ws {
+    let mut ws = connect(addr).await;
+    hello(&mut ws).await;
+    ws
+}
+
+pub(super) fn grant_message(circuit_id: CircuitId, token: [u8; 32]) -> Message {
+    UnifiedFrame::control(ControlMessage::MediaGrant { circuit_id, token }).encode()
+}
+
+pub(super) fn join_message(token: [u8; 32], lane: u8, role: u8) -> Message {
+    UnifiedFrame::control(ControlMessage::MediaJoin { token, lane, role }).encode()
+}
+
+/// Two new identities paired, both members granting `token`.
+pub(super) async fn granted(
+    state: &RelayState,
+    addr: SocketAddr,
+    token: [u8; 32],
+) -> (Ws, Ws, Created, Created) {
+    let (a, b) = (TestIdentity::random(), TestIdentity::random());
+    let (mut wa, mut wb, ca, cb) = pair_up(state, addr, &a, &b).await;
+    wa.send(grant_message(ca.circuit_id, token))
+        .await
+        .expect("grant a");
+    wb.send(grant_message(cb.circuit_id, token))
+        .await
+        .expect("grant b");
+    eventually("token usable", || state.media.is_usable(&token)).await;
+    (wa, wb, ca, cb)
+}
+
+/// A call connection joined on `token`: waits until the relay holds the
+/// lane. Reads nothing from the connection, so a `MediaJoined` the relay
+/// sends at once stays queued for the test to see.
+pub(super) async fn joined(
+    state: &RelayState,
+    addr: SocketAddr,
+    token: [u8; 32],
+    lane: u8,
+    role: u8,
+) -> Ws {
+    let mut ws = call_connection(addr).await;
+    ws.send(join_message(token, lane, role))
+        .await
+        .expect("join");
+    let (r, l) = (usize::from(role), usize::from(lane));
+    eventually("lane joined", || state.media.lanes_of(&token)[r][l]).await;
+    ws
+}
+
+/// The next `MediaJoined` or `MediaPeerGone`, skipping everything else.
+pub(super) async fn next_media_control(ws: &mut Ws, wait: Duration) -> Option<ControlMessage> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let m = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .ok()??
+            .ok()?;
+        if let Ok(UnifiedFrame::Control(c)) = UnifiedFrame::decode(&m) {
+            if matches!(
+                c,
+                ControlMessage::MediaJoined | ControlMessage::MediaPeerGone
+            ) {
+                return Some(c);
+            }
+        }
+    }
+}
+
+/// Like `joined`, also returning the challenge the hello gave (for a test
+/// that signs a publish a call connection must not be allowed to send).
+pub(super) async fn joined_with_challenge(
+    state: &RelayState,
+    addr: SocketAddr,
+    token: [u8; 32],
+    lane: u8,
+    role: u8,
+) -> (Ws, [u8; 32]) {
+    let mut ws = connect(addr).await;
+    let challenge = hello(&mut ws).await;
+    ws.send(join_message(token, lane, role))
+        .await
+        .expect("join");
+    let (r, l) = (usize::from(role), usize::from(lane));
+    eventually("lane joined", || state.media.lanes_of(&token)[r][l]).await;
+    (ws, challenge)
+}
+
+/// A `0x05` media frame: `seq` big-endian and `payload_len` filler bytes.
+pub(super) fn media_frame(seq: u64, payload_len: usize) -> Message {
+    let mut b = vec![crate::protocol::unified::FRAME_TYPE_MEDIA];
+    b.extend_from_slice(&seq.to_be_bytes());
+    b.resize(1 + 8 + payload_len, 0xEE);
+    Message::Binary(b)
+}
+
+/// The next media frame on `ws`, skipping keepalives and control frames.
+pub(super) async fn next_media(ws: &mut Ws, wait: Duration) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .ok()??
+            .ok()?
+        {
+            Message::Binary(b)
+                if b.first() == Some(&crate::protocol::unified::FRAME_TYPE_MEDIA) =>
+            {
+                return Some(b)
+            }
+            _ => continue,
+        }
+    }
 }

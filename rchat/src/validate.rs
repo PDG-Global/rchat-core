@@ -256,6 +256,12 @@ pub fn control(msg: &ControlMessage) -> Result<(), Invalid> {
         ControlMessage::DeliveryReceipt { .. } | ControlMessage::ReadReceipt { .. } => {
             Err("receipts travel end-to-end; control receipts are not accepted")
         }
+        ControlMessage::MediaJoin { lane, role, .. } => {
+            if *lane > 3 || *role > 1 {
+                return Err("lane must be at most 3 and role 0 or 1");
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -573,5 +579,36 @@ mod tests {
             let reason = control(&receipt).expect_err("receipts are end-to-end now");
             assert!(!reason.contains("abc"));
         }
+    }
+
+    #[test]
+    fn media_join_lane_and_role_are_bounded() {
+        let ok = ControlMessage::MediaJoin {
+            token: [1; 32],
+            lane: 1,
+            role: 1,
+        };
+        assert!(control(&ok).is_ok());
+        for lane in 0..=3 {
+            let ok = ControlMessage::MediaJoin {
+                token: [1; 32],
+                lane,
+                role: 0,
+            };
+            assert!(control(&ok).is_ok(), "lane {lane}");
+        }
+        for (lane, role) in [(4, 0), (0, 2), (255, 255)] {
+            let bad = ControlMessage::MediaJoin {
+                token: [1; 32],
+                lane,
+                role,
+            };
+            assert!(control(&bad).is_err(), "lane {lane} role {role}");
+        }
+        let grant = ControlMessage::MediaGrant {
+            circuit_id: crate::protocol::CircuitId([0; 16]),
+            token: [0; 32],
+        };
+        assert!(control(&grant).is_ok());
     }
 }

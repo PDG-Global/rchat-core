@@ -404,3 +404,50 @@ fn c2c_queue_handed_over_both_ways() {
         Ok(ServerControl::QueueHandedOver { .. })
     ));
 }
+
+/// Android calls spec §5: the four media control messages (19-22) are
+/// encoded identically by both crates and decode across them.
+#[test]
+fn calls_media_control_messages_both_ways() {
+    let pairs = [
+        (
+            ServerControl::MediaGrant {
+                circuit_id: ServerCircuitId([9; 16]),
+                token: [0xA5; 32],
+            },
+            CoreControl::MediaGrant {
+                circuit_id: CoreCircuitId([9; 16]),
+                token: [0xA5; 32],
+            },
+        ),
+        (
+            ServerControl::MediaJoin {
+                token: [0x5A; 32],
+                lane: 1,
+                role: 1,
+            },
+            CoreControl::MediaJoin {
+                token: [0x5A; 32],
+                lane: 1,
+                role: 1,
+            },
+        ),
+        (ServerControl::MediaJoined, CoreControl::MediaJoined),
+        (ServerControl::MediaPeerGone, CoreControl::MediaPeerGone),
+    ];
+    for (server, core) in pairs {
+        assert_eq!(server.encode(), core.encode(), "identical encodings");
+        assert!(CoreControl::decode_without_frame_type(&server.encode()).is_some());
+        assert!(ServerControl::decode(&core.encode()).is_ok());
+    }
+    assert_eq!(
+        super::unified::MEDIA_GRANT_REFUSED,
+        rchat_core::protocol::MEDIA_GRANT_REFUSED
+    );
+    assert_eq!(
+        super::unified::CALLS_CAPABILITY,
+        rchat_core::protocol::CALLS_CAPABILITY
+    );
+    assert_eq!(super::unified::VIDEO_CAPABILITY, "video-v1");
+    assert_eq!(rchat_core::protocol::FRAME_TYPE_MEDIA, 0x05);
+}

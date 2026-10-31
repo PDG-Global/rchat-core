@@ -131,7 +131,8 @@ pub struct SessionSnapshotV2 {
     pub blinded: bool,
     /// `ChatSession::blind_since_unix` (R20).
     pub blind_since_unix: Option<u64>,
-    /// `ChatSession::last_identity_fallback_unix` (R20).
+    /// `ChatSession::last_identity_fallback_unix` (R20): when the last identity
+    /// re-pair completed.
     pub last_identity_fallback_unix: Option<u64>,
 }
 

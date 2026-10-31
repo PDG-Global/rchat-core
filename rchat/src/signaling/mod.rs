@@ -43,21 +43,32 @@ use tracing::{debug, error, info, trace, warn};
 
 mod circuits;
 mod fair_share;
+mod held;
 mod key_auth;
 mod knock_store;
+mod media;
 #[cfg(feature = "test-mitm")]
 pub(crate) mod mitm;
 mod pair_lock;
 pub(crate) mod persist;
 mod relay_identity;
 mod tags;
+mod tcp_ack;
 
 #[cfg(test)]
 mod blind_pairing_tests;
 #[cfg(test)]
+mod call_netsim_tests;
+#[cfg(test)]
+mod call_netsim_video_tests;
+#[cfg(test)]
 mod circuit_race_tests;
 #[cfg(test)]
 mod client_resumption_tests;
+#[cfg(test)]
+mod held_copy_tests;
+#[cfg(test)]
+mod idle_ping_tests;
 #[cfg(test)]
 mod inflight_salvage_tests;
 #[cfg(test)]
@@ -68,6 +79,8 @@ mod key_auth_tests;
 mod limits_tests;
 #[cfg(test)]
 mod log_privacy_tests;
+#[cfg(test)]
+mod media_tests;
 #[cfg(test)]
 mod metadata_bounds_tests;
 #[cfg(test)]
@@ -84,6 +97,8 @@ mod queue_v2_tests;
 mod reconnect_session_tests;
 #[cfg(test)]
 mod rotation_relay_tests;
+#[cfg(test)]
+mod stale_connection_tests;
 #[cfg(test)]
 mod state_bounds_tests;
 #[cfg(test)]
@@ -227,18 +242,42 @@ pub(crate) struct RelayState {
     pub(crate) outbound: Arc<limits::OutboundBudget>,
     /// Bytes held in all connections' WebSocket buffers (M-5).
     pub(crate) buffers: Arc<limits::BufferBudget>,
+    /// Bytes of held copies, all connections (Task 8 B, review M2).
+    pub(crate) held_budget: Arc<limits::HeldBudget>,
+    /// Proven connections that are closing and whose held copies and unsent
+    /// queue have not been re-queued yet, with their identity's tag (review
+    /// L2). While a connection is listed, packets for its identity pairs
+    /// are queued behind its copies instead of handed to the member's new
+    /// connection, and the new connection's first ask leaves the queue to
+    /// the salvage, which hands everything over in order.
+    pub(crate) salvaging: Arc<DashMap<ClientId, IdTag>>,
     /// Longest a writer may make no progress with a message to send
     /// (`limits::WRITER_STALL_TIMEOUT`; shorter in tests).
     pub(crate) writer_stall: Duration,
-    /// Fixed keepalive ping interval for tests; None: `ping_wait`'s jitter.
+    /// Fixed idle-ping threshold for tests; None: `idle_ping_after`.
     pub(crate) keepalive_ping_every: Option<Duration>,
     /// How long a ping may go unanswered once written (`PONG_TIMEOUT`;
     /// shorter in tests).
     pub(crate) pong_timeout: Duration,
+    /// Fallback only (no acknowledgement source): how long before a client
+    /// frame a held copy must have been written for that frame to discard
+    /// it (`held::HOLD_GUARD`; shorter in tests).
+    pub(crate) hold_guard: Duration,
+    /// Tests: the acknowledgement source every connection uses, instead of
+    /// the kernel's.
+    #[cfg(test)]
+    pub(crate) ack_override: Option<Arc<dyn tcp_ack::AckSource>>,
+    /// Tests: peer addresses whose connections keep the production
+    /// keepalive timings when `keepalive_ping_every` / `pong_timeout` are
+    /// scaled down for the others.
+    #[cfg(test)]
+    pub(crate) keepalive_exempt: Arc<DashMap<SocketAddr, ()>>,
     /// The --no-tls stand-in binding; None with TLS.
     pub(crate) dev_binding: Option<[u8; 32]>,
     /// The relay's long-term identity (spec §4.9).
     pub(crate) relay_identity: Arc<relay_identity::RelayIdentity>,
+    /// Call tokens and call connections (Android calls §5).
+    pub(crate) media: Arc<media::MediaState>,
 }
 
 impl RelayState {
@@ -252,7 +291,13 @@ impl RelayState {
         ));
         let outbound = limits::OutboundBudget::new(config.outbound_budget_bytes);
         let buffers = limits::BufferBudget::new(config.buffer_budget_bytes);
+        let held_budget = Arc::new(limits::HeldBudget::new(
+            config.offline_queue.held_copy_max_total_bytes,
+            config.offline_queue.held_copy_max_bytes_per_connection,
+        ));
         Self {
+            held_budget,
+            salvaging: Arc::new(DashMap::new()),
             config,
             connections: Arc::new(DashMap::new()),
             circuits: Arc::new(DashMap::new()),
@@ -269,9 +314,24 @@ impl RelayState {
             writer_stall: limits::WRITER_STALL_TIMEOUT,
             keepalive_ping_every: None,
             pong_timeout: PONG_TIMEOUT,
+            // Tests run whole exchanges within milliseconds, far inside
+            // the production guard: a zero guard keeps their relay frames
+            // free of re-queued duplicates (a frame after a write proves
+            // it). The guard itself is covered by `held`'s unit tests and
+            // `held_copy_tests`.
+            #[cfg(test)]
+            ack_override: None,
+            #[cfg(test)]
+            keepalive_exempt: Arc::new(DashMap::new()),
+            hold_guard: if cfg!(test) {
+                Duration::ZERO
+            } else {
+                held::HOLD_GUARD
+            },
             buffers,
             dev_binding: None,
             relay_identity: Arc::new(relay_identity::RelayIdentity::ephemeral()),
+            media: Arc::new(media::MediaState::default()),
         }
     }
 }
@@ -446,6 +506,12 @@ pub(crate) struct UnifiedConnection {
     /// this connection (final re-review N-2) instead of a copy in each.
     /// Made on the first ask after a publish; cleared by a publish.
     peer_bundle: Option<Arc<PeerBundle>>,
+    /// Copies of relayed records written to this connection and not yet
+    /// acknowledged (Task 8 B); here so a shutdown can save them (review
+    /// L3). None for records without a socket (tests).
+    held: Option<Arc<held::HeldCopies>>,
+    /// Set once this connection joined a call (it is then a call connection).
+    media: Option<media::LaneState>,
 }
 
 /// (pin, version) of the identity at `path`. A missing key is an error
@@ -487,6 +553,9 @@ impl Server {
         env: &dyn persist::PathEnv,
     ) -> anyhow::Result<Self> {
         let dev_binding = config.dev_binding()?;
+        if let Some(text) = timeout_warning(config.connection_timeout()) {
+            warn!("{}", text);
+        }
         // `main` always sets the path; a `Server` built directly (tests) with
         // no path gets an in-memory identity and never writes a key file.
         let relay_identity = match config.relay_identity_path.as_deref() {
@@ -660,6 +729,20 @@ impl Server {
                         } else {
                             None
                         };
+                        // Task 8 review M1: count the bytes the kernel takes
+                        // from this socket (below TLS) and ask it what the
+                        // peer has acknowledged, for the held copies.
+                        let tcp_written = Arc::new(AtomicU64::new(0));
+                        let ack: Arc<dyn tcp_ack::AckSource> = {
+                            use std::os::fd::AsRawFd;
+                            Arc::new(tcp_ack::KernelAck::new(
+                                stream.as_raw_fd(),
+                                tcp_written.clone(),
+                            ))
+                        };
+                        #[cfg(test)]
+                        let ack = state.ack_override.clone().unwrap_or(ack);
+                        let stream = tcp_ack::CountingIo::new(stream, tcp_written);
                         if let Some(front) = tls_front {
                             // TLS 1.3 (handshake bounded by tls_handshake_timeout_secs)
                             match front.accept(stream).await {
@@ -679,6 +762,7 @@ impl Server {
                                         decoy_config.clone(),
                                         binding,
                                         limiter,
+                                        ack,
                                     )
                                     .await
                                     {
@@ -714,6 +798,7 @@ impl Server {
                             decoy_config,
                             binding,
                             limiter,
+                            ack,
                         )
                         .await
                         {
@@ -785,6 +870,17 @@ impl Server {
                         }
                     }
                     sweep_stale_state(now, &state);
+                });
+            }
+        });
+
+        let media_state = self.state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(media::SWEEP_INTERVAL);
+            loop {
+                interval.tick().await;
+                supervised_round("media sweep", || {
+                    media::sweep(Instant::now(), &media_state);
                 });
             }
         });
@@ -966,9 +1062,53 @@ fn supervised_round(task: &'static str, round: impl FnOnce()) -> bool {
     }
 }
 
-/// Wait before the next keepalive ping: 25-35 s (spec 5.7, D19).
-pub(crate) fn ping_wait(r: f64) -> Duration {
-    Duration::from_millis(25_000 + (r.clamp(0.0, 1.0) * 10_000.0).round() as u64)
+/// Silence after which the relay pings a connection (owner decision
+/// 2026-10-26, Task 8 C; replaces the fixed 25-35 s ping of spec 5.7 D19).
+/// Clients ping every 30 s in the foreground and every 240 s ± 8 s in the
+/// background. The relay's threshold sits above the client's longest
+/// background interval (review L4), so a client that keeps its own schedule
+/// is not pinged by the relay.
+pub(crate) const IDLE_PING: Duration = Duration::from_secs(262);
+/// Jitter on `IDLE_PING`, either way.
+pub(crate) const IDLE_PING_JITTER: Duration = Duration::from_secs(8);
+/// The idle ping always comes at least this long before
+/// `connection_timeout_secs`, which leaves the client that long to answer
+/// before the idle timeout closes it (review L5).
+pub(crate) const IDLE_PING_BEFORE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Never sooner than this, unless the timeout leaves less than
+/// `IDLE_PING_BEFORE_TIMEOUT` for the answer (the lowest accepted timeout,
+/// 60 s, pings at 30 s).
+pub(crate) const IDLE_PING_FLOOR: Duration = Duration::from_secs(60);
+/// Below this `connection_timeout_secs`, background clients (which ping
+/// every 240 s ± 8 s) live on the relay's pings, or are closed: the relay
+/// warns at startup.
+pub(crate) const BACKGROUND_FRIENDLY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The startup warning for a `connection_timeout_secs` too low for
+/// background clients (review L5), if any.
+pub(crate) fn timeout_warning(timeout: Duration) -> Option<String> {
+    (timeout < BACKGROUND_FRIENDLY_TIMEOUT).then(|| {
+        format!(
+            "connection_timeout_secs = {} is under {}: clients in the background ping about every 240 s, \
+             so they stay connected only on the relay's own pings (more battery), or not at all \
+             under 90 s; {} or more is recommended",
+            timeout.as_secs(),
+            BACKGROUND_FRIENDLY_TIMEOUT.as_secs(),
+            BACKGROUND_FRIENDLY_TIMEOUT.as_secs()
+        )
+    })
+}
+
+/// Silence before the relay pings: `IDLE_PING` ± `IDLE_PING_JITTER` (`r`
+/// in 0..=1 picks the point), at least `IDLE_PING_FLOOR`, and always at
+/// most `connection_timeout` − `IDLE_PING_BEFORE_TIMEOUT`, so the client
+/// gets at least 30 s to answer before the idle timeout.
+pub(crate) fn idle_ping_after(r: f64, connection_timeout: Duration) -> Duration {
+    let span = IDLE_PING_JITTER.as_millis() as f64;
+    let offset = ((r.clamp(0.0, 1.0) * 2.0 - 1.0) * span).round() as i64;
+    let base = Duration::from_millis((IDLE_PING.as_millis() as i64 + offset).max(0) as u64);
+    let cap = connection_timeout.saturating_sub(IDLE_PING_BEFORE_TIMEOUT);
+    base.max(IDLE_PING_FLOOR).min(cap)
 }
 
 /// The client always sends a resume field; all-zero means none (spec 5.7).
@@ -1323,20 +1463,27 @@ where
 const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One keepalive round for `client_id`: close it if its last ping went
-/// unanswered for `pong_timeout` after the writer wrote it (`ping_written`),
-/// else send a ping if none is pending.
-/// Returns false when the keepalive task should stop (the connection is
-/// gone or has been told to close).
+/// unanswered for `pong_timeout` after the writer wrote it (`ping_written`);
+/// else, with no ping pending, send one if nothing has been received from
+/// it for `idle_after` (Task 8 C: only a quiet connection is pinged).
+/// "Received" is `last_activity`: any data frame, including the client's
+/// keepalive ping and pong. WebSocket control frames do not count, as they
+/// do not hold off the idle timeout either.
+///
+/// Returns how long to wait before the next round, or None when the
+/// keepalive task should stop (the connection is gone or has been told to
+/// close).
 fn keepalive_tick(
     client_id: ClientId,
     connections: &DashMap<ClientId, UnifiedConnection>,
     now: Instant,
     pong_timeout: Duration,
     ping_written: Option<Instant>,
-) -> bool {
-    let Some(conn) = connections.get(&client_id) else {
-        return false;
-    };
+    idle_after: Duration,
+) -> Option<Duration> {
+    // How often a pending ping, or a retry, is looked at again.
+    let check = (pong_timeout / 4).clamp(Duration::from_millis(10), Duration::from_secs(5));
+    let conn = connections.get(&client_id)?;
     if let Some(ping_sent) = conn.pending_ping {
         // Counted from when the writer finished writing this ping, not
         // from when it was queued: a ping still waiting behind a large
@@ -1344,35 +1491,41 @@ fn keepalive_tick(
         // Until it is written the writer is either making progress (the
         // peer is reading) or stalls, and the writer stall closes it.
         let Some(written) = ping_written.filter(|w| *w >= ping_sent) else {
-            return true;
+            return Some(check);
         };
-        if now.saturating_duration_since(written) > pong_timeout {
+        let waited = now.saturating_duration_since(written);
+        if waited > pong_timeout {
             debug!("Keepalive timeout, disconnecting peer");
             // Close the connection; its task removes it from the maps.
             conn.ws_tx.kill();
-            return false;
+            return None;
         }
-        return true;
+        return Some((pong_timeout - waited + Duration::from_millis(1)).min(check));
+    }
+    let silent = now.saturating_duration_since(conn.last_activity);
+    if silent < idle_after {
+        return Some(idle_after - silent);
     }
     match conn.ws_tx.send(Frame::keepalive_ping().encode()) {
         Ok(()) => {}
         // N-1: the relay-wide budget is spent, usually by others (its
         // heaviest holder is already being shed). Not this peer's fault:
-        // no ping is pending, so the next tick tries again.
-        Err(limits::ConnSendError::Overloaded) => return true,
+        // no ping is pending, so the next round tries again.
+        Err(limits::ConnSendError::Overloaded) => return Some(check),
         // H-1: a full queue (the peer is not draining what it is sent;
         // `send` has already told it to close) or a closed connection.
         Err(_) => {
             debug!("Keepalive ping could not be queued; closing the connection");
             conn.ws_tx.kill();
-            return false;
+            return None;
         }
     }
     drop(conn);
     if let Some(mut conn) = connections.get_mut(&client_id) {
         conn.pending_ping = Some(now);
     }
-    true
+    metrics::KEEPALIVE_PINGS.inc();
+    Some(check)
 }
 
 /// Longest a refused connection waits for its error reply to be written
@@ -1381,6 +1534,9 @@ const REFUSAL_FLUSH: Duration = Duration::from_millis(500);
 
 /// One client connection, over TLS (production) or plaintext (`--no-tls`).
 /// Both transports share this single code path.
+// One argument per piece of per-connection context the accept task
+// resolved before the upgrade.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S>(
     mut stream: S,
     addr: SocketAddr,
@@ -1389,6 +1545,7 @@ async fn handle_connection<S>(
     decoy_config: DecoyConfig,
     channel_binding: [u8; 32],
     limiter: Arc<ConnectionLimiter>,
+    ack: Arc<dyn tcp_ack::AckSource>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1485,6 +1642,14 @@ where
     // The HTTP upgrade is done; only WebSocket bytes count from here.
     meter.received(0);
 
+    // Task 8 B: copies of relayed records written to this connection that
+    // it has not yet shown it received.
+    let held = Arc::new(held::HeldCopies::new(
+        state.held_budget.clone(),
+        state.hold_guard,
+        ack,
+    ));
+
     // Store connection
     let client_circuits = Arc::new(DashMap::new());
     let now = Instant::now();
@@ -1513,6 +1678,8 @@ where
             has_asked: false,
             blind_ask_bucket: None,
             peer_bundle: None,
+            held: Some(held.clone()),
+            media: None,
         },
     );
 
@@ -1526,6 +1693,7 @@ where
         kill: kill.clone(),
         armed: true,
         writer: None,
+        held: held.clone(),
     };
 
     trace!("Client {} connected", privacy::tag(client_id.as_ref()));
@@ -1541,6 +1709,7 @@ where
     let writer_kill = kill.clone();
     let writer_meter = meter.clone();
     let stall = state.writer_stall;
+    let writer_held = held.clone();
     let writer_task = tokio::spawn(async move {
         let mut in_flight: Option<limits::Outbound> = None;
         loop {
@@ -1552,6 +1721,12 @@ where
                     None => break,
                 },
             };
+            // A relayed video frame that waited past its age cap is
+            // dropped unwritten (the receiver has moved on).
+            if budget.is_stale(Instant::now()) {
+                metrics::media_video_dropped(metrics::MEDIA_DROP_STALE);
+                continue;
+            }
             // A Close frame is the last thing this connection sends: queued
             // after an error reply (`key_auth::close_with_error`), it ends
             // the connection once the error is on the wire.
@@ -1570,6 +1745,11 @@ where
                 WriteOutcome::Sent => {
                     if ping {
                         written.ping_written();
+                    }
+                    // Task 8 B: written in full is not received. Held
+                    // until the client shows life (`held`).
+                    if let Some(copy) = copy.filter(is_relayed_record) {
+                        writer_held.hold(copy, budget.enqueued_at(), Instant::now());
                     }
                 }
                 WriteOutcome::Failed | WriteOutcome::Killed => {
@@ -1611,20 +1791,33 @@ where
     let keepalive_connections = connections.clone();
     let keepalive_kill = kill.clone();
     let (ping_every, pong_timeout) = (state.keepalive_ping_every, state.pong_timeout);
+    #[cfg(test)]
+    let (ping_every, pong_timeout) = if state.keepalive_exempt.contains_key(&addr) {
+        (None, PONG_TIMEOUT)
+    } else {
+        (ping_every, pong_timeout)
+    };
+    let connection_timeout = _config.connection_timeout();
+    let idle_after = move || {
+        ping_every.unwrap_or_else(|| idle_ping_after(rand::random::<f64>(), connection_timeout))
+    };
     tokio::spawn(async move {
+        let mut wait = idle_after();
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(ping_every.unwrap_or_else(|| ping_wait(rand::random::<f64>()))) => {}
+                _ = tokio::time::sleep(wait) => {}
                 _ = keepalive_kill.cancelled() => break,
             }
-            if !keepalive_tick(
+            match keepalive_tick(
                 keepalive_client_id,
                 &keepalive_connections,
                 Instant::now(),
                 pong_timeout,
                 keepalive_progress.last_ping_written(),
+                idle_after(),
             ) {
-                break;
+                Some(next) => wait = next,
+                None => break,
             }
         }
 
@@ -1684,6 +1877,11 @@ where
                 if matches!(m, Message::Text(_) | Message::Binary(_)) {
                     meter.received(m.len());
                 }
+                // Task 8 B, review M1/L1: any frame from the client, a Close
+                // included, is a sign of life. Held copies go once the
+                // kernel reports their bytes acknowledged; what is not
+                // acknowledged at the end is re-queued.
+                held.on_client_frame(Instant::now());
                 Some(m.len() + limits::PER_MESSAGE_COST_BYTES)
             }
             _ => None,
@@ -1702,27 +1900,37 @@ where
                     );
                     break;
                 }
-                // Update activity
-                if let Some(mut conn) = connections.get_mut(&client_id) {
-                    conn.last_activity = Instant::now();
-                }
-
-                // Handle signaling message. The input text is dropped before
-                // the handler awaits anything.
-                let parsed = serde_json::from_str::<SignalingMessage>(&text);
-                drop(text);
-                match parsed {
-                    Ok(msg) => {
-                        trace!(
-                            "Received signaling message from client={}",
-                            privacy::tag(client_id.as_ref())
-                        );
-                        if let Err(e) = handle_signaling_message(client_id, msg, &state).await {
-                            debug!("Signaling error: {}", e);
-                        }
+                if connections
+                    .get(&client_id)
+                    .is_some_and(|c| c.media.is_some())
+                {
+                    // A call connection sends media and keepalives only (§5).
+                    metrics::reject(metrics::REJECT_CALL_FRAME);
+                    debug!("Signaling from a call connection; closing");
+                    close_now(client_id, &connections);
+                } else {
+                    // Update activity
+                    if let Some(mut conn) = connections.get_mut(&client_id) {
+                        conn.last_activity = Instant::now();
                     }
-                    Err(e) => {
-                        debug!("Failed to parse signaling message ({:?})", e.classify());
+
+                    // Handle signaling message. The input text is dropped before
+                    // the handler awaits anything.
+                    let parsed = serde_json::from_str::<SignalingMessage>(&text);
+                    drop(text);
+                    match parsed {
+                        Ok(msg) => {
+                            trace!(
+                                "Received signaling message from client={}",
+                                privacy::tag(client_id.as_ref())
+                            );
+                            if let Err(e) = handle_signaling_message(client_id, msg, &state).await {
+                                debug!("Signaling error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to parse signaling message ({:?})", e.classify());
+                        }
                     }
                 }
             }
@@ -1738,47 +1946,75 @@ where
                     );
                     break;
                 }
-                // Update activity
-                if let Some(mut conn) = connections.get_mut(&client_id) {
-                    conn.last_activity = Instant::now();
-                }
-
-                // Handle binary frame using unified protocol
-                if !bin.is_empty() {
-                    let frame_type = bin[0];
-                    trace!(
-                        "Received binary frame from {}: type=0x{:02x}",
-                        privacy::tag(client_id.as_ref()),
-                        frame_type
-                    );
-
-                    let msg = Message::Binary(bin);
-                    let decoded = UnifiedFrame::decode(&msg);
-                    drop(msg);
-                    match decoded {
-                        Ok(frame) => {
-                            if let Err(e) = handle_frame(client_id, frame, &state).await {
-                                debug!("Frame handling error: {}", e);
-                            }
-                        }
-                        Err(FrameError::UnknownFrameType(_)) => {
-                            // An unknown prefix (0x05 is reserved for future
-                            // media, protocol v3 §9a) is refused and the
-                            // connection closed; nothing reaches a handler.
-                            metrics::reject(metrics::REJECT_UNKNOWN_FRAME);
-                            debug!("Unknown frame type; closing");
-                            if let Some(mut conn) = connections.get_mut(&client_id) {
-                                conn.closing = true;
-                                let _ = conn.ws_tx.send(Message::Close(None));
-                            }
-                        }
-                        Err(e) => {
-                            // PRIVACY: never log the frame bytes themselves.
-                            debug!("Failed to decode frame: {}", e.kind());
-                        }
+                let call_connection = connections
+                    .get(&client_id)
+                    .is_some_and(|c| c.media.is_some());
+                let keepalive =
+                    bin.first() == Some(&crate::protocol::unified::FRAME_TYPE_KEEPALIVE);
+                if call_connection
+                    && !keepalive
+                    && bin.first() != Some(&crate::protocol::unified::FRAME_TYPE_MEDIA)
+                {
+                    metrics::reject(metrics::REJECT_CALL_FRAME);
+                    debug!("Non-media frame from a call connection; closing");
+                    close_now(client_id, &connections);
+                } else if bin.first() == Some(&crate::protocol::unified::FRAME_TYPE_MEDIA) {
+                    if let Some(mut conn) = connections.get_mut(&client_id) {
+                        conn.last_activity = Instant::now();
+                    }
+                    if let media::FrameVerdict::NotACallConnection =
+                        media::on_media_frame(client_id, bin, &state, Instant::now())
+                    {
+                        // Not a call connection: refused like an unknown prefix
+                        // (an older relay does the same, spec §5).
+                        metrics::reject(metrics::REJECT_UNKNOWN_FRAME);
+                        debug!("Media frame from a connection in no call; closing");
+                        close_now(client_id, &connections);
                     }
                 } else {
-                    debug!("Received empty binary frame");
+                    // Update activity
+                    if let Some(mut conn) = connections.get_mut(&client_id) {
+                        conn.last_activity = Instant::now();
+                    }
+
+                    // Handle binary frame using unified protocol
+                    if !bin.is_empty() {
+                        let frame_type = bin[0];
+                        trace!(
+                            "Received binary frame from {}: type=0x{:02x}",
+                            privacy::tag(client_id.as_ref()),
+                            frame_type
+                        );
+
+                        let msg = Message::Binary(bin);
+                        let decoded = UnifiedFrame::decode(&msg);
+                        drop(msg);
+                        match decoded {
+                            Ok(frame) => {
+                                if let Err(e) = handle_frame(client_id, frame, &state).await {
+                                    debug!("Frame handling error: {}", e);
+                                }
+                            }
+                            Err(FrameError::UnknownFrameType(_)) => {
+                                // An unknown prefix is refused and the connection
+                                // closed; nothing reaches a handler (0x05 from a
+                                // call connection never gets here, see
+                                // media::on_media_frame).
+                                metrics::reject(metrics::REJECT_UNKNOWN_FRAME);
+                                debug!("Unknown frame type; closing");
+                                if let Some(mut conn) = connections.get_mut(&client_id) {
+                                    conn.closing = true;
+                                    let _ = conn.ws_tx.send(Message::Close(None));
+                                }
+                            }
+                            Err(e) => {
+                                // PRIVACY: never log the frame bytes themselves.
+                                debug!("Failed to decode frame: {}", e.kind());
+                            }
+                        }
+                    } else {
+                        debug!("Received empty binary frame");
+                    }
                 }
             }
             Ok(Some(Ok(Message::Ping(data)))) => {
@@ -1810,7 +2046,9 @@ where
                 break;
             }
             Err(_) => {
-                // Timeout - continue to check
+                // Timeout - continue to check. The idle tick also releases
+                // held copies the client has acknowledged since (M1).
+                held.tick();
             }
         }
 
@@ -1844,11 +2082,19 @@ where
     let proven = connections
         .get(&client_id)
         .and_then(|conn| conn.proven_identity);
+    // Review L2: from here until its copies are re-queued, packets for this
+    // connection's pairs wait in the queue behind them (`salvaging`).
+    if let Some(identity) = proven {
+        state.salvaging.insert(client_id, id_tag(&identity));
+    }
     if !refused {
         kill.cancel();
     }
     let Some(mut writer) = cleanup.writer.take() else {
         cleanup.run();
+        if let Some(identity) = proven {
+            salvage_unsent(Vec::new(), None, id_tag(&identity), Some(client_id), &state).await;
+        }
         return Ok(());
     };
     cleanup.run();
@@ -1872,9 +2118,19 @@ where
                 .await
                 .ok(),
         };
-        if let Some(Ok(rest)) = rx {
-            salvage_unsent(rest.in_flight, rest.rx, id_tag(&identity), &state).await;
-        }
+        // A last look at what the client acknowledged: the stream (its
+        // read half) is still owned here, so the socket is still open.
+        held.tick();
+        // Task 8 B: the held copies were written before anything the
+        // writer still had, so they go first. The writer has stopped (or
+        // is stuck past `WRITER_EXIT_WAIT`); either way what it held is
+        // re-queued.
+        let copies = held.take();
+        let rest = match rx {
+            Some(Ok(rest)) => Some(rest),
+            _ => None,
+        };
+        salvage_unsent(copies, rest, id_tag(&identity), Some(client_id), &state).await;
     }
 
     trace!("Client {} disconnected", privacy::tag(client_id.as_ref()));
@@ -1904,6 +2160,26 @@ fn carries_relayed_record(msg: &Message) -> bool {
     use crate::protocol::unified::{FRAME_TYPE_CONTROL, FRAME_TYPE_RELAY};
     matches!(msg, Message::Binary(b)
         if matches!(b.first(), Some(&FRAME_TYPE_RELAY) | Some(&FRAME_TYPE_CONTROL)))
+}
+
+/// bincode index of `ControlMessage::QueuedMessage` (pinned by the codec
+/// test `v3_variants_keep_their_bincode_indices`).
+const QUEUED_MESSAGE_INDEX: u32 = 14;
+
+/// Whether `msg` is a relay packet or a `QueuedMessage`, the two frames
+/// `salvageable` keeps: by the frame type byte and, for a control frame,
+/// its bincode variant index, so the writer decodes nothing (Task 8 B
+/// holds a copy only of these, never of an ack or other control frame).
+fn is_relayed_record(msg: &Message) -> bool {
+    use crate::protocol::unified::{FRAME_TYPE_CONTROL, FRAME_TYPE_RELAY};
+    let Message::Binary(b) = msg else {
+        return false;
+    };
+    match b.first() {
+        Some(&FRAME_TYPE_RELAY) => true,
+        Some(&FRAME_TYPE_CONTROL) => b.get(1..5) == Some(&QUEUED_MESSAGE_INDEX.to_le_bytes()[..]),
+        _ => false,
+    }
 }
 
 /// The record `msg` carries for re-queueing, if any, stamped `enqueued_at`
@@ -1943,9 +2219,9 @@ fn salvageable(msg: &Message, enqueued_at: u64) -> Option<StoredMessage> {
 /// already back on another connection, they are handed to it at once
 /// rather than waiting for its next publish. A copy may arrive twice (the
 /// peer read a frame whose write the relay saw fail); the receiver drops
-/// a repeated envelope id (D35). What the socket accepted in full and the
-/// peer never read is beyond the relay's sight; the client's end-to-end
-/// receipts still show it undelivered.
+/// a repeated envelope id (D35). What the socket accepted in full but the
+/// client never showed it received comes first (`held`, Task 8 B): those
+/// copies were written before anything the writer still had.
 ///
 /// Post-marker window (final review L5). A record handed to the member's
 /// other connection after that connection's `QueueHandedOver` marker can
@@ -1958,32 +2234,57 @@ fn salvageable(msg: &Message, enqueued_at: u64) -> Option<StoredMessage> {
 /// closing without the relay knowing yet (its Close not yet read) may
 /// still be handed records it never reads, as above.
 async fn salvage_unsent(
-    in_flight: Option<limits::Outbound>,
-    mut rx: tokio::sync::mpsc::Receiver<limits::Outbound>,
+    held: Vec<(Message, Option<u64>)>,
+    rest: Option<WriterRest>,
     tag: IdTag,
+    client: Option<ClientId>,
     state: &RelayState,
 ) {
-    rx.close();
     let now = crate::protocol::timestamp();
+    let mut msgs: Vec<StoredMessage> = Vec::new();
+    // Task 8 B: copies written in full but never shown received, oldest
+    // first; then what the writer had not finished.
+    let copies = held.len();
+    for (msg, enqueued_at) in held {
+        msgs.extend(salvageable(&msg, enqueued_at.unwrap_or(now)));
+    }
+    if copies > 0 {
+        metrics::HELD_COPIES_REQUEUED.inc_by(copies as u64);
+    }
     // Permits are held until the records are re-queued below.
     let mut permits = Vec::new();
-    let mut msgs: Vec<StoredMessage> = Vec::new();
-    for (msg, permit) in in_flight
-        .into_iter()
-        .chain(std::iter::from_fn(|| rx.try_recv().ok()))
-    {
-        msgs.extend(salvageable(&msg, permit.enqueued_at().unwrap_or(now)));
-        permits.push(permit);
+    if let Some(WriterRest { in_flight, mut rx }) = rest {
+        rx.close();
+        for (msg, permit) in in_flight
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+        {
+            msgs.extend(salvageable(&msg, permit.enqueued_at().unwrap_or(now)));
+            permits.push(permit);
+        }
     }
-    if msgs.is_empty() {
+    // A listed connection (review L2) always goes on: packets for its pairs
+    // may have been queued behind it, and the listing ends under the lock.
+    if msgs.is_empty() && client.is_none() {
         return;
     }
-    debug!(
-        "Re-queueing {} unsent messages of a closed connection",
-        msgs.len()
-    );
+    if !msgs.is_empty() {
+        debug!(
+            "Re-queueing {} unsent messages of a closed connection",
+            msgs.len()
+        );
+    }
     let guard = pair_lock::ID_LOCKS.lock(tag).await;
-    let dropped = requeue_salvaged(tag, msgs, state);
+    let dropped = if msgs.is_empty() {
+        0
+    } else {
+        requeue_salvaged(tag, msgs, state)
+    };
+    // Review L2: the copies are in, ahead of anything queued behind them;
+    // from now on packets for this connection's pairs may go live again.
+    if let Some(client) = client {
+        state.salvaging.remove(&client);
+    }
     if dropped > 0 {
         debug!(
             "Dropped {} salvaged messages over the offline caps",
@@ -2008,6 +2309,38 @@ async fn salvage_unsent(
     if let (Some(client), Some(queue)) = (live, backlog) {
         drain_offline_queue(client, tag, queue, state).await;
     }
+}
+
+/// Shutdown with RCQ2 persistence on (review L3): put every live
+/// connection's held copies into its identity's offline queue, so the save
+/// that follows keeps them. Copies are taken whole: whether the client
+/// acknowledged them is asked only by the connection's own task, which owns
+/// the socket, so some may arrive twice after the restart (the core drops a
+/// repeated id). What the writers still had queued is not reached and is
+/// lost with the process, as before. Returns how many were re-queued.
+pub(crate) async fn requeue_held_for_shutdown(state: &RelayState) -> usize {
+    let live: Vec<(IdTag, Arc<held::HeldCopies>)> = state
+        .connections
+        .iter()
+        .filter_map(|c| Some((id_tag(&c.proven_identity?), c.held.clone()?)))
+        .collect();
+    let mut total = 0;
+    let now = crate::protocol::timestamp();
+    for (tag, held) in live {
+        let msgs: Vec<StoredMessage> = held
+            .take()
+            .iter()
+            .filter_map(|(m, enqueued_at)| salvageable(m, enqueued_at.unwrap_or(now)))
+            .collect();
+        if msgs.is_empty() {
+            continue;
+        }
+        total += msgs.len();
+        metrics::HELD_COPIES_REQUEUED.inc_by(msgs.len() as u64);
+        let _guard = pair_lock::ID_LOCKS.lock(tag).await;
+        requeue_salvaged(tag, msgs, state);
+    }
+    total
 }
 
 /// Admit salvaged records (M-1) as if they were newly stored: messages
@@ -2099,6 +2432,9 @@ struct ConnectionCleanup {
     armed: bool,
     /// The writer task, which hands back its unsent queue when it stops.
     writer: Option<tokio::task::JoinHandle<WriterRest>>,
+    /// Copies of what the writer wrote and the client never showed it
+    /// received (Task 8 B).
+    held: Arc<held::HeldCopies>,
 }
 
 impl ConnectionCleanup {
@@ -2124,6 +2460,7 @@ impl ConnectionCleanup {
             // socket (the peer's packets queue for it, and a reconnect may
             // resume); only the orphan sweep removes them.
             circuits::on_disconnect(client_id, &conn, state, Instant::now());
+            media::on_connection_closed(client_id, &conn, state, Instant::now());
         }
         metrics::CONNECTIONS_TOTAL.dec();
         metrics::CONNECTIONS_CLOSED.inc();
@@ -2132,6 +2469,16 @@ impl ConnectionCleanup {
 
 impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
+        if !self.armed {
+            // Re-review L-new-2: `run()` disarmed this, and the teardown
+            // after it re-queues the copies and ends the `salvaging`
+            // listing. Reached with the listing still there only when that
+            // teardown panicked: end it, so the member's packets and first
+            // ask are not held back for the rest of the boot. (After a
+            // normal teardown it is already gone, and the Drop path below
+            // ends it in its own salvage.)
+            self.state.salvaging.remove(&self.client_id);
+        }
         if self.armed {
             // Early exit: stop the writer and keepalive tasks too.
             self.kill.cancel();
@@ -2145,12 +2492,28 @@ impl Drop for ConnectionCleanup {
             // senders; re-queue them as the normal path does (R-10).
             let writer = self.writer.take();
             let runtime = tokio::runtime::Handle::try_current();
-            if let (Some(identity), Some(writer), Ok(runtime)) = (proven, writer, runtime) {
+            if let Some(identity) = proven {
+                self.state
+                    .salvaging
+                    .insert(self.client_id, id_tag(&identity));
+            }
+            if proven.is_some() && runtime.is_err() {
+                self.state.salvaging.remove(&self.client_id);
+            }
+            if let (Some(identity), Ok(runtime)) = (proven, runtime) {
                 let state = self.state.clone();
+                let held = self.held.clone();
+                let client = self.client_id;
                 runtime.spawn(async move {
-                    if let Ok(Ok(rest)) = tokio::time::timeout(WRITER_EXIT_WAIT, writer).await {
-                        salvage_unsent(rest.in_flight, rest.rx, id_tag(&identity), &state).await;
-                    }
+                    let rest = match writer {
+                        Some(w) => match tokio::time::timeout(WRITER_EXIT_WAIT, w).await {
+                            Ok(Ok(rest)) => Some(rest),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    salvage_unsent(held.take(), rest, id_tag(&identity), Some(client), &state)
+                        .await;
                 });
             }
         }
@@ -2287,6 +2650,8 @@ async fn handle_signaling_message(
                                 "key-auth-v1".to_string(),
                                 "sealed-relay-v1".to_string(),
                                 "mutual-circuits-v1".to_string(),
+                                crate::protocol::unified::CALLS_CAPABILITY.to_string(),
+                                crate::protocol::unified::VIDEO_CAPABILITY.to_string(),
                             ],
                         },
                         auth_challenge: Some(hex::encode(nonce)),
@@ -2364,6 +2729,12 @@ async fn handle_signaling_message(
             // identity. A connection never changes identity (R7), so a
             // re-publish overwrites its own mapping.
             identity_to_client.insert(tag, client_id);
+            // Owner ruling 2026-10-26 (Task 8 A): the member's older
+            // foreground connections are stale (one device per identity;
+            // the core never drains while connected). Close them now
+            // rather than when their keepalive fails, so circuit routing
+            // stops reaching a socket that may be dead.
+            close_stale_connections(verified.identity, client_id, state);
             #[cfg(test)]
             tests_hook::after_identity_mapped(tag);
             trace!(
@@ -2730,8 +3101,25 @@ async fn forward_to_live_identity(
     // asked (a background drain, or a foreground one before its first
     // ask) counts as offline: the packet is filed and acknowledged, and
     // the first ask hands it over (`note_first_ask`).
+    // Review L2: the slot's closing connection still has copies to
+    // re-queue; this newer packet waits in the queue behind them, and the
+    // salvage hands both over in order.
+    let salvage_pending = hand_over && state.salvaging.contains_key(&slot_client);
+    // Review L2: records already wait in the member's queue for its new
+    // connection's first ask (re-queued copies of an older connection, or
+    // packets filed while it counted as offline). A newer packet must not
+    // overtake them: it is filed behind them, and the first ask hands the
+    // whole queue over in order.
+    let queue_waiting = || {
+        state
+            .message_queues
+            .get(&target_tag)
+            .is_some_and(|q| !q.pending.is_empty())
+    };
     let live = match live {
         Some((_, false)) if !hand_over => None,
+        Some(_) if salvage_pending => None,
+        Some((_, false)) if queue_waiting() => None,
         other => other.map(|(tx, _)| tx),
     };
     if !hand_over && live.is_some() {
@@ -3074,6 +3462,12 @@ async fn handle_control_message(client_id: ClientId, msg: ControlMessage, state:
     // Validate client-supplied keys and ids at the boundary. Refused with an
     // error frame that does not echo the input; nothing is stored.
     if let Err(reason) = validate::control(&msg) {
+        if matches!(msg, ControlMessage::MediaJoin { .. }) {
+            metrics::MEDIA_JOIN_REFUSED.inc();
+            debug!("Call connection join refused; closing");
+            close_now(client_id, connections);
+            return;
+        }
         debug!("Rejected control message: {}", reason);
         let error_response = FrameBuilder::error(ControlErrorCode::InvalidMessage, reason);
         let _ = send_frame(client_id, error_response, connections).await;
@@ -3144,6 +3538,36 @@ async fn handle_control_message(client_id: ClientId, msg: ControlMessage, state:
             )
             .await;
         }
+        ControlMessage::MediaGrant { circuit_id, token } => {
+            if matches!(
+                media::grant(client_id, circuit_id, &token, state, Instant::now()),
+                media::Grant::Refused
+            ) {
+                let err = FrameBuilder::error(
+                    ControlErrorCode::InvalidMessage,
+                    crate::protocol::unified::MEDIA_GRANT_REFUSED,
+                );
+                let _ = send_frame(client_id, err, connections).await;
+            }
+        }
+        ControlMessage::MediaJoin { token, lane, role } => {
+            if matches!(
+                media::join(client_id, &token, lane, role, state, Instant::now()),
+                media::Join::Refused
+            ) {
+                metrics::MEDIA_JOIN_REFUSED.inc();
+                debug!("Call connection join refused; closing");
+                close_now(client_id, connections);
+            } else if media::is_video_lane(lane) {
+                // Little unsent data in the kernel towards this receiver:
+                // late video waits in the relay's queue, where the age cap
+                // drops it.
+                let held = connections.get(&client_id).and_then(|c| c.held.clone());
+                if let Some(held) = held {
+                    held.bound_send_queue();
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -3179,12 +3603,62 @@ async fn note_first_ask(client_id: ClientId, state: &RelayState) {
         .identity_to_client
         .get(&tag)
         .is_some_and(|c| *c == client_id);
-    let backlog = mapped.then(|| take_offline_queue(tag, state)).flatten();
+    // Review L2: while an older connection of the member still has copies
+    // to re-queue, the queue is left to that salvage, which hands it over
+    // to this (now foreground) connection with the copies first.
+    let salvage_pending = state.salvaging.iter().any(|e| *e.value() == tag);
+    let backlog = (mapped && !salvage_pending)
+        .then(|| take_offline_queue(tag, state))
+        .flatten();
     drop(guard);
     if let Some(queue) = backlog {
         drain_offline_queue(client_id, tag, queue, state).await;
     }
     circuits::end_departed_blind_rows(tag, client_id, state).await;
+}
+
+/// Owner ruling 2026-10-26 (Task 8 A): after `client_id` has proven
+/// `identity` and taken its routing slot, close every *other* connection
+/// proven as the same identity that has asked (`has_asked`: a foreground
+/// connection). Returns how many were told to close.
+///
+/// Why only those: a background drain never asks, and the core refuses a
+/// drain while it is connected (`ForegroundConnected`), so an asked
+/// connection of the same identity still open when a new publish lands is
+/// a socket the device has already given up on (usually one that died
+/// without a FIN). A drain connection is never closed here, and a drain's
+/// own publish closes only such stale foreground sockets, never a drain.
+///
+/// Routing then follows the existing circuit model, unchanged: the stale
+/// connection's cleanup (`circuits::on_disconnect`) orphans its identity
+/// pairs, whose packets go to the new connection by the D34 hand-over
+/// (`forward_to_live_identity`), and its blinded rows end at the new
+/// connection's first ask (R21 / fix round 2 N-1), so both peers re-pair
+/// under the next token. What its writer still held is re-queued for the
+/// member (R-10, and the held copies of Task 8 B). Called under
+/// `ID_LOCKS(tag)`.
+fn close_stale_connections(identity: [u8; 32], client_id: ClientId, state: &RelayState) -> usize {
+    let stale: Vec<(ClientId, limits::ConnTx)> = state
+        .connections
+        .iter()
+        .filter(|c| *c.key() != client_id && c.has_asked && c.proven_identity == Some(identity))
+        .map(|c| (*c.key(), c.ws_tx.clone()))
+        .collect();
+    let tag = id_tag(&identity);
+    for (stale_id, tx) in &stale {
+        // Listed before it is killed (review L2): no packet for its pairs
+        // reaches the new connection ahead of its re-queued copies.
+        state.salvaging.insert(*stale_id, tag);
+        metrics::reject(metrics::REJECT_REPLACED);
+        tx.kill();
+    }
+    if !stale.is_empty() {
+        trace!(
+            "Closed {} stale connections of a member that published again",
+            stale.len()
+        );
+    }
+    stale.len()
 }
 
 /// Whether `client_id` is a live connection that has asked (its member's
@@ -3235,6 +3709,15 @@ async fn send_signaling(
         conn.ws_tx.send(frame.encode())?;
     }
     Ok(())
+}
+
+/// Mark `client_id` closing and send it a Close frame: a refused join or a
+/// frame a call connection may not send (Android calls §5).
+fn close_now(client_id: ClientId, connections: &DashMap<ClientId, UnifiedConnection>) {
+    if let Some(mut conn) = connections.get_mut(&client_id) {
+        conn.closing = true;
+        let _ = conn.ws_tx.send(Message::Close(None));
+    }
 }
 
 /// Send a unified frame to a client

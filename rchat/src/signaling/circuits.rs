@@ -1248,6 +1248,7 @@ pub(super) async fn handle_close_circuit(
         return;
     }
     teardown_key(key, state, Some(caller));
+    super::media::on_circuit_closed(key, state);
     // A blinded token is spent once paired: there is no ask of the caller's
     // under it to drop.
     if let PairKey::Identity(pair) = key {

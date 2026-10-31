@@ -434,6 +434,12 @@ pub(crate) struct QueueSaver {
 }
 
 impl QueueSaver {
+    /// Before the shutdown save: live connections' held copies go into
+    /// their identities' queues (review L3). Returns how many.
+    pub(crate) async fn requeue_held(&self) -> usize {
+        super::requeue_held_for_shutdown(&self.state).await
+    }
+
     /// Snapshot, seal and write atomically, one save at a time. Blocking
     /// (fsync): call from a blocking thread.
     pub(crate) fn save_now(&self) -> Result<()> {

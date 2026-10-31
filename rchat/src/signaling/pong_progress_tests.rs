@@ -87,7 +87,28 @@ async fn a_slow_healthy_reader_is_not_closed_behind_large_frames() {
     let (addr, state) = start_tuned(big_config(), short_keepalive).await;
     let (s_id, r_id) = (TestIdentity::random(), TestIdentity::random());
     let proxy = throttling_proxy(addr, 2 << 20).await;
-    let mut ws_s = authed(addr, &s_id).await;
+    // The scaled keepalive is for R only. S never reads, so it never
+    // answers a ping, and the relay reads S's large frames only as fast as
+    // it forwards them to R: with S on the scaled timings the relay would
+    // close S mid-upload (seen on FreeBSD, whose small initial TCP buffers
+    // keep S's sends blocked past the 2 s pong timeout). S keeps the
+    // production timings.
+    let mut ws_s = {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        state
+            .keepalive_exempt
+            .insert(sock.local_addr().unwrap(), ());
+        let tcp = sock.connect(addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(
+            format!("ws://{addr}/"),
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp),
+        )
+        .await
+        .unwrap();
+        ws
+    };
+    publish(&mut ws_s, &s_id).await;
     let mut ws_r = authed(proxy, &r_id).await;
     ask_each_other(&state, &mut ws_s, &s_id, &mut ws_r, &r_id).await;
     let cs = created(&mut ws_s).await;

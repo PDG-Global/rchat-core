@@ -218,8 +218,10 @@ async fn a_ping_refused_by_a_spent_global_budget_is_retried_not_fatal() {
         &state.connections,
         Instant::now(),
         PONG_TIMEOUT,
-        None
-    ));
+        None,
+        Duration::ZERO
+    )
+    .is_some());
     assert!(!tx.is_closed(), "an innocent pinger stays");
     assert!(state
         .connections
@@ -233,8 +235,10 @@ async fn a_ping_refused_by_a_spent_global_budget_is_retried_not_fatal() {
         &state.connections,
         Instant::now(),
         PONG_TIMEOUT,
-        None
-    ));
+        None,
+        Duration::ZERO
+    )
+    .is_some());
     assert!(conn_rx.try_recv().is_ok(), "the next tick pings");
     assert!(state
         .connections
@@ -256,13 +260,15 @@ async fn a_ping_into_a_full_queue_closes_the_connection() {
     let client = conn.client_id;
     state.connections.insert(client, conn);
 
-    assert!(!keepalive_tick(
+    assert!(keepalive_tick(
         client,
         &state.connections,
         Instant::now(),
         PONG_TIMEOUT,
-        None
-    ));
+        None,
+        Duration::ZERO
+    )
+    .is_none());
     assert!(tx.is_closed(), "the connection was told to close");
 }
 
@@ -282,8 +288,10 @@ async fn keepalive_pings_then_times_out_an_unanswered_ping() {
         &state.connections,
         t0,
         PONG_TIMEOUT,
-        None
-    ));
+        None,
+        Duration::ZERO
+    )
+    .is_some());
     assert!(rx.try_recv().is_ok(), "a ping was queued");
     let written = Some(t0 + Duration::from_secs(1));
     assert!(keepalive_tick(
@@ -291,16 +299,20 @@ async fn keepalive_pings_then_times_out_an_unanswered_ping() {
         &state.connections,
         t0 + Duration::from_secs(1) + PONG_TIMEOUT,
         PONG_TIMEOUT,
-        written
-    ));
+        written,
+        Duration::ZERO
+    )
+    .is_some());
     assert!(!tx.is_closed());
-    assert!(!keepalive_tick(
+    assert!(keepalive_tick(
         client,
         &state.connections,
         t0 + Duration::from_secs(2) + PONG_TIMEOUT,
         PONG_TIMEOUT,
-        written
-    ));
+        written,
+        Duration::ZERO
+    )
+    .is_none());
     assert!(tx.is_closed());
 }
 
@@ -321,23 +333,29 @@ async fn an_unwritten_ping_does_not_time_out() {
         &state.connections,
         t0,
         PONG_TIMEOUT,
-        Some(before)
-    ));
+        Some(before),
+        Duration::ZERO
+    )
+    .is_some());
     let late = t0 + PONG_TIMEOUT * 5;
     assert!(keepalive_tick(
         client,
         &state.connections,
         late,
         PONG_TIMEOUT,
-        None
-    ));
+        None,
+        Duration::ZERO
+    )
+    .is_some());
     assert!(keepalive_tick(
         client,
         &state.connections,
         late,
         PONG_TIMEOUT,
-        Some(before)
-    ));
+        Some(before),
+        Duration::ZERO
+    )
+    .is_some());
     assert!(!tx.is_closed());
 }
 

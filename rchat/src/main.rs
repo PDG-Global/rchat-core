@@ -354,6 +354,15 @@ async fn main() -> Result<()> {
     };
     if let Some(sig) = stop {
         if let Some(saver) = saver {
+            // Held copies (written, not yet acknowledged) are saved too,
+            // under their recipients (Task 8 review L3).
+            let held = saver.requeue_held().await;
+            if held > 0 {
+                info!(
+                    "{}: {} unacknowledged records put back in the queue",
+                    sig, held
+                );
+            }
             // save_now fsyncs and waits for any periodic save in flight.
             match tokio::task::spawn_blocking(move || saver.save_now()).await {
                 Ok(Ok(())) => info!("{}: offline queue saved", sig),

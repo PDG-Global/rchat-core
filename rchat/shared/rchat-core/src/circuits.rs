@@ -37,6 +37,15 @@ pub(crate) const MAX_SENT_IDS: usize = 4096;
 /// How long a user ask stays in flight on one connection: a second user
 /// ask to the same peer inside it is suppressed (spec §18.6 D33).
 pub(crate) const ASK_IN_FLIGHT: Duration = Duration::from_secs(5);
+/// How long the relay holds a one-sided identity ask (it expires at 540 s).
+#[cfg(test)]
+pub(crate) const RELAY_ASK_HOLD: Duration = Duration::from_secs(540);
+/// An unanswered identity ask is sent again this long after it was sent,
+/// plus or minus 30 s (`ASK_REFRESH_SPREAD_SECS` x jitter; well before the relay's hold ends).
+const ASK_REFRESH_SECS: f64 = 480.0;
+const ASK_REFRESH_SPREAD_SECS: f64 = 150.0; // times the +-0.2 jitter: +-30 s
+/// At most this many refreshes of one unanswered ask per connection.
+pub(crate) const MAX_ASK_REFRESHES: u32 = 8;
 /// How far back a peer's session reset reports unconfirmed sends (reason 3),
 /// and how long a reported-lost id may pass the duplicate drop.
 pub(crate) const RESET_REPORT_MAX_AGE_SECS: u64 = 72 * 3600;
@@ -574,6 +583,11 @@ impl ClientInner {
         self.note_recent_ask(peer_hex, ek_pub, now, false);
         self.unanswered_asks
             .insert(peer_hex.to_string(), (now, self.transport_epoch));
+        let refresh_in = (ASK_REFRESH_SECS + self.jitter() * ASK_REFRESH_SPREAD_SECS).max(60.0);
+        self.ask_refresh.insert(
+            peer_hex.to_string(),
+            (now + Duration::from_secs_f64(refresh_in), 0),
+        );
         // Final review H-1: the first identity ask a pinned contact's knock
         // caused on this connection starts its clock (`fire_blind_timeouts`
         // sends the pair back to blind when it runs out unmatched).
@@ -609,6 +623,7 @@ impl ClientInner {
 
     /// The relay answered the peer's ask (any outcome), or the peer is gone.
     pub(crate) fn clear_unanswered(&mut self, peer_hex: &str) {
+        self.ask_refresh.remove(peer_hex);
         if self.unanswered_asks.remove(peer_hex).is_some() {
             self.persist_meta();
         }
@@ -618,6 +633,7 @@ impl ClientInner {
     pub(crate) fn fire_due_reasks(&mut self, now: Instant) {
         // Blind asks held their whole TTL without a match (§C.1, §C.4).
         self.fire_blind_timeouts(now);
+        self.fire_ask_upkeep(now);
         let due: Vec<String> = self
             .pending_reasks
             .iter()
@@ -653,6 +669,59 @@ impl ClientInner {
                 log::debug!("[RUST] scheduled re-ask could not be sent; deferred");
                 if !self.deferred_asks.contains(&peer) {
                     self.deferred_asks.push(peer);
+                }
+            }
+        }
+    }
+
+    /// Final review I-2(b), on the existing timer while published (never in
+    /// a drain: the caller returns first): parked asks go out, and an
+    /// identity ask nobody answered is sent again before the relay lets go
+    /// of it (540 s). Through the pacer, never over an ask in flight, and
+    /// uncounted like a resume: it is not a retry. Bounded per connection.
+    fn fire_ask_upkeep(&mut self, now: Instant) {
+        if !self.is_key_bundle_published || self.in_drain() {
+            return;
+        }
+        if !self.deferred_asks.is_empty() {
+            self.send_deferred_asks(now, &[]);
+        }
+        let due: Vec<String> = self
+            .ask_refresh
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for peer in due {
+            let Some((_, done)) = self.ask_refresh.remove(&peer) else {
+                continue;
+            };
+            let current = self
+                .unanswered_asks
+                .get(&peer)
+                .is_some_and(|(_, ep)| *ep == self.transport_epoch);
+            if !current
+                || done >= MAX_ASK_REFRESHES
+                || self.require_askable(&peer).is_err()
+                || self.has_live_circuit(&peer)
+                || self.awaiting_live_init(&peer)
+                || self.blind_asks.contains_key(&peer)
+                || self.blind_path(&peer)
+            {
+                continue;
+            }
+            if self.ask_in_flight_until(&peer, now).is_some() {
+                continue;
+            }
+            if !self.ask_pacer.take(now) {
+                let at = self.ask_pacer.next_at(now);
+                self.ask_refresh.insert(peer, (at, done));
+                continue;
+            }
+            if self.send_ask(&peer, now).is_ok() {
+                // `send_ask` set a fresh clock; keep the count.
+                if let Some(e) = self.ask_refresh.get_mut(&peer) {
+                    e.1 = done + 1;
                 }
             }
         }
@@ -775,8 +844,33 @@ impl ClientInner {
                 asked.push(peer);
             }
         }
+        self.send_deferred_asks(now, &asked);
+        // Spec §4.8, round-2 M3: on every accepted publish, ask each pinned
+        // contact not yet reached under the new identity (no 72 h cutoff).
+        if self.rotation_pending_reach() {
+            let unreached: Vec<String> = self.rotation_unreached.iter().cloned().collect();
+            for peer in unreached {
+                if self.peers.pin_for(&peer).is_some() && !self.has_live_circuit(&peer) {
+                    self.schedule_reask(&peer);
+                }
+            }
+        }
+    }
+
+    /// Send the asks parked in `deferred_asks` (the publish was not yet
+    /// acknowledged, a send failed, a KEM key was missing). Run from
+    /// `after_publish_ok`, and from the timer while the bundle is published,
+    /// so one parked ask never waits for the next reconnect. `skip` lists
+    /// peers already asked in this pass.
+    fn send_deferred_asks(&mut self, now: Instant, skip: &[String]) {
         for peer in std::mem::take(&mut self.deferred_asks) {
-            if asked.contains(&peer) {
+            if skip.contains(&peer) {
+                continue;
+            }
+            // Never over an ask still in flight on this connection: a second
+            // would tear down the pair it is forming. Kept for the next tick.
+            if self.ask_in_flight_until(&peer, now).is_some() {
+                self.deferred_asks.push(peer);
                 continue;
             }
             // An ask left unanswered by a replaced transport is sent again
@@ -800,16 +894,6 @@ impl ClientInner {
                 // askable (Task 14 minor: it used to be dropped here).
                 if self.require_askable(&peer).is_ok() && !self.deferred_asks.contains(&peer) {
                     self.deferred_asks.push(peer);
-                }
-            }
-        }
-        // Spec §4.8, round-2 M3: on every accepted publish, ask each pinned
-        // contact not yet reached under the new identity (no 72 h cutoff).
-        if self.rotation_pending_reach() {
-            let unreached: Vec<String> = self.rotation_unreached.iter().cloned().collect();
-            for peer in unreached {
-                if self.peers.pin_for(&peer).is_some() && !self.has_live_circuit(&peer) {
-                    self.schedule_reask(&peer);
                 }
             }
         }
@@ -1042,7 +1126,7 @@ impl ClientInner {
             return;
         }
         if fresh {
-            if !self.knock_may_repair_by_identity(peer_hex, no_prior_session) {
+            if !self.identity_repair_allowed(peer_hex, no_prior_session) {
                 log::debug!("[RUST] contact knock: identity budget spent; staying blind");
                 return;
             }
@@ -1063,38 +1147,44 @@ impl ClientInner {
         self.schedule_reask(peer_hex);
     }
 
-    /// Rulings R35 and M-1 (Task 16 fix round 1): whether a pinned
+    /// Rulings R35 and M-1, and the 2026-10-19 ruling: whether a pinned
     /// contact's fresh knock may move the pair to the identity path. With
     /// no blind-capable session (no pair secret) the identity path is the
-    /// only one: yes. Otherwise every such re-pair, flagged "no prior
-    /// session" or not, draws on the pair's one identity re-pair per
+    /// only one: yes, no stamp. Otherwise it is answered only if (a) no
+    /// identity re-pair with this contact completed within
     /// `IDENTITY_FALLBACK_INTERVAL_SECS` (`last_identity_fallback_unix`,
-    /// persisted, shared with the timed fallback): the first one acts at once
-    /// and stamps it, and any other within 24 h is ignored for re-pairing
-    /// (the pair stays blind). So a relay that withholds genuine knocks,
-    /// first-contact, reinstall and rotation knocks included, and delivers
-    /// them after blind re-pairs can force at most one identity re-pair (and
-    /// one `SessionReplaced`) per pair per 24 h; a genuine reinstall still
-    /// re-pairs at once unless one already happened that day.
-    fn knock_may_repair_by_identity(&mut self, peer_hex: &str, no_prior_session: bool) -> bool {
+    /// stamped by the verified install, persisted) and (b) no knock answer to
+    /// this contact was scheduled within the same time (`knock_answered`,
+    /// memory only). Every identity ask carries a fresh knock, so without
+    /// (b) two sides could answer each other's knocks without end; our own
+    /// attempts never spend (b), so an unanswered fallback does not block
+    /// answering the contact. Bounds: at most one completed identity
+    /// re-pair, and one `SessionReplaced`, per pair per 24 h (persisted);
+    /// target-naming asks per side per pair per day are at most one timed
+    /// fallback plus one knock answer per process lifetime (the answer
+    /// budget resets on an app restart, which a relay cannot cause). Each
+    /// answer that runs out unmatched sends the pair back to blind.
+    fn identity_repair_allowed(&mut self, peer_hex: &str, no_prior_session: bool) -> bool {
         let now_unix = self.pair_now_unix();
-        let spent = match self.session_manager.get(peer_hex) {
+        let within =
+            |t: u64| now_unix.saturating_sub(t) < crate::blind::IDENTITY_FALLBACK_INTERVAL_SECS;
+        let repaired = match self.session_manager.get(peer_hex) {
             None => return true,
             Some(s) if s.pair_secret.is_none() => return true,
-            Some(s) => s.last_identity_fallback_unix.is_some_and(|t| {
-                now_unix.saturating_sub(t) < crate::blind::IDENTITY_FALLBACK_INTERVAL_SECS
-            }),
+            Some(s) => s.last_identity_fallback_unix.is_some_and(within),
         };
-        if spent {
+        let answered = self
+            .knock_answered
+            .get(peer_hex)
+            .copied()
+            .is_some_and(within);
+        if repaired || answered {
             log::debug!(
                 "[RUST] contact knock (no prior session: {no_prior_session}): identity budget spent"
             );
             return false;
         }
-        if let Some(mut s) = self.session_manager.get_mut(peer_hex) {
-            s.last_identity_fallback_unix = Some(now_unix);
-        }
-        let _ = self.persist_peer(peer_hex);
+        self.knock_answered.insert(peer_hex.to_string(), now_unix);
         true
     }
 
@@ -1112,6 +1202,10 @@ impl ClientInner {
             // The app stores it with the pin and re-pins it at launch (R11,
             // fix round 1 minor 2): a key event with code 5, the key as hex.
             self.emit_peer_key_event(peer_hex, KEM_KEY_LEARNED, &hex::encode(&bundle.kem_pk[..]));
+            // An ask that waited for this key is served by the knock's own
+            // answer (`contact_knocked` asks); a stale entry would send a
+            // second ask at the next publish.
+            self.deferred_asks.retain(|p| p != peer_hex);
         }
     }
 
@@ -2744,12 +2838,21 @@ impl ClientInner {
         }
         session.blinded = blind;
         // R20: the fallback clock starts again with this verified install
-        // (M-3: only here, never at the bare match); the last fallback's
-        // time carries over, so at most one per interval.
-        session.last_identity_fallback_unix = self
-            .session_manager
-            .get(peer_hex)
-            .and_then(|s| s.last_identity_fallback_unix);
+        // (M-3: only here, never at the bare match). The identity re-pair
+        // budget is spent here too, and only here: an identity install that
+        // replaces a session holding a pair secret stamps it (a completed
+        // re-pair, not first contact); any other install carries it over.
+        let replaced = self.session_manager.get(peer_hex);
+        let re_pair = n.origin == crate::blind::InstallOrigin::Identity
+            && replaced.as_ref().is_some_and(|s| s.pair_secret.is_some());
+        session.last_identity_fallback_unix = if re_pair {
+            Some(self.pair_now_unix())
+        } else {
+            replaced
+                .as_ref()
+                .and_then(|s| s.last_identity_fallback_unix)
+        };
+        drop(replaced);
         self.identity_fallback.remove(peer_hex);
         if !blind {
             // M-4: a new pair secret: what was sealed under the old lineage
@@ -3269,6 +3372,8 @@ impl ClientInner {
     /// Close the live circuit and drop the current and retired sessions and
     /// anything held from the peer.
     fn forget_peer_session(&mut self, peer_hex: &str) {
+        // Its call ends first, while the session can still carry the End.
+        self.call_forget_peer(peer_hex, Instant::now());
         self.close_circuit_with(peer_hex);
         if let Some(p) = self.pending_inits.remove(peer_hex) {
             self.close_circuit_id(&p.circuit_id);
@@ -3451,6 +3556,14 @@ impl ClientInner {
             self.peers.set_pin_hour(&id, now_hour());
         }
         self.ask_if_kem_arrived(&id);
+        // Final review I-2: a knock from this identity that arrived before
+        // it was pinned was only a request. Pinning it now (from a code, or
+        // by accepting) answers that knock: the peer asked first, so the
+        // pair forms without waiting for a reconnect. An ask already in
+        // flight (the app's own `request_circuit`) is not repeated.
+        if new_pin && self.peers.has_requested(&id) {
+            self.answer_noted_knock(&id);
+        }
         Ok(())
     }
 
@@ -3466,6 +3579,18 @@ impl ClientInner {
         self.peers.pin_kem(&id, kem_pk).map_err(pin_error)?;
         self.ask_if_kem_arrived(&id);
         Ok(())
+    }
+
+    /// Ask a freshly pinned peer whose earlier knock was held as a request.
+    /// A failure is kept in `deferred_asks` by `ask` (no KEM key yet) or
+    /// here, so the next accepted publish sends it.
+    fn answer_noted_knock(&mut self, id: &str) {
+        if self.ask(id, AskTrigger::User, Instant::now()).is_err() {
+            log::debug!("[RUST] ask after pinning a requester could not be sent");
+            if self.require_askable(id).is_ok() && !self.deferred_asks.iter().any(|p| p == id) {
+                self.deferred_asks.push(id.to_string());
+            }
+        }
     }
 
     /// T5 N-1: a peer deferred for want of a KEM key is asked as soon as

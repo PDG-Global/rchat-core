@@ -116,6 +116,26 @@ pub fn blind_tag(token: &[u8; 32]) -> BlindTag {
     blind_tag_with(pair_key_ref(), token)
 }
 
+/// Keyed tag of a call's relay token (Android calls §5, D3). Pair-derived:
+/// whoever holds the token is one of a pair, so it is never logged next to
+/// an identity-derived value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MediaTag(pub [u8; 32]);
+
+impl fmt::Debug for MediaTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MediaTag(..)")
+    }
+}
+
+/// `BLAKE3-keyed(PAIR_KEY, "rchat/media/v1\0" || token)`.
+pub fn media_tag(token: &[u8; 32]) -> MediaTag {
+    let mut h = blake3::Hasher::new_keyed(pair_key_ref());
+    h.update(b"rchat/media/v1\0");
+    h.update(token);
+    MediaTag(*h.finalize().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

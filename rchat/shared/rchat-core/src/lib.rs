@@ -40,20 +40,30 @@ uniffi::setup_scaffolding!();
 mod acks;
 #[cfg(test)]
 mod alloc_probe;
+#[cfg(all(target_os = "android", feature = "dev-log"))]
+mod android_log;
+mod android_roots;
 pub mod blind;
 #[cfg(test)]
 mod blind_flow_tests;
+pub mod call;
 mod circuits;
 pub mod crypto;
 pub mod device_key;
 pub mod disappearing;
 pub mod drain;
 pub mod ffi;
+pub mod file_check;
 pub mod file_msg;
 pub mod invite;
+#[cfg(any(target_os = "android", test))]
+pub mod jni;
+#[cfg(all(test, rchat_app_tree))]
+mod jni_parity_tests;
 pub mod kem;
 pub mod keyauth;
 pub mod knock;
+pub mod media_check;
 pub mod notice;
 pub mod padding;
 pub mod pairing;
@@ -92,7 +102,7 @@ use peers::{PeerBook, PeerKeyState};
 use protocol::{classify_signaling, signaling_frame, SignalingEvent, SignalingMessage};
 use protocol::{CircuitId, ControlMessage, Frame, MessageId, MessageType, RelayPacket};
 use session::SessionManager;
-use transport::{TransportConfig, WebSocketClient};
+use transport::{KeepaliveInterval, TransportConfig, WebSocketClient};
 
 /// Most sealed bodies held for senders whose session does not exist yet.
 pub(crate) const MAX_PENDING_ENCRYPTED: usize = 256;
@@ -372,11 +382,36 @@ pub enum RChatError {
     #[error("File too large: at most {max} bytes in all")]
     FileTooLarge { max: u64 },
 
+    /// A kind of file rChat never sends (file-safety spec §3), refused
+    /// before anything is sent (FFI code 30). `category` is
+    /// `file_check::Verdict::code`, never shown to the user.
+    #[error("rChat doesn't send this kind of file")]
+    FileBlocked { category: i32 },
+
     /// A background drain (protocol v3 §H.1) was asked for while the
     /// client is connected: a connected client receives the queue itself,
     /// and the drain never takes its connection over (FFI code 29).
     #[error("A connected client is running; no background drain")]
     ForegroundConnected,
+
+    /// The relay does not pair call connections (no `calls-v1`, D8).
+    #[error("Your relay needs an update for calls")]
+    RelayNoCalls,
+    /// A call is already in progress (one call at a time).
+    #[error("A call is already in progress")]
+    CallInProgress,
+    /// No call with that id (it ended, or never existed here).
+    #[error("No such call")]
+    NoSuchCall,
+    /// Video cannot be started on this call (FFI code 34).
+    #[error("Video is unavailable on this call")]
+    VideoUnavailable,
+    /// The relay does not carry video (no `video-v1`, FFI code 35).
+    #[error("Your relay needs an update for video")]
+    RelayNoVideo,
+    /// Video was asked for again too soon (FFI code 36).
+    #[error("Video was asked for too soon")]
+    VideoTooSoon,
 }
 
 /// Configuration for the RChat client. `Debug` never prints the identity
@@ -424,6 +459,10 @@ pub struct ClientConfig {
     /// removes a peer on `on_circuit_established`).
     #[serde(default)]
     pub rotation_unreached_hex: Option<Vec<String>>,
+    /// Android voice calls (D9): handle call signalling (0x0A-0x0D). Off,
+    /// they are dropped like any unknown plaintext (protocol v3).
+    #[serde(default)]
+    pub calls_enabled: bool,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -460,6 +499,7 @@ impl Default for ClientConfig {
             rotation_links_hex: None,
             rotated_at_unix: None,
             rotation_unreached_hex: None,
+            calls_enabled: false,
         }
     }
 }
@@ -506,6 +546,21 @@ pub struct ReceivedFile {
     pub timestamp_ms: u64,
 }
 
+/// A received file the core blocked (file-safety spec §3): its bytes were
+/// wiped and never handed over. `name` is cleaned
+/// (`file_msg::sanitise_name`); `expire_secs` is the sender's timer
+/// (0 = never). The core already marked it seen and queued its delivered
+/// receipt: the app files a bubble and never confirms it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct BlockedFile {
+    pub id: String,
+    pub sender_identity: String,
+    pub name: String,
+    pub expire_secs: u32,
+    pub timestamp_ms: u64,
+}
+
 /// A knock from someone not yet accepted (spec §6.3). Intro fields are
 /// empty / 0 when the knock carried no intro.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +594,11 @@ pub trait RChatCallbacks: Send + Sync {
     /// reaches `on_message_received`. Its delivered receipt is queued when
     /// the app calls `mark_message_seen`, as for any message (D36).
     fn on_file_received(&self, _file: ReceivedFile) {}
+
+    /// A received file of a kind rChat blocks (file-safety spec §3): no
+    /// bytes. Never followed by `on_file_received` for the same id; the
+    /// core has queued its delivered receipt.
+    fn on_file_blocked(&self, _file: BlockedFile) {}
 
     /// A contact's disappearing timer changed (protocol v3 §I.2): `secs` is
     /// one of `disappearing::TIMER_CHOICES_SECS` (0 = off), `changed_at_ms`
@@ -615,18 +675,38 @@ pub struct RChatClient {
     /// The latest `set_steady_traffic` value (enabled, slot ms, foreground),
     /// applied the same way.
     steady_wanted: Arc<std::sync::Mutex<(bool, u32, bool)>>,
+    /// The inner `keepalive`, set without the client lock.
+    keepalive: KeepaliveInterval,
+    /// The configured interval, restored in the foreground.
+    keepalive_foreground_secs: u64,
     /// The inner `connected_mirror`, read without the client lock.
     connected_mirror: Arc<std::sync::atomic::AtomicBool>,
     /// Set by `retire` (and so by every uninstall): `connect` refuses from
     /// then on, so a client the app no longer holds never connects or
     /// publishes again (R34 round 2 N-1).
     retired: Arc<std::sync::atomic::AtomicBool>,
+    /// The call slot's event queue, polled without the client lock (D19).
+    call_events: Arc<parking_lot::Mutex<std::collections::VecDeque<call::machine::CallEvent>>>,
+    /// The current call's media, for the audio thread without the client
+    /// lock (D37).
+    call_audio: Arc<parking_lot::Mutex<Option<Arc<dyn call::machine::MediaControl>>>>,
+    call_muted: Arc<std::sync::atomic::AtomicBool>,
+    /// The current call's video engine, for the app's video threads
+    /// without the client lock.
+    call_video: Arc<parking_lot::Mutex<Option<Arc<dyn call::video::engine::VideoControl>>>>,
+    call_video_prefs: Arc<call::machine::VideoPrefs>,
     /// Tests: a pause in `connect` before it takes the client lock.
     #[cfg(test)]
     pre_lock_delay_for_test: Arc<std::sync::Mutex<std::time::Duration>>,
 }
 
 struct ClientInner {
+    /// The relay announced `calls-v1` at this connection's hello (D8).
+    relay_calls: bool,
+    /// The relay announced `video-v1` (video lanes 2 and 3).
+    relay_video: bool,
+    /// Voice calls (Android calls spec).
+    call: call::machine::CallSlot,
     config: ClientConfig,
     websocket: Option<WebSocketClient>,
     identity: Option<IdentityKeyPair>,
@@ -743,6 +823,9 @@ struct ClientInner {
     /// relay's host, port and pin, and dropped on `disconnect()`, a pin
     /// change, a refused relay and an identity wipe or change.
     tls_tickets: tls_resumption::ResumptionStore,
+    /// The keepalive interval every connection of this client follows,
+    /// changeable while connected (`RChatClient::set_keepalive_background`).
+    keepalive: KeepaliveInterval,
     /// Tests only: let non-signaling frames through before the gate.
     bypass_frame_gate: bool,
     /// Non-signaling frames dropped before the relay gate and publish passed.
@@ -817,6 +900,9 @@ struct ClientInner {
     auto_resends: std::collections::HashMap<String, VecDeque<u64>>,
     /// Peers with an ask that has had no answer: (sent at, attempts).
     unanswered_asks: std::collections::HashMap<String, (std::time::Instant, u64)>,
+    /// When an unanswered identity ask is sent again (before the relay's
+    /// hold ends), and how many refreshes it has had. Memory only.
+    ask_refresh: std::collections::HashMap<String, (std::time::Instant, u32)>,
     /// Calls into `SessionManager::decrypt_from` (read by tests only).
     decrypt_attempts: std::sync::atomic::AtomicU64,
     /// Where `retry_held` resumes when more senders wait than it takes per
@@ -884,6 +970,11 @@ struct ClientInner {
     /// (N-2): an older knock, or that very knock, is ignored. Persisted in
     /// the peer record.
     knock_acted: std::collections::HashMap<String, (u64, [u8; 32])>,
+    /// Unix time of the last identity ask sent in answer to a pinned
+    /// contact's knock, per contact: one answer per pair per 24 h, so
+    /// answers cannot ping-pong between two sides (each ask carries a fresh
+    /// knock). Memory only, one entry per contact; resets with the process.
+    knock_answered: std::collections::HashMap<String, u64>,
     /// Peers whose knock (a pinned contact's) shows they are on the
     /// identity path: our next ask to them is an identity ask, until the
     /// next session install, until that identity ask runs out unmatched
@@ -921,6 +1012,11 @@ struct ClientInner {
 
 /// Transport events, handled one at a time in arrival order.
 pub(crate) use transport::TransportEvent as CoreEvent;
+
+/// Keepalive interval while an Android app holds its connection in the
+/// background (spec 2026-10-26 §3): with the ±8 s jitter at most 248 s,
+/// under the relay's 300 s idle timeout.
+pub const KEEPALIVE_BACKGROUND_SECS: u64 = 240;
 
 impl ClientInner {
     /// Report a delivery or recovery event to the app (spec §18.9). Never
@@ -991,6 +1087,9 @@ impl ClientInner {
             steady_unheard: std::collections::HashMap::new(),
             steady_message_turn: std::collections::HashSet::new(),
             sent_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            relay_calls: false,
+            relay_video: false,
+            call: Default::default(),
             auth_challenge: None,
             publish_requested: false,
             publish_in_flight: false,
@@ -1002,6 +1101,7 @@ impl ClientInner {
             hello_outstanding: false,
             relay_pin_info: None,
             tls_tickets: tls_resumption::ResumptionStore::new(),
+            keepalive: KeepaliveInterval::new(u64::from(config.keepalive_interval_secs)),
             bypass_frame_gate: false,
             frames_dropped_before_gate: 0,
             rotation_block: None,
@@ -1028,6 +1128,7 @@ impl ClientInner {
             retrying_held: false,
             auto_resends: std::collections::HashMap::new(),
             unanswered_asks: std::collections::HashMap::new(),
+            ask_refresh: std::collections::HashMap::new(),
             decrypt_attempts: std::sync::atomic::AtomicU64::new(0),
             retry_cursor: 0,
             acks: std::sync::Mutex::new(acks::AckTracker::default()),
@@ -1054,6 +1155,7 @@ impl ClientInner {
             identity_fallback: std::collections::HashMap::new(),
             seen_knocks: std::collections::HashMap::new(),
             knock_acted: std::collections::HashMap::new(),
+            knock_answered: std::collections::HashMap::new(),
             identity_wanted: std::collections::HashMap::new(),
             ask_pacer: blind::AskPacer::default(),
             recent_asks: VecDeque::new(),
@@ -1323,6 +1425,8 @@ impl ClientInner {
                 auth_challenge,
                 knock_ttl_hours,
                 relay_identity,
+                calls,
+                video,
             } => {
                 if !self.hello_outstanding {
                     log::debug!("[RUST] Ignoring a hello_response with no hello outstanding");
@@ -1341,6 +1445,8 @@ impl ClientInner {
                     return;
                 }
                 self.auth_challenge = Some(challenge);
+                self.relay_calls = calls;
+                self.relay_video = video;
                 self.publish_in_flight = false;
                 if let Some(hours) = knock_ttl_hours {
                     self.knock_ttl_hours = hours.clamp(1, 72);
@@ -1445,16 +1551,30 @@ impl ClientInner {
         self.blind_paused.clear();
         self.spent_blind_asks.clear();
         // A fallback identity ask went with the connection: back to blind
-        // (the next one waits out `IDENTITY_FALLBACK_INTERVAL_SECS`).
+        // (its send restarted the fallback clock, so the next one is a day
+        // away).
         self.identity_fallback.clear();
         // So did a knock-driven identity ask (final review H-1): back to
         // blind, unless the knock said the contact holds no session with us
         // (it cannot ask blind; its identity ask is answered again, with
         // blind asks beside it while we hold a PS, N-1).
-        self.identity_wanted.retain(|_, w| {
-            w.asked = None;
+        // A dropped one restarts the blind clock (as when it runs out), so
+        // the timed fallback is never due right behind it.
+        let now_unix = self.pair_now_unix();
+        let mut dropped: Vec<String> = Vec::new();
+        self.identity_wanted.retain(|p, w| {
+            let was_asked = w.asked.take().is_some();
+            if !w.no_prior_session && was_asked {
+                dropped.push(p.clone());
+            }
             w.no_prior_session
         });
+        for peer in dropped {
+            if let Some(mut s) = self.session_manager.get_mut(&peer) {
+                s.blind_since_unix = Some(now_unix);
+            }
+            let _ = self.persist_peer(&peer);
+        }
         // A new connection: a full ask burst, and nothing to blame a
         // refusal on yet.
         self.ask_pacer.reset();
@@ -1555,6 +1675,8 @@ impl ClientInner {
         self.auth_challenge = None;
         self.publish_in_flight = false;
         self.notify_reconnect = false;
+        // The next connection's queue is handed over afresh (D11).
+        self.call.handed_over = false;
     }
 
     /// Handle one transport event, unless it comes from a retired client.
@@ -1585,8 +1707,10 @@ impl ClientInner {
 
     /// A decrypted ratchet plaintext from an accepted peer. Format:
     /// `00 00 00 00` legacy invisible hello (v3 sends a cover reply,
-    /// `05 01`, instead); `01 || text`; `02 || binary`; `0A`-`0F` reserved
-    /// for call signalling and dropped like any unknown type (§9a);
+    /// `05 01`, instead); `01 || text`; `02 || binary`; `0A`-`0D` call
+    /// signalling (Android calls spec §4: handled by `call::machine` when
+    /// `calls_enabled`, never receipted; dropped as v3 drops it when off);
+    /// `0E` video signalling (`call::video`, same rules as calls); `0F` reserved and dropped;
     /// `06 ||` session notice (accepted only under the current session, `by`;
     /// its signature checked against that session's `binding`).
     /// `message_id` is the sealed envelope's id (§4.5): delivered as
@@ -1602,6 +1726,39 @@ impl ClientInner {
         binding: Option<[u8; 32]>,
     ) {
         if plaintext == [0u8; 4] {
+            return;
+        }
+        #[cfg(test)]
+        if plaintext.first().is_some_and(|b| {
+            call::signal::is_call_type(*b) || call::video::signal::is_video_type(*b)
+        }) {
+            self.call.heard.push(plaintext.to_vec());
+        }
+        if plaintext
+            .first()
+            .is_some_and(|b| call::signal::is_call_type(*b))
+        {
+            // Call signalling (spec §4): never a message, never receipted.
+            // Off (D9) or from a retired session, dropped as v3 drops it.
+            if self.config.calls_enabled && by == session::DecryptedBy::Current {
+                self.handle_call_plaintext(
+                    sender,
+                    plaintext,
+                    std::time::Instant::now(),
+                    call::unix_ms(),
+                );
+            }
+            return;
+        }
+        if plaintext
+            .first()
+            .is_some_and(|b| call::video::signal::is_video_type(*b))
+        {
+            // Video signalling (video spec): never a message, never
+            // receipted; off or from a retired session, dropped.
+            if self.config.calls_enabled && by == session::DecryptedBy::Current {
+                self.handle_video_plaintext(sender, plaintext, std::time::Instant::now());
+            }
             return;
         }
         if plaintext.first() == Some(&notice::NOTICE_TYPE) {
@@ -1696,9 +1853,31 @@ impl ClientInner {
             // A file goes to its own callback only, never as a message
             // (§E.2); its receipt follows `mark_message_seen` like any
             // message's. `is_deliverable` already checked it decodes.
-            let Ok(f) = file_msg::decode_file(plaintext) else {
+            let Ok(mut f) = file_msg::decode_file(plaintext) else {
                 return;
             };
+            // File safety §3: a blocked kind never reaches the app. `f.name`
+            // is already cleaned (`decode_file`), as `classify` expects.
+            if file_check::classify(&f.name, &f.bytes).is_blocked() {
+                zeroize::Zeroize::zeroize(&mut f.bytes);
+                self.drain_note_delivered(sender, message_id);
+                if let Some(cb) = &self.callbacks {
+                    cb.on_file_blocked(BlockedFile {
+                        id: hex::encode(message_id),
+                        sender_identity: sender.to_string(),
+                        name: f.name,
+                        expire_secs: f.expire_secs,
+                        timestamp_ms,
+                    });
+                }
+                // Nothing for the app to store (Decision 2): seen and
+                // receipted here, so the sender never retries and a replay
+                // is receipted, not reported again.
+                if self.mark_seen_and_receipt(sender, message_id).is_err() {
+                    log::warn!("[RUST] a blocked file's seen mark could not be saved");
+                }
+                return;
+            }
             let file = ReceivedFile {
                 id: hex::encode(message_id),
                 sender_identity: sender.to_string(),
@@ -1860,8 +2039,21 @@ impl RChatClient {
         // Moved back for `ClientInner::new`, which takes it at once.
         config.identity_key_seed = seed.as_mut().map(|hex| std::mem::take(&mut **hex));
         drop(seed);
-        let inner = ClientInner::new(config);
+        let mut inner = ClientInner::new(config);
+        // Call media runs on this client's runtime, never a short one.
+        inner.call.starter = Arc::new(call::machine::RealStarter::new(Some(
+            runtime.handle().clone(),
+        )));
         let connected_mirror = inner.connected_mirror.clone();
+        let keepalive = inner.keepalive.clone();
+        let keepalive_foreground_secs = keepalive.get();
+        let (call_events, call_audio, call_muted) = (
+            inner.call.events.clone(),
+            inner.call.audio.clone(),
+            inner.call.muted.clone(),
+        );
+        let (call_video, call_video_prefs) =
+            (inner.call.video.clone(), inner.call.video_prefs.clone());
 
         Ok(Arc::new(Self {
             runtime: Arc::new(runtime),
@@ -1869,8 +2061,15 @@ impl RChatClient {
             callback_hub: CallbackHub::new(),
             cover_wanted: Arc::default(),
             steady_wanted: Arc::default(),
+            keepalive,
+            keepalive_foreground_secs,
             connected_mirror,
             retired: Arc::default(),
+            call_events,
+            call_audio,
+            call_muted,
+            call_video,
+            call_video_prefs,
             #[cfg(test)]
             pre_lock_delay_for_test: Arc::default(),
         }))
@@ -2034,6 +2233,7 @@ impl RChatClient {
                 reconnect_max_attempts_after_connect: 0,
                 dev_origin: guard.config.dev_origin.clone(),
                 resumption: Some(guard.tls_tickets.clone()),
+                keepalive_live: Some(guard.keepalive.clone()),
             };
             guard.bind_tls_tickets();
 
@@ -2155,6 +2355,8 @@ impl RChatClient {
 
         block_on_async(runtime, move || async move {
             let mut guard = inner.write().await;
+            // A call can't outlive the connection: ended (failed), media stopped.
+            guard.call_abort(call::unix_ms());
 
             // Coalesced best-effort writes go before the sessions are wiped.
             guard.flush_deferred_writes();
@@ -2573,7 +2775,9 @@ impl RChatClient {
     /// (`file_msg::sanitise_name`) before it leaves; `mime` is advisory and
     /// must be printable ASCII of at most 255 bytes (`InvalidParameter`);
     /// the whole plaintext must fit `file_msg::MAX_FILE_PLAINTEXT`
-    /// (`FileTooLarge`). Both are checked before anything else.
+    /// (`FileTooLarge`). Both are checked before anything else, then the
+    /// kind (`FileBlocked`, file-safety spec §3: the classifier a receiver
+    /// runs, on the cleaned name and the bytes).
     /// The message carries the contact's current disappearing timer (§I.2),
     /// read under the lock that seals it. Files travel outside the steady
     /// shape unless the whole plaintext fits a slot, and are ack-tracked
@@ -3065,6 +3269,18 @@ impl RChatClient {
         });
     }
 
+    /// Android background receiving: the keepalive stretches to
+    /// `KEEPALIVE_BACKGROUND_SECS` while `background`, and returns to the
+    /// configured interval (30 s) in the foreground. Reaches the live
+    /// connection at once and every later one of this client.
+    pub fn set_keepalive_background(&self, background: bool) {
+        self.keepalive.set(if background {
+            KEEPALIVE_BACKGROUND_SECS
+        } else {
+            self.keepalive_foreground_secs
+        });
+    }
+
     /// Process pending operations (call this periodically from UI)
     pub fn process_pending(&self) -> Result<(), RChatError> {
         let inner = self.inner.clone();
@@ -3115,17 +3331,28 @@ pub(crate) fn sn_error(e: peers::SafetyNumberError, peer: &str) -> RChatError {
 }
 
 /// A file send's body (`file_msg::encode_file_body`, errors mapped for the
-/// app). The caller holds `data` in `Zeroizing`; the body is wiped by
-/// `send_payload_checked`.
+/// app), refused when the classifier the receiver runs blocks the cleaned
+/// name or the bytes (file-safety spec §3, code 30). The caller holds
+/// `data` in `Zeroizing`; the body is wiped by `send_payload_checked`, or
+/// here when refused.
 fn file_body(name: &str, mime: &str, data: &[u8], expire_secs: u32) -> Result<Vec<u8>, RChatError> {
-    file_msg::encode_file_body(name, mime, data, expire_secs).map_err(|e| match e {
-        file_msg::FileError::TooLarge => RChatError::FileTooLarge {
-            max: file_msg::MAX_FILE_PLAINTEXT as u64,
-        },
-        _ => RChatError::InvalidParameter {
-            message: "MIME type must be printable ASCII, at most 255 bytes".into(),
-        },
-    })
+    let mut body =
+        file_msg::encode_file_body(name, mime, data, expire_secs).map_err(|e| match e {
+            file_msg::FileError::TooLarge => RChatError::FileTooLarge {
+                max: file_msg::MAX_FILE_PLAINTEXT as u64,
+            },
+            _ => RChatError::InvalidParameter {
+                message: "MIME type must be printable ASCII, at most 255 bytes".into(),
+            },
+        })?;
+    let verdict = file_check::classify(&file_msg::sanitise_name(name.as_bytes()), data);
+    if verdict.is_blocked() {
+        zeroize::Zeroize::zeroize(&mut body);
+        return Err(RChatError::FileBlocked {
+            category: verdict.code(),
+        });
+    }
+    Ok(body)
 }
 
 /// What a send handed to the core: its 32-hex id and the disappearing
@@ -3781,7 +4008,9 @@ impl RChatClient {
             // R34a: the queue taken at our publish is handed over. Only a
             // background drain acts on it (it may end); otherwise nothing.
             Frame::Control(ControlMessage::QueueHandedOver { .. }) => {
-                guard.drain_note_handed_over(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                guard.drain_note_handed_over(now);
+                guard.call_on_queue_handed_over(now, call::unix_ms());
             }
             Frame::Control(ControlMessage::CircuitClosed { circuit_id, .. }) => {
                 guard.handle_circuit_closed(circuit_id)
@@ -3793,6 +4022,12 @@ impl RChatClient {
             // Final review: an ask refused over a relay cap. The offline
             // queue's refusal of a relay packet (its text starts with the
             // shared `OFFLINE_QUEUE_FULL_PREFIX`, N-3) is not about an ask.
+            Frame::Control(ControlMessage::Error {
+                code: protocol::ControlErrorCode::InvalidMessage,
+                message,
+            }) if message == protocol::MEDIA_GRANT_REFUSED => {
+                guard.call_grant_refused(call::unix_ms())
+            }
             Frame::Control(ControlMessage::Error {
                 code: protocol::ControlErrorCode::RateLimited,
                 message,
@@ -4204,6 +4439,9 @@ impl RChatCallbacks for HubCallbacks {
                 cb.on_file_received(f);
             }
         });
+    }
+    fn on_file_blocked(&self, file: BlockedFile) {
+        self.0.post(move |cb| cb.on_file_blocked(file));
     }
     fn on_message_delivered(&self, message_id: String) {
         self.0.post(move |cb| cb.on_message_delivered(message_id));
@@ -4709,6 +4947,9 @@ mod tests {
                     .unwrap()
                     .push(format!("file {} {}", f.name, f.bytes.len()));
             }
+            fn on_file_blocked(&self, f: BlockedFile) {
+                self.0.lock().unwrap().push(format!("blocked {}", f.name));
+            }
             fn on_message_delivered(&self, _: String) {}
             fn on_error(&self, _: String) {}
             fn on_circuit_established(&self, _: String, _: bool) {}
@@ -4725,8 +4966,18 @@ mod tests {
             bytes: vec![1, 2, 3],
             timestamp_ms: 1,
         });
+        HubCallbacks(hub.clone()).on_file_blocked(BlockedFile {
+            id: "cd".repeat(16),
+            sender_identity: PEER.into(),
+            name: "x.apk".into(),
+            expire_secs: 0,
+            timestamp_ms: 2,
+        });
         hub.flush(Duration::from_secs(2));
-        assert_eq!(*files.0.lock().unwrap(), vec!["file x.bin 3".to_string()]);
+        assert_eq!(
+            *files.0.lock().unwrap(),
+            vec!["file x.bin 3".to_string(), "blocked x.apk".to_string()]
+        );
     }
 
     /// Fix round 2 N-1: a file whose hub job is dropped undelivered is

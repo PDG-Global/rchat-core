@@ -245,6 +245,14 @@ persist = false
 # persist_key_path = "/run/rchat/queue.key"
 # Dev/exception only: skip the memory-filesystem check for the key.
 # allow_persistent_key = false
+# Held copies: each relayed message written to a connection is kept until the
+# client's TCP stack acknowledges it, and put back in the queue if the
+# connection ends first. A budget of its own, separate from the queue's.
+# Per connection: at least max_message_bytes. Defaults 4 MiB and 64 MiB.
+# Behind a layer-4 front end (proxy_protocol) the front end acknowledges, so
+# the copies cover only the hop to it.
+# held_copy_max_bytes_per_connection = 4194304
+# held_copy_max_total_bytes = 67108864
 
 # --- Option 1: automatic certificates (Let's Encrypt, TLS-ALPN-01) ---------
 # Requirements: a public DNS A/AAAA record for every domain pointing at this

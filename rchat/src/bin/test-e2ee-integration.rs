@@ -756,6 +756,14 @@ extern "C" fn e9_file(
 ) {
 }
 extern "C" fn e9_timer(_: *const c_char, _: u32, _: u64, _: c_int) {}
+extern "C" fn e9_file_blocked(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u32,
+    _: u64,
+) {
+}
 
 /// E9 (protocol v3 §H.1, R34 M-8): `rchat_background_drain` itself, against
 /// the real relay. Bob has never connected; Alice asks him (a one-sided
@@ -786,6 +794,7 @@ fn e9_ffi_background_drain(args: &Args, _relay: &mut Relay) -> Result<(), String
         Some(e9_status),
         Some(e9_file),
         Some(e9_timer),
+        Some(e9_file_blocked),
     );
     check(registered == 0, "rchat_register_callbacks")?;
     let config = CString::new(format!(

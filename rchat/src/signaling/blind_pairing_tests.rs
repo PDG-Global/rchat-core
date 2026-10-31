@@ -379,6 +379,10 @@ async fn a_third_ask_on_a_paired_token_gets_pair_token_busy() {
         TestIdentity::random(),
     );
     let token = rand::random();
+    // B's other connection publishes before B's slot connection asks: a
+    // publish closes only connections that have asked (Task 8 A), so both
+    // stay open.
+    let mut wb2 = authed(addr, &b).await;
     let (_wa, mut wb, _ca, _cb) = blind_pair(&state, addr, &a, &b, token).await;
     let mut wc = authed(addr, &c).await;
     wc.send(blind_ask(token, [0xC3; 32])).await.unwrap();
@@ -393,7 +397,6 @@ async fn a_third_ask_on_a_paired_token_gets_pair_token_busy() {
     assert_eq!(state.blind_pair_circuits.len(), 1);
     // A member on another connection (not a slot of the row) asking the
     // consumed token is refused the same way; the pair is untouched.
-    let mut wb2 = authed(addr, &b).await;
     wb2.send(blind_ask(token, [0xB9; 32])).await.unwrap();
     let fb = frames_until_quiet(&mut wb2, QUIET).await;
     assert_eq!(busy_eks(&fb), vec![vec![0xB9u8; 32]]);
@@ -791,26 +794,24 @@ async fn a_member_asking_again_ends_its_departed_blind_rows() {
     .await;
 }
 
-/// Fix round 2 N-1: the member publishes and asks on a new connection
-/// before the relay has closed its old one (the common mobile case). Its
-/// first ask has nothing to end yet; when the old socket closes, the row
-/// ends at once (the peer told `CircuitClosed`) and nothing is left in the
-/// index.
+/// Fix round 2 N-1, as amended by Task 8 A: the member publishes on a new
+/// connection while the relay still holds its old one (the common mobile
+/// case). The publish closes the old socket at once (it had asked, so it is
+/// stale); the new connection's first ask ends the row (R21; or the old
+/// socket's close does, N-1, when the ask wins the race), the peer is told
+/// `CircuitClosed`, and nothing is left in the index.
 #[tokio::test]
-async fn an_old_socket_closing_after_the_members_new_ask_ends_the_row() {
+async fn a_new_publish_closes_the_old_socket_and_the_new_ask_ends_the_row() {
     let (addr, state) = start(test_config()).await;
     let (a, b) = (TestIdentity::random(), TestIdentity::random());
     let token = rand::random();
-    let (mut wa, wb, ca, _cb) = blind_pair(&state, addr, &a, &b, token).await;
+    let (mut wa, mut wb, ca, _cb) = blind_pair(&state, addr, &a, &b, token).await;
     let mut wb2 = authed(addr, &b).await;
-    blind_held(&mut wb2, &state, &b, rand::random(), [0xB3; 32]).await;
-    assert_eq!(
-        state.blind_pair_circuits.len(),
-        1,
-        "the old slot is still live"
+    assert!(
+        closed_within(&mut wb, Duration::from_secs(2)).await,
+        "the old socket is closed by the new publish"
     );
-    assert!(frames_until_quiet(&mut wa, QUIET).await.is_empty());
-    drop(wb);
+    blind_held(&mut wb2, &state, &b, rand::random(), [0xB3; 32]).await;
     let st = state.clone();
     eventually("the old connection to go", move || {
         st.connections.len() == 2
@@ -823,11 +824,13 @@ async fn an_old_socket_closing_after_the_members_new_ask_ends_the_row() {
             UnifiedFrame::Control(ControlMessage::CircuitClosed { circuit_id, .. })
                 if *circuit_id == ca.circuit_id
         )),
-        "A told when B's old socket closed: {fa:?}"
+        "A told: {fa:?}"
     );
-    assert!(state.blind_pair_circuits.is_empty());
-    assert!(state.circuits.is_empty());
-    assert!(state.departed_blind.is_empty(), "nothing left in the index");
+    let st = state.clone();
+    eventually("the row and its index entry to go", move || {
+        st.blind_pair_circuits.is_empty() && st.circuits.is_empty() && st.departed_blind.is_empty()
+    })
+    .await;
 }
 
 /// Final review L1: a background drain (publish, read the queue, leave,
@@ -1092,16 +1095,19 @@ async fn a_packet_for_a_member_back_on_a_new_connection_ends_the_blinded_row() {
     // closes, and the old one's close-time teardown misses the token's
     // lock, so the row is still there when A's packet comes (final review
     // L1: only a connection that has asked counts as B being back).
+    // Task 8 A: B's publish closes its old (asked) socket at once. Its
+    // close-time teardown leaves the row while B's new connection has not
+    // asked; the index entry R21 would end it with at the first ask is
+    // removed here to model a teardown that missed.
+    let _old = wb;
     let mut wb2 = authed(addr, &b).await;
-    blind_held(&mut wb2, &state, &b, rand::random(), [0xB3; 32]).await;
-    let held = super::pair_lock::BLIND_LOCKS.lock(blind_tag(&token)).await;
-    drop(wb);
     let st = state.clone();
     eventually("the old connection to go", move || {
         st.connections.len() == 2
     })
     .await;
-    drop(held);
+    state.departed_blind.remove(&id_tag(&b.bytes));
+    blind_held(&mut wb2, &state, &b, rand::random(), [0xB3; 32]).await;
     assert_eq!(state.blind_pair_circuits.len(), 1, "the teardown missed");
     wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 64]))
         .await
@@ -1392,11 +1398,13 @@ async fn a_replay_from_another_connection_moves_the_charge() {
     let token = rand::random();
     let tag = blind_tag(&token);
     let mut wa1 = authed(addr, &a).await;
-    blind_held(&mut wa1, &state, &a, token, [1; 32]).await;
     let c1 = mapped_client(&state, &a).unwrap();
+    // Published before the first connection asks: a publish closes only
+    // connections that have asked (Task 8 A), so both stay open.
     let mut wa2 = authed(addr, &a).await;
     let c2 = mapped_client(&state, &a).unwrap();
     assert_ne!(c1, c2);
+    blind_held(&mut wa1, &state, &a, token, [1; 32]).await;
     let charged = |c: ClientId| {
         state.connections.get(&c).is_some_and(|conn| {
             conn.pending_charges

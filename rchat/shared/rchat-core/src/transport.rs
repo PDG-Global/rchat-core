@@ -12,6 +12,7 @@ use crate::tls_boring::{
 use crate::tls_resumption::ResumptionStore;
 use crate::{protocol::*, RChatError};
 use futures::{SinkExt, StreamExt};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -37,12 +38,154 @@ fn inbound_ws_config() -> WebSocketConfig {
     }
 }
 
+/// Longest one TCP connect to one address may take. A healthy connect takes
+/// well under a second; a SYN that goes nowhere is better abandoned (and the
+/// next address, or a fresh attempt a moment later, tried) than waited out for
+/// the whole `connection_timeout_secs`.
+pub(crate) const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest the DNS lookup may take, for the same reason: a healthy answer
+/// takes well under a second.
+pub(crate) const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve with a time limit. The messages never carry the host or an
+/// address (they reach the log).
+async fn resolve_within<I, Fut>(lookup: Fut, limit: Duration) -> Result<Vec<SocketAddr>, RChatError>
+where
+    I: Iterator<Item = SocketAddr>,
+    Fut: std::future::Future<Output = std::io::Result<I>>,
+{
+    let addrs = timeout(limit, lookup)
+        .await
+        .map_err(|_| RChatError::ConnectionFailed {
+            message: "DNS lookup timeout".to_string(),
+        })?
+        .map_err(|e| RChatError::ConnectionFailed {
+            message: format!("DNS lookup failed: {}", e),
+        })?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(RChatError::ConnectionFailed {
+            message: "No addresses resolved".to_string(),
+        });
+    }
+    Ok(addrs)
+}
+
+/// Addresses tried per connect attempt, in resolver order.
+pub(crate) const MAX_CONNECT_ADDRS: usize = 4;
+
+/// Try each address in order (at most [`MAX_CONNECT_ADDRS`]), each for at
+/// most `per_try`; the first that connects wins. When all fail, the last
+/// error is returned.
+async fn connect_first<T, F, Fut>(
+    addrs: &[SocketAddr],
+    per_try: Duration,
+    mut connect: F,
+) -> Result<T, RChatError>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut last = RChatError::ConnectionFailed {
+        message: "No addresses resolved".to_string(),
+    };
+    // At most MAX_CONNECT_ADDRS: a DNS answer with many unreachable
+    // addresses must not hold one attempt for minutes.
+    for addr in addrs.iter().take(MAX_CONNECT_ADDRS) {
+        last = match timeout(per_try, connect(*addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => RChatError::ConnectionFailed {
+                message: format!("TCP connection failed: {}", e),
+            },
+            Err(_) => RChatError::ConnectionFailed {
+                message: "TCP connection timeout".to_string(),
+            },
+        };
+    }
+    Err(last)
+}
+
 /// Unified stream type for WebSocket connections.
 /// Wraps either a plain TCP stream or a BoringSSL TLS stream, and notes
 /// when the socket last delivered any bytes (`last_read`).
 pub struct TransportStream {
     kind: StreamKind,
     last_read: ReadClock,
+    /// When the socket last took bytes from a write.
+    last_write: ReadClock,
+    /// Set by `ResetOnClose::arm`: closing resets the connection.
+    reset_on_close: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A socket's write progress in bytes: the socket took bytes from a write,
+/// or its kernel send queue (unsent and unacknowledged) shrank. A slow but
+/// moving connection keeps making progress even when one message takes
+/// seconds, or when `TCP_NOTSENT_LOWAT` holds writes back while it drains.
+pub(crate) struct SendProgress {
+    wrote: ReadClock,
+    fd: std::os::fd::RawFd,
+    queued: Option<u64>,
+    drained_at: Instant,
+}
+
+impl SendProgress {
+    /// How long since the last progress (checks the kernel queue now).
+    pub(crate) fn idle_for(&mut self) -> Duration {
+        if let Some(q) = kernel_send_queued(self.fd) {
+            if self.queued.is_some_and(|before| q < before) {
+                self.drained_at = Instant::now();
+            }
+            self.queued = Some(q);
+        }
+        self.wrote.last().max(self.drained_at).elapsed()
+    }
+}
+
+/// Bytes in a TCP socket's send queue (unsent and unacknowledged): Linux
+/// and Android `TIOCOUTQ`, Apple `SO_NWRITE`; `None` elsewhere or on error.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kernel_send_queued(fd: std::os::fd::RawFd) -> Option<u64> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: an fd the caller keeps open, and an int for the result.
+    let r = unsafe { libc::ioctl(fd, libc::TIOCOUTQ as _, &mut n) };
+    (r == 0).then(|| u64::try_from(n).unwrap_or(0))
+}
+
+#[cfg(target_vendor = "apple")]
+fn kernel_send_queued(fd: std::os::fd::RawFd) -> Option<u64> {
+    const SO_NWRITE: libc::c_int = 0x1024;
+    let mut n: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: an fd the caller keeps open, and an int-sized buffer.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_NWRITE,
+            &mut n as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (r == 0).then(|| u64::try_from(n).unwrap_or(0))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn kernel_send_queued(_fd: std::os::fd::RawFd) -> Option<u64> {
+    None
+}
+
+/// Makes a stream's close a reset (`SO_LINGER` on with a zero timeout):
+/// whatever the kernel still holds unsent is discarded at once instead of
+/// draining after the close. For call connections being abandoned, so
+/// stale video stops sharing the link with the audio.
+#[derive(Clone)]
+pub(crate) struct ResetOnClose(Arc<std::sync::atomic::AtomicBool>);
+
+impl ResetOnClose {
+    pub(crate) fn arm(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 enum StreamKind {
@@ -50,7 +193,8 @@ enum StreamKind {
     Tls(BoringTlsStream),
 }
 
-/// When a connection's socket last delivered bytes. Liveness is bytes
+/// When a connection's socket last delivered bytes (or, as a write clock,
+/// last took bytes). Liveness is bytes
 /// arriving, not messages completing: a large message coming in slowly
 /// (a photo or voice note over a thin link, with the relay's pings queued
 /// behind it) completes nothing for a long time on a healthy connection
@@ -58,10 +202,11 @@ enum StreamKind {
 ///
 /// Known limit (security review L-3): over TLS, bytes reach this stream
 /// only a whole TLS record at a time (up to 16 KiB of plaintext), so the
-/// clock moves once per record. A healthy connection slower than one
-/// record per dead threshold (16 KiB / 30 s, about 546 B/s with the app's
-/// 10 s keepalive timeout) can still be declared dead in the middle of a
-/// large frame (spec §18.11 limit 12).
+/// clock moves once per record. A healthy connection that delivers no
+/// record for 30 s after a ping went out (with the app's 10 s keepalive
+/// timeout; between 30 s and about 68 s between records, depending on when
+/// the ping falls) can still be declared dead in the middle of a large
+/// frame (spec §18.11 limit 12).
 #[derive(Clone)]
 pub(crate) struct ReadClock(Arc<parking_lot::Mutex<Instant>>);
 
@@ -84,6 +229,8 @@ impl TransportStream {
         Self {
             kind: StreamKind::Plain(stream),
             last_read: ReadClock::new(),
+            last_write: ReadClock::new(),
+            reset_on_close: Arc::default(),
         }
     }
 
@@ -91,12 +238,51 @@ impl TransportStream {
         Self {
             kind: StreamKind::Tls(stream),
             last_read: ReadClock::new(),
+            last_write: ReadClock::new(),
+            reset_on_close: Arc::default(),
+        }
+    }
+
+    /// Watches this socket's write progress (`SendProgress`). Use it only
+    /// while the stream lives: it keeps the socket's fd, not the socket.
+    pub(crate) fn send_progress(&self) -> SendProgress {
+        use std::os::fd::AsRawFd;
+        SendProgress {
+            wrote: self.last_write.clone(),
+            fd: self.tcp().as_raw_fd(),
+            queued: None,
+            drained_at: Instant::now(),
+        }
+    }
+
+    /// A handle that, once armed, makes this stream's close a reset.
+    pub(crate) fn reset_on_close(&self) -> ResetOnClose {
+        ResetOnClose(self.reset_on_close.clone())
+    }
+
+    fn tcp(&self) -> &TcpStream {
+        match &self.kind {
+            StreamKind::Plain(s) => s,
+            StreamKind::Tls(s) => s.tcp(),
         }
     }
 
     /// When this socket last delivered bytes.
     pub(crate) fn read_clock(&self) -> ReadClock {
         self.last_read.clone()
+    }
+}
+
+impl Drop for TransportStream {
+    fn drop(&mut self) {
+        if self
+            .reset_on_close
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Err(e) = socket2::SockRef::from(self.tcp()).set_linger(Some(Duration::ZERO)) {
+                log::debug!("SO_LINGER for a reset failed: {e}");
+            }
+        }
     }
 }
 
@@ -125,10 +311,15 @@ impl AsyncWrite for TransportStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.kind {
+        let this = &mut *self;
+        let polled = match this.kind {
             StreamKind::Plain(ref mut s) => Pin::new(s).poll_write(cx, buf),
             StreamKind::Tls(ref mut s) => Pin::new(s).poll_write(cx, buf),
+        };
+        if matches!(polled, Poll::Ready(Ok(n)) if n > 0) {
+            this.last_write.touch();
         }
+        polled
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -176,6 +367,10 @@ pub struct TransportConfig {
     /// `wss://` only: TLS 1.3 tickets for the pinned relay (spec §D.1),
     /// owned by the client. None: every handshake is a full one.
     pub resumption: Option<ResumptionStore>,
+    /// The client's live keepalive interval: when set it overrides
+    /// `keepalive_interval_secs` and may change while connected (Android
+    /// background receiving, `KeepaliveInterval`).
+    pub keepalive_live: Option<KeepaliveInterval>,
 }
 
 impl Default for TransportConfig {
@@ -193,7 +388,50 @@ impl Default for TransportConfig {
             reconnect_max_attempts_after_connect: 0,
             dev_origin: None,
             resumption: None,
+            keepalive_live: None,
         }
+    }
+}
+
+/// A client's keepalive interval, shared with each of its connections and
+/// changeable while they run (Android background receiving): a change
+/// reschedules the next ping at once. Never below 1 s.
+#[derive(Debug, Clone)]
+pub struct KeepaliveInterval(Arc<tokio::sync::watch::Sender<u64>>);
+
+impl KeepaliveInterval {
+    pub fn new(secs: u64) -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(secs.max(1)).0))
+    }
+
+    /// Sets the interval; running connections pick it up before their next ping.
+    pub fn set(&self, secs: u64) {
+        let secs = secs.max(1);
+        self.0.send_if_modified(|v| {
+            if *v == secs {
+                false
+            } else {
+                *v = secs;
+                true
+            }
+        });
+    }
+
+    pub fn get(&self) -> u64 {
+        *self.0.borrow()
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+}
+
+/// The next change of a connection's live interval: false when the client
+/// dropped it; never resolves when there is none.
+async fn interval_changed(rx: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
+    match rx {
+        Some(rx) => rx.changed().await.is_ok(),
+        None => std::future::pending().await,
     }
 }
 
@@ -278,6 +516,165 @@ pub(crate) fn plain_channel_binding(
     crate::keyauth::dev_origin_binding(&origin).map_err(|e| RChatError::ConnectionFailed {
         message: format!("invalid relay origin: {e}"),
     })
+}
+
+/// Unsent bytes a call connection's kernel may hold before the socket
+/// stops taking writes (`TCP_NOTSENT_LOWAT`, see `open_websocket`).
+const CALL_NOTSENT_LOWAT: usize = 16 * 1024;
+/// Send buffer of a call connection on Apple systems, bytes: their kernel
+/// honours `TCP_NOTSENT_LOWAT` only when reporting the socket writable, and
+/// a write still takes up to the whole send buffer, so a bound is kept.
+#[cfg(target_vendor = "apple")]
+const CALL_SEND_BUFFER: usize = 32 * 1024;
+
+/// `TCP_NOTSENT_LOWAT` on a socket (Linux and Android 25, Apple 0x201).
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn set_notsent_lowat(tcp: &TcpStream, bytes: usize) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_vendor = "apple")]
+    const TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
+    #[cfg(not(target_vendor = "apple"))]
+    const TCP_NOTSENT_LOWAT: libc::c_int = libc::TCP_NOTSENT_LOWAT;
+    let v = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    // SAFETY: a live socket fd owned by `tcp`, and a pointer to a c_int of
+    // the size passed.
+    let r = unsafe {
+        libc::setsockopt(
+            tcp.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_NOTSENT_LOWAT,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn set_notsent_lowat(_tcp: &TcpStream, _bytes: usize) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+/// One WebSocket to `cfg.server_url`: DNS, TCP (keepalive 60 s / 10 s),
+/// BoringSSL TLS 1.3 (with the ticket store) or the dev `ws://` path, and
+/// the upgrade; returns it with its channel binding. `low_latency` turns on
+/// `TCP_NODELAY` (call connections: 20 ms frames must not wait for Nagle).
+pub(crate) async fn open_websocket(
+    cfg: &TransportConfig,
+    low_latency: bool,
+) -> Result<(WebSocketStream<TransportStream>, [u8; 32]), RChatError> {
+    let url = &cfg.server_url;
+
+    // Parse URI to extract host and port for manual TCP connection
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        url.parse().map_err(|e| RChatError::ConnectionFailed {
+            message: format!("Invalid server URL: {}", e),
+        })?;
+
+    let host = uri.host().ok_or_else(|| RChatError::ConnectionFailed {
+        message: "Server URL has no host".to_string(),
+    })?;
+    let is_wss = url.starts_with("wss://");
+    if !is_wss && !plain_ws_allowed(host, !cfg!(debug_assertions)) {
+        return Err(RChatError::ConnectionFailed {
+            message: "ws:// is only allowed to a loopback relay; use wss://".to_string(),
+        });
+    }
+    let port = uri.port_u16().unwrap_or(if is_wss { 443 } else { 80 });
+
+    // DNS lookup, then TCP connect to each address in resolver order.
+    let limit = Duration::from_secs(cfg.connection_timeout_secs);
+    let addrs = resolve_within(
+        tokio::net::lookup_host(format!("{}:{}", host, port)),
+        DNS_TIMEOUT.min(limit),
+    )
+    .await?;
+    let tcp_stream = connect_first(&addrs, TCP_CONNECT_TIMEOUT.min(limit), |addr| {
+        TcpStream::connect(addr)
+    })
+    .await?;
+
+    // Configure TCP keepalive for fast dead connection detection
+    // Initial: 60s, Interval: 10s (matches RVPN settings)
+    let tcp_stream = WebSocketClient::configure_tcp_keepalive(tcp_stream)
+        .await
+        .map_err(|e| RChatError::ConnectionFailed {
+            message: format!("TCP keepalive configuration failed: {}", e),
+        })?;
+    if low_latency {
+        tcp_stream
+            .set_nodelay(true)
+            .map_err(|e| RChatError::ConnectionFailed {
+                message: format!("TCP_NODELAY failed: {e}"),
+            })?;
+        // Little unsent data in the kernel: with video on the same link, a
+        // deep send buffer (auto-tuned to megabytes) holds seconds of stale
+        // video that keep competing with the audio after the app has
+        // dropped or paused it, and hides congestion from the adapter. The
+        // low-water mark bounds only what is not yet sent, not what is in
+        // flight, so a long fat path still fills. Best effort.
+        if let Err(e) = set_notsent_lowat(&tcp_stream, CALL_NOTSENT_LOWAT) {
+            log::debug!("TCP_NOTSENT_LOWAT on a call connection failed: {e}");
+        }
+        #[cfg(target_vendor = "apple")]
+        if let Err(e) = socket2::SockRef::from(&tcp_stream).set_send_buffer_size(CALL_SEND_BUFFER) {
+            log::debug!("send buffer on a call connection failed: {e}");
+        }
+    }
+
+    // Establish TLS if needed, then perform WebSocket handshake
+    let (stream, binding) = if is_wss {
+        // BoringSSL; with a store, a ticket for the pinned relay is
+        // offered and fresh ones kept (a refused ticket: full handshake).
+        let fingerprint = cfg.tls_fingerprint;
+        let handshake = async {
+            match &cfg.resumption {
+                Some(store) => connect_resumable(tcp_stream, host, port, fingerprint, store).await,
+                None => connect_with_fingerprint(tcp_stream, host, fingerprint, None).await,
+            }
+        };
+        let tls_stream = timeout(Duration::from_secs(cfg.connection_timeout_secs), handshake)
+            .await
+            .map_err(|_| RChatError::ConnectionFailed {
+                message: "TLS handshake timeout".to_string(),
+            })?
+            .map_err(|e| RChatError::ConnectionFailed {
+                message: format!("TLS handshake failed: {}", e),
+            })?;
+        let binding =
+            tls_stream
+                .export_channel_binding()
+                .map_err(|e| RChatError::ConnectionFailed {
+                    message: format!("TLS exporter unavailable: {}", e),
+                })?;
+        (TransportStream::tls(tls_stream), binding)
+    } else {
+        let binding = plain_channel_binding(url, cfg.dev_origin.as_deref())?;
+        (TransportStream::plain(tcp_stream), binding)
+    };
+
+    // WebSocket handshake over the established stream.
+    // Pass the URL string so tokio-tungstenite builds the request with
+    // all required headers (Sec-WebSocket-Key, Upgrade, Connection, etc.).
+    let result = timeout(
+        Duration::from_secs(cfg.connection_timeout_secs),
+        tokio_tungstenite::client_async_with_config(url, stream, Some(inbound_ws_config())),
+    )
+    .await;
+
+    match result {
+        Ok(Ok((ws_stream, _))) => Ok((ws_stream, binding)),
+        Ok(Err(e)) => Err(RChatError::ConnectionFailed {
+            message: format!("WebSocket error: {}", e),
+        }),
+        Err(_) => Err(RChatError::ConnectionFailed {
+            message: "WebSocket handshake timeout".to_string(),
+        }),
+    }
 }
 
 impl WebSocketClient {
@@ -558,111 +955,7 @@ impl WebSocketClient {
     async fn try_connect(
         &self,
     ) -> Result<(WebSocketStream<TransportStream>, [u8; 32]), RChatError> {
-        let url = &self.config.server_url;
-
-        // Parse URI to extract host and port for manual TCP connection
-        let uri: tokio_tungstenite::tungstenite::http::Uri =
-            url.parse().map_err(|e| RChatError::ConnectionFailed {
-                message: format!("Invalid server URL: {}", e),
-            })?;
-
-        let host = uri.host().ok_or_else(|| RChatError::ConnectionFailed {
-            message: "Server URL has no host".to_string(),
-        })?;
-        let is_wss = url.starts_with("wss://");
-        if !is_wss && !plain_ws_allowed(host, !cfg!(debug_assertions)) {
-            return Err(RChatError::ConnectionFailed {
-                message: "ws:// is only allowed to a loopback relay; use wss://".to_string(),
-            });
-        }
-        let port = uri.port_u16().unwrap_or(if is_wss { 443 } else { 80 });
-
-        // DNS lookup
-        let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
-            .await
-            .map_err(|e| RChatError::ConnectionFailed {
-                message: format!("DNS lookup failed: {}", e),
-            })?
-            .next()
-            .ok_or_else(|| RChatError::ConnectionFailed {
-                message: "No addresses resolved".to_string(),
-            })?;
-
-        // TCP connect with timeout
-        let tcp_stream = timeout(
-            Duration::from_secs(self.config.connection_timeout_secs),
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| RChatError::ConnectionFailed {
-            message: "TCP connection timeout".to_string(),
-        })?
-        .map_err(|e| RChatError::ConnectionFailed {
-            message: format!("TCP connection failed: {}", e),
-        })?;
-
-        // Configure TCP keepalive for fast dead connection detection
-        // Initial: 60s, Interval: 10s (matches RVPN settings)
-        let tcp_stream = Self::configure_tcp_keepalive(tcp_stream)
-            .await
-            .map_err(|e| RChatError::ConnectionFailed {
-                message: format!("TCP keepalive configuration failed: {}", e),
-            })?;
-
-        // Establish TLS if needed, then perform WebSocket handshake
-        let (stream, binding) = if is_wss {
-            // BoringSSL; with a store, a ticket for the pinned relay is
-            // offered and fresh ones kept (a refused ticket: full handshake).
-            let fingerprint = self.config.tls_fingerprint;
-            let handshake = async {
-                match &self.config.resumption {
-                    Some(store) => {
-                        connect_resumable(tcp_stream, host, port, fingerprint, store).await
-                    }
-                    None => connect_with_fingerprint(tcp_stream, host, fingerprint, None).await,
-                }
-            };
-            let tls_stream = timeout(
-                Duration::from_secs(self.config.connection_timeout_secs),
-                handshake,
-            )
-            .await
-            .map_err(|_| RChatError::ConnectionFailed {
-                message: "TLS handshake timeout".to_string(),
-            })?
-            .map_err(|e| RChatError::ConnectionFailed {
-                message: format!("TLS handshake failed: {}", e),
-            })?;
-            let binding =
-                tls_stream
-                    .export_channel_binding()
-                    .map_err(|e| RChatError::ConnectionFailed {
-                        message: format!("TLS exporter unavailable: {}", e),
-                    })?;
-            (TransportStream::tls(tls_stream), binding)
-        } else {
-            let binding = plain_channel_binding(url, self.config.dev_origin.as_deref())?;
-            (TransportStream::plain(tcp_stream), binding)
-        };
-
-        // WebSocket handshake over the established stream.
-        // Pass the URL string so tokio-tungstenite builds the request with
-        // all required headers (Sec-WebSocket-Key, Upgrade, Connection, etc.).
-        let result = timeout(
-            Duration::from_secs(self.config.connection_timeout_secs),
-            tokio_tungstenite::client_async_with_config(url, stream, Some(inbound_ws_config())),
-        )
-        .await;
-
-        match result {
-            Ok(Ok((ws_stream, _))) => Ok((ws_stream, binding)),
-            Ok(Err(e)) => Err(RChatError::ConnectionFailed {
-                message: format!("WebSocket error: {}", e),
-            }),
-            Err(_) => Err(RChatError::ConnectionFailed {
-                message: "WebSocket handshake timeout".to_string(),
-            }),
-        }
+        open_websocket(&self.config, false).await
     }
 
     /// Configure TCP keepalive on the underlying socket.
@@ -705,7 +998,15 @@ impl WebSocketClient {
         let disconnect_callback = self.disconnect_callback.clone();
         let channel_binding = self.channel_binding.clone();
         let event_sink = self.event_sink.lock().clone();
-        let keepalive_interval_secs = self.config.keepalive_interval_secs;
+        let mut interval_rx = self
+            .config
+            .keepalive_live
+            .as_ref()
+            .map(KeepaliveInterval::subscribe);
+        let mut keepalive_interval_secs = interval_rx
+            .as_mut()
+            .map(|rx| *rx.borrow_and_update())
+            .unwrap_or(self.config.keepalive_interval_secs);
         let keepalive_timeout_secs = self.config.keepalive_timeout_secs;
 
         // Create channels for outgoing messages
@@ -725,7 +1026,9 @@ impl WebSocketClient {
             let (mut ws_tx, mut ws_rx) = ws_stream.split();
             let mut next_keepalive =
                 Instant::now() + keepalive_wait(keepalive_interval_secs, rand::random::<f64>());
-            let mut _last_ping_sent: Option<Instant> = None;
+            // The oldest ping with nothing read since it went out.
+            let mut last_ping_sent: Option<Instant> = None;
+            let dead_after = Duration::from_secs(keepalive_timeout_secs.saturating_mul(3));
 
             loop {
                 tokio::select! {
@@ -756,7 +1059,7 @@ impl WebSocketClient {
                         match msg {
                             Some(Ok(Message::Binary(data))) => {
                                 *last_received.write().await = Instant::now();
-                                _last_ping_sent = None;
+                                last_ping_sent = None;
 
                                 log::trace!("[RUST] Received binary data: {} bytes", data.len());
 
@@ -804,7 +1107,7 @@ impl WebSocketClient {
                             }
                             Some(Ok(Message::Text(text))) => {
                                 *last_received.write().await = Instant::now();
-                                _last_ping_sent = None;
+                                last_ping_sent = None;
 
                                 // Handle text frames (signaling messages)
                                 // Text frames are JSON-encoded signaling messages
@@ -824,7 +1127,7 @@ impl WebSocketClient {
                             }
                             Some(Ok(Message::Pong(_))) => {
                                 *last_received.write().await = Instant::now();
-                                _last_ping_sent = None;
+                                last_ping_sent = None;
                             }
                             Some(Ok(Message::Close(_))) => {
                                 log::debug!("WebSocket closed by server");
@@ -844,6 +1147,43 @@ impl WebSocketClient {
                         }
                     }
 
+                    // Dead: a ping has gone unanswered for `dead_after`. Armed
+                    // only while one is outstanding, so it cannot spin; it
+                    // does not move the ping schedule.
+                    _ = tokio::time::sleep_until(last_ping_sent.unwrap_or_else(Instant::now) + dead_after),
+                        if last_ping_sent.is_some() =>
+                    {
+                        if let Some(sent) = last_ping_sent {
+                            let last = (*last_received.read().await).max(read_clock.last());
+                            if last < sent {
+                                log::debug!("Connection appears dead - ping unanswered for {:?}", sent.elapsed());
+                                break;
+                            }
+                            // Bytes arrived since: the ping was answered.
+                            last_ping_sent = None;
+                        }
+                    }
+
+                    // The interval changed (the app went to, or came back
+                    // from, the background): the next ping follows it.
+                    alive = interval_changed(&mut interval_rx) => {
+                        if !alive {
+                            interval_rx = None;
+                        } else if let Some(rx) = interval_rx.as_mut() {
+                            let previous = keepalive_interval_secs;
+                            keepalive_interval_secs = *rx.borrow_and_update();
+                            next_keepalive = if keepalive_interval_secs < previous {
+                                // Back from the background: probe now, so a
+                                // connection that died while the interval was
+                                // long is found within `dead_after`.
+                                Instant::now()
+                            } else {
+                                Instant::now()
+                                    + keepalive_wait(keepalive_interval_secs, rand::random::<f64>())
+                            };
+                        }
+                    }
+
                     // Send keepalive pings
                     _ = tokio::time::sleep_until(next_keepalive) => {
                         next_keepalive = Instant::now()
@@ -852,10 +1192,17 @@ impl WebSocketClient {
                         // last bytes read: a slow large message is alive.
                         let last = (*last_received.read().await).max(read_clock.last());
 
-                        // Check if connection appears dead
-                        if last.elapsed() > Duration::from_secs(keepalive_timeout_secs * 3) {
-                            log::debug!("Connection appears dead - no data for {:?}", last.elapsed());
-                            break;
+                        // Dead only when a ping went unanswered: nothing read
+                        // for `keepalive_timeout_secs * 3` since it was sent.
+                        // Measured from the last data instead, a quiet but
+                        // healthy connection was dropped whenever the jittered
+                        // wait (up to interval + 8 s) ran past that limit.
+                        let unanswered = last_ping_sent.filter(|sent| last < *sent);
+                        if let Some(sent) = unanswered {
+                            if sent.elapsed() >= dead_after {
+                                log::debug!("Connection appears dead - ping unanswered for {:?}", sent.elapsed());
+                                break;
+                            }
                         }
 
                         // Send ping
@@ -871,7 +1218,9 @@ impl WebSocketClient {
                             break;
                         }
 
-                        _last_ping_sent = Some(Instant::now());
+                        if unanswered.is_none() {
+                            last_ping_sent = Some(Instant::now());
+                        }
                     }
                 }
             }
@@ -1074,7 +1423,13 @@ impl WebSocketClient {
     /// Check if connection is healthy (received data recently)
     pub async fn is_healthy(&self) -> bool {
         let last = *self.last_received.read().await;
-        let timeout = Duration::from_secs(self.config.keepalive_interval_secs * 2);
+        // The live interval (it stretches in the background), not the configured one.
+        let interval = self
+            .config
+            .keepalive_live
+            .as_ref()
+            .map_or(self.config.keepalive_interval_secs, KeepaliveInterval::get);
+        let timeout = Duration::from_secs(interval.saturating_mul(2));
         last.elapsed() < timeout
     }
 }
@@ -1397,6 +1752,42 @@ mod tests {
         relay.abort();
     }
 
+    /// An armed `ResetOnClose` makes the close a reset (the peer reads an
+    /// error, and unsent data is discarded); unarmed, a normal close (the
+    /// peer reads the data, then the end).
+    #[tokio::test]
+    async fn an_armed_stream_closes_with_a_reset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for armed in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            let mut stream = TransportStream::plain(client.unwrap());
+            let mut server = server.unwrap().0;
+            stream.write_all(&[7; 1000]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if armed {
+                stream.reset_on_close().arm();
+            }
+            drop(stream);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut buf = vec![0u8; 4096];
+            let mut got = 0;
+            let ended = loop {
+                match server.read(&mut buf).await {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => got += n,
+                    Err(e) => break Err(e.kind()),
+                }
+            };
+            if armed {
+                assert_eq!(ended, Err(std::io::ErrorKind::ConnectionReset));
+            } else {
+                assert_eq!((ended, got), (Ok(()), 1000));
+            }
+        }
+    }
+
     /// TG-3: a read that delivers no bytes - nothing available yet
     /// (Pending) or end of stream (Ready with nothing filled) - leaves the
     /// clock where it was; a read that delivers bytes moves it.
@@ -1435,6 +1826,53 @@ mod tests {
         assert_eq!(clock.last(), moved, "EOF must not count as liveness");
     }
 
+    /// A quiet relay that answers every ping (as the real one does) keeps
+    /// the connection, however long the jittered wait runs past the dead
+    /// limit: here every wait (5-9 s) is over it (3 s).
+    #[tokio::test]
+    async fn answered_pings_keep_a_quiet_connection() {
+        let (url, relay) = local_relay(|mut ws| async move {
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Binary(data) = msg {
+                    if let Some(Frame::Keepalive(KeepaliveMessage::Ping { timestamp })) =
+                        Frame::decode(&data)
+                    {
+                        let pong = KeepaliveMessage::Pong {
+                            ping_timestamp: timestamp,
+                            timestamp,
+                        };
+                        if ws
+                            .send(Message::Binary(pong.encode_with_frame_type()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        let client = WebSocketClient::new(TransportConfig {
+            server_url: url,
+            auto_reconnect: false,
+            reconnect_max_attempts: 1,
+            keepalive_interval_secs: 1,
+            keepalive_timeout_secs: 1,
+            ..TransportConfig::default()
+        });
+        let (tx, mut rx) = mpsc::channel::<TransportEvent>(8);
+        client.set_event_sink(tx);
+        client.connect().await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(25), rx.recv()).await;
+        assert!(
+            event.is_err(),
+            "a connection whose pings are answered was dropped: {event:?}"
+        );
+        client.disconnect().await;
+        relay.abort();
+    }
+
     /// The other half: a relay that stops sending bytes mid-message (socket
     /// open, nothing arriving) is still declared dead.
     #[tokio::test]
@@ -1467,6 +1905,259 @@ mod tests {
         );
         client.disconnect().await;
         relay.abort();
+    }
+
+    /// DNS that never answers is abandoned at the limit, with a message
+    /// that names no host.
+    #[tokio::test(start_paused = true)]
+    async fn dns_lookup_that_never_answers_times_out() {
+        let started = Instant::now();
+        let r = resolve_within(
+            std::future::pending::<std::io::Result<std::vec::IntoIter<SocketAddr>>>(),
+            DNS_TIMEOUT,
+        )
+        .await;
+        assert_eq!(started.elapsed(), DNS_TIMEOUT);
+        match r {
+            Err(RChatError::ConnectionFailed { message }) => {
+                assert_eq!(message, "DNS lookup timeout")
+            }
+            other => panic!("{other:?}"),
+        }
+        let ok = resolve_within(
+            async { Ok(vec!["127.0.0.1:1".parse().unwrap()].into_iter()) },
+            DNS_TIMEOUT,
+        )
+        .await;
+        assert_eq!(ok.unwrap().len(), 1);
+    }
+
+    /// A hanging first address costs `per_try`, not the whole connection
+    /// timeout, and the next address is tried.
+    #[tokio::test(start_paused = true)]
+    async fn connect_tries_the_next_address_when_one_hangs() {
+        let first: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let second: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let started = Instant::now();
+        let got = connect_first(&[first, second], TCP_CONNECT_TIMEOUT, |addr| async move {
+            if addr == first {
+                std::future::pending::<()>().await;
+            }
+            Ok(addr)
+        })
+        .await;
+        assert_eq!(got.unwrap(), second);
+        assert_eq!(started.elapsed(), TCP_CONNECT_TIMEOUT);
+    }
+
+    /// When every address fails, the last error is the one returned, in the
+    /// same words as before.
+    #[tokio::test(start_paused = true)]
+    async fn connect_keeps_the_last_error_when_all_fail() {
+        let addrs: Vec<SocketAddr> = vec![
+            "192.0.2.1:1".parse().unwrap(),
+            "192.0.2.2:1".parse().unwrap(),
+        ];
+        let msg = |r: Result<(), RChatError>| match r {
+            Err(RChatError::ConnectionFailed { message }) => message,
+            other => panic!("{other:?}"),
+        };
+        // Refused, then timed out: the timeout is last.
+        let r = connect_first(&addrs, TCP_CONNECT_TIMEOUT, |addr| async move {
+            if addr == addrs_first() {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            std::future::pending().await
+        })
+        .await;
+        assert_eq!(msg(r), "TCP connection timeout");
+        // Timed out, then refused: the refusal is last.
+        let r = connect_first(&addrs, TCP_CONNECT_TIMEOUT, |addr| async move {
+            if addr != addrs_first() {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            std::future::pending().await
+        })
+        .await;
+        assert!(msg(r).starts_with("TCP connection failed: "));
+        // Nothing to try.
+        let r = connect_first::<(), _, _>(&[], TCP_CONNECT_TIMEOUT, |_| async { Ok(()) }).await;
+        assert_eq!(msg(r), "No addresses resolved");
+    }
+
+    fn addrs_first() -> SocketAddr {
+        "192.0.2.1:1".parse().unwrap()
+    }
+
+    /// A relay that reads everything and never answers. Reports when each
+    /// ping reached it (std clock, so it is independent of the client's).
+    async fn silent_relay(
+        pings: mpsc::UnboundedSender<std::time::Instant>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        local_relay(|mut ws| async move {
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Binary(data) = msg {
+                    if let Some(Frame::Keepalive(KeepaliveMessage::Ping { .. })) =
+                        Frame::decode(&data)
+                    {
+                        let _ = pings.send(std::time::Instant::now());
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// A silent relay is noticed `keepalive_timeout_secs * 3` after the
+    /// ping, not at the next tick (5-9 s later, with an interval of 1).
+    #[tokio::test]
+    async fn silent_relay_is_declared_dead_soon_after_the_ping() {
+        let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        let (url, relay) = silent_relay(ping_tx).await;
+        let client = WebSocketClient::new(TransportConfig {
+            server_url: url,
+            auto_reconnect: false,
+            reconnect_max_attempts: 1,
+            keepalive_interval_secs: 1,
+            keepalive_timeout_secs: 1,
+            ..TransportConfig::default()
+        });
+        let (tx, mut rx) = mpsc::channel::<TransportEvent>(8);
+        client.set_event_sink(tx);
+        client.connect().await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+        let seen = std::time::Instant::now();
+        assert!(
+            matches!(event, Ok(Some(TransportEvent::Disconnected))),
+            "{event:?}"
+        );
+        let first_ping = ping_rx.recv().await.expect("the relay saw a ping");
+        let gap = seen.duration_since(first_ping);
+        assert!(
+            gap >= Duration::from_millis(2500) && gap < Duration::from_millis(4500),
+            "dead {gap:?} after the ping; want about 3 s (the old rule needed 5-9 s)"
+        );
+        client.disconnect().await;
+        relay.abort();
+    }
+
+    /// The deadline is measured from the oldest unanswered ping: further
+    /// pings sent while the relay stays silent do not push it out.
+    #[tokio::test]
+    async fn oldest_unanswered_ping_is_the_one_timed() {
+        let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        let (url, relay) = silent_relay(ping_tx).await;
+        let client = WebSocketClient::new(TransportConfig {
+            server_url: url,
+            auto_reconnect: false,
+            reconnect_max_attempts: 1,
+            keepalive_interval_secs: 1, // a tick every 5-9 s
+            keepalive_timeout_secs: 4,  // dead 12 s after the first ping
+            ..TransportConfig::default()
+        });
+        let (tx, mut rx) = mpsc::channel::<TransportEvent>(8);
+        client.set_event_sink(tx);
+        client.connect().await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(40), rx.recv()).await;
+        let seen = std::time::Instant::now();
+        assert!(
+            matches!(event, Ok(Some(TransportEvent::Disconnected))),
+            "{event:?}"
+        );
+        let first_ping = ping_rx.recv().await.expect("the relay saw a ping");
+        let mut count = 1;
+        while ping_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert!(count >= 2, "a later tick sent another ping ({count})");
+        let gap = seen.duration_since(first_ping);
+        assert!(
+            gap >= Duration::from_millis(11900) && gap < Duration::from_millis(13500),
+            "dead {gap:?} after the first ping; want about 12 s"
+        );
+        client.disconnect().await;
+        relay.abort();
+    }
+
+    /// Android background receiving: the live interval floors at 1 s and
+    /// notifies only on a real change.
+    #[test]
+    fn keepalive_interval_floors_and_notifies_only_on_change() {
+        let k = KeepaliveInterval::new(0);
+        assert_eq!(k.get(), 1);
+        let mut rx = k.subscribe();
+        k.set(1);
+        assert!(!rx.has_changed().unwrap(), "same value: no change");
+        k.set(240);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), 240);
+        k.set(0);
+        assert_eq!(k.get(), 1);
+    }
+
+    /// A live change reschedules the next ping at once. Going to a shorter
+    /// interval (the app came back to the foreground) pings immediately, so
+    /// a connection that died while it slept is found by the dead-after-ping
+    /// rule instead of being trusted for another interval (final review
+    /// I-1); back at 240 s none follows.
+    #[tokio::test]
+    async fn a_live_interval_change_reschedules_the_next_ping() {
+        let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        let (url, relay) = silent_relay(ping_tx).await;
+        let live = KeepaliveInterval::new(240);
+        let client = WebSocketClient::new(TransportConfig {
+            server_url: url,
+            auto_reconnect: false,
+            reconnect_max_attempts: 1,
+            keepalive_timeout_secs: 60, // dead only 180 s after a ping: never in this test
+            keepalive_live: Some(live.clone()),
+            ..TransportConfig::default()
+        });
+        let (tx, _rx) = mpsc::channel::<TransportEvent>(8);
+        client.set_event_sink(tx);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(ping_rx.try_recv().is_err(), "no ping at a 240 s interval");
+        let changed = std::time::Instant::now();
+        live.set(1);
+        let first = tokio::time::timeout(Duration::from_secs(12), ping_rx.recv())
+            .await
+            .expect("a ping after the change")
+            .expect("the relay saw a ping");
+        let gap = first.duration_since(changed);
+        assert!(
+            gap < Duration::from_secs(2),
+            "first ping {gap:?} after the change; want at once"
+        );
+        live.set(240);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while ping_rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_secs(12), ping_rx.recv())
+                .await
+                .is_err(),
+            "no ping within 12 s once back at 240 s"
+        );
+        client.disconnect().await;
+        relay.abort();
+    }
+
+    /// Final review M-6: health is judged against the live interval.
+    #[tokio::test]
+    async fn is_healthy_uses_the_live_interval() {
+        let live = KeepaliveInterval::new(240);
+        let client = WebSocketClient::new(TransportConfig {
+            keepalive_interval_secs: 30,
+            keepalive_live: Some(live.clone()),
+            ..TransportConfig::default()
+        });
+        *client.last_received.write().await = Instant::now() - Duration::from_secs(100);
+        assert!(
+            client.is_healthy().await,
+            "100 s of silence is fine at 240 s"
+        );
+        live.set(30);
+        assert!(!client.is_healthy().await, "and not at 30 s");
     }
 
     #[test]

@@ -41,7 +41,10 @@ pub struct CardDk {
 /// A contact card, the same JSON the iOS app shows as a QR code: v1
 /// `{"n","ik","ak"}`, or v2 `{"v":2,"n","ik","ak","dk","dkh","dks"}`.
 /// `kem` (base64 of the 1184-byte ML-KEM-768 key, protocol v3 §A.6) is
-/// carried ahead of card v3 (Task 6): knocks need it (R1).
+/// carried ahead of card v3 (Task 6): knocks need it (R1). A v3 card
+/// (`{"v":3,...,"kem","bs"}`, what the apps show) also carries `bs`, base64 of
+/// the identity's 64-byte signature over `ik ‖ ak ‖ kem_pk`; a card with `bs`
+/// is written as v3, one without keeps the v1/v2 form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
     pub name: String,
@@ -49,6 +52,7 @@ pub struct Card {
     pub ak: String,
     pub dk: Option<CardDk>,
     pub kem: Option<String>,
+    pub bs: Option<String>,
 }
 
 /// The card's JSON, field for field.
@@ -67,6 +71,8 @@ struct CardJson {
     dks: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bs: Option<String>,
 }
 
 fn is_hex(k: &str, len: usize) -> bool {
@@ -94,7 +100,11 @@ impl Card {
         }
         let dk = match (c.v.unwrap_or(1), c.dk, c.dkh, c.dks) {
             (1, None, None, None) => None,
-            (2, Some(dk), Some(dkh), Some(dks)) => Some(CardDk::checked(dk, dkh, dks)?),
+            (2 | 3, Some(dk), Some(dkh), Some(dks)) => Some(CardDk::checked(dk, dkh, dks)?),
+            (3, None, None, None) => None,
+            (3, ..) => {
+                return Err("a v3 card's dk, dkh and dks come together or not at all".to_string())
+            }
             (1 | 2, ..) => return Err("a v2 card needs dk, dkh and dks; v1 has none".to_string()),
             (v, ..) => return Err(format!("unknown card version {v}")),
         };
@@ -108,19 +118,37 @@ impl Card {
                 return Err(format!("kem must be 1184 bytes (got {len})"));
             }
         }
+        if c.v == Some(3) && (c.kem.is_none() || c.bs.is_none()) {
+            return Err("a v3 card needs kem and bs".to_string());
+        }
+        if let Some(b) = &c.bs {
+            use base64::Engine as _;
+            let len = base64::engine::general_purpose::STANDARD
+                .decode(b)
+                .map_err(|_| "bs must be base64".to_string())?
+                .len();
+            if len != 64 {
+                return Err(format!("bs must be 64 bytes (got {len})"));
+            }
+        }
         Ok(Card {
             name: c.n,
             ik: c.ik.to_lowercase(),
             ak: c.ak.to_lowercase(),
             dk,
             kem: c.kem,
+            bs: c.bs,
         })
     }
 
     pub fn to_json(&self) -> String {
         let d = self.dk.clone();
         let json = CardJson {
-            v: d.as_ref().map(|_| 2),
+            v: if self.bs.is_some() {
+                Some(3)
+            } else {
+                d.as_ref().map(|_| 2)
+            },
             n: self.name.clone(),
             ik: self.ik.clone(),
             ak: self.ak.clone(),
@@ -128,6 +156,7 @@ impl Card {
             dk: d.as_ref().map(|d| d.dk.clone()),
             dks: d.map(|d| d.dks),
             kem: self.kem.clone(),
+            bs: self.bs.clone(),
         };
         serde_json::to_string(&json).expect("a card always serialises")
     }
@@ -580,6 +609,7 @@ impl Peer {
             dev_origin: origin.map(str::to_string),
             reconnect_max_attempts: 5,
             enable_delivery_confirmation: true,
+            calls_enabled: true,
             ..ClientConfig::default()
         };
         let client = RChatClient::new(config).map_err(|e| e.to_string())?;
@@ -618,6 +648,11 @@ impl Peer {
             ak: client.get_agreement_key().map_err(|e| e.to_string())?,
             dk,
             kem: Some(kem),
+            bs: Some({
+                use base64::Engine as _;
+                let sig = client.get_bundle_signature().map_err(|e| e.to_string())?;
+                base64::engine::general_purpose::STANDARD.encode(sig)
+            }),
         };
         let rec = Arc::new(Mutex::new(Recorded {
             timer_override,
@@ -847,4 +882,26 @@ pub fn ws_url(server: &str) -> String {
     } else {
         format!("ws://{server}")
     }
+}
+
+/// One 20 ms frame of a sine at `hz` (48 kHz mono), frame `n` of a stream.
+pub fn tone(hz: f64, n: usize) -> [i16; 960] {
+    core::array::from_fn(|i| {
+        let t = (n * 960 + i) as f64 / 48_000.0;
+        ((2.0 * std::f64::consts::PI * hz * t).sin() * 8000.0) as i16
+    })
+}
+
+/// Goertzel power of `hz` in `pcm`, normalised to 0..1 of its total power.
+pub fn tone_share(pcm: &[i16], hz: f64) -> f64 {
+    let k = 2.0 * (2.0 * std::f64::consts::PI * hz / 48_000.0).cos();
+    let (mut s1, mut s2, mut total) = (0.0f64, 0.0f64, 0.0f64);
+    for x in pcm {
+        let x = f64::from(*x);
+        let s = x + k * s1 - s2;
+        s2 = s1;
+        s1 = s;
+        total += x * x;
+    }
+    (s1 * s1 + s2 * s2 - k * s1 * s2) / (total * pcm.len() as f64 / 2.0).max(1.0)
 }

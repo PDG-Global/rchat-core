@@ -3248,7 +3248,8 @@ fn dk4_device_key_never_taken_from_the_network() {
     // file of the crate. Test-only files and inline `#[cfg(test)] mod … {`
     // blocks are skipped; definitions (`fn pin_device_key(`) are not calls.
     // `ffi.rs` (`rchat_pin_device_key`: the staged and the live client
-    // path) is the C entry for the app's scan, paste and restore paths.
+    // path) is the C entry for the app's scan, paste and restore paths;
+    // `jni.rs` (`pinDeviceKey`) only forwards the Android app's to it.
     let dir = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
     let mut sites: Vec<(String, usize)> = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap() {
@@ -3271,10 +3272,11 @@ fn dk4_device_key_never_taken_from_the_network() {
         sites,
         vec![
             ("ffi.rs".to_string(), 2),
+            ("jni.rs".to_string(), 1),
             ("lib.rs".to_string(), 1),
             ("peers.rs".to_string(), 1)
         ],
-        "only rchat_pin_device_key, RChatClient::pin_device_key and PeerBook::overlay set a DK pin"
+        "only rchat_pin_device_key (and its JNI forwarder), RChatClient::pin_device_key and PeerBook::overlay set a DK pin"
     );
 }
 

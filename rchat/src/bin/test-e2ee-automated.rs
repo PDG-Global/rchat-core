@@ -968,6 +968,29 @@ mod tests {
             ..c.clone()
         };
         assert!(Card::parse(&short.to_json()).is_err(), "kem of 1183 bytes");
+
+        // Card v3 as the apps write it: kem and bs, device key optional.
+        let v3 = Card {
+            bs: Some(b64(64)),
+            ..with_kem.clone()
+        };
+        let json3 = v3.to_json();
+        assert!(json3.starts_with(r#"{"v":3,"n":"A""#), "{json3}");
+        assert_eq!(Card::parse(&json3).unwrap(), v3);
+        let v3dk = Card {
+            dk: Some(dk.clone()),
+            ..v3.clone()
+        };
+        assert_eq!(Card::parse(&v3dk.to_json()).unwrap(), v3dk);
+        assert!(
+            Card::parse(&json3.replace(&format!(r#","bs":"{}""#, b64(64)), "")).is_err(),
+            "v3 without bs"
+        );
+        assert!(
+            Card::parse(&json3.replace(&b64(64), &b64(63))).is_err(),
+            "bs of 63 bytes"
+        );
+        assert!(Card::parse(&json3.replace(r#""v":3"#, r#""v":4"#)).is_err());
         assert!(Card::parse(&with_kem.to_json().replace("BwcH", "!!!!")).is_err());
     }
 

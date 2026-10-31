@@ -352,7 +352,17 @@ async fn salvage_records(state: &RelayState, tag: tags::IdTag, payloads: &[Vec<u
             .send(FrameBuilder::queued_message(p.clone()).encode())
             .unwrap();
     }
-    salvage_unsent(None, old_rx, tag, state).await;
+    salvage_unsent(
+        Vec::new(),
+        Some(WriterRest {
+            in_flight: None,
+            rx: old_rx,
+        }),
+        tag,
+        None,
+        state,
+    )
+    .await;
 }
 
 /// Final review L5: records salvaged from a closed connection are handed

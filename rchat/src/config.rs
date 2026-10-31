@@ -659,6 +659,23 @@ pub struct OfflineQueueConfig {
     /// must then not be used for this relay).
     #[serde(default)]
     pub allow_persistent_key: bool,
+    /// Bytes of held copies one connection may keep: relayed records
+    /// written to it that its client has not yet acknowledged (Task 8 B).
+    /// At least `max_message_bytes`. Default 4 MiB.
+    #[serde(default = "default_held_copy_max_bytes_per_connection")]
+    pub held_copy_max_bytes_per_connection: usize,
+    /// Bytes of held copies all connections together may keep: a budget of
+    /// its own, separate from the offline store's. Default 64 MiB.
+    #[serde(default = "default_held_copy_max_total_bytes")]
+    pub held_copy_max_total_bytes: usize,
+}
+
+fn default_held_copy_max_bytes_per_connection() -> usize {
+    crate::limits::HELD_COPY_MAX_BYTES_PER_CONNECTION
+}
+
+fn default_held_copy_max_total_bytes() -> usize {
+    crate::limits::HELD_COPY_MAX_TOTAL_BYTES
 }
 
 fn default_queue_ttl_secs() -> u64 {
@@ -678,6 +695,8 @@ impl Default for OfflineQueueConfig {
             persist_path: None,
             persist_key_path: None,
             allow_persistent_key: false,
+            held_copy_max_bytes_per_connection: default_held_copy_max_bytes_per_connection(),
+            held_copy_max_total_bytes: default_held_copy_max_total_bytes(),
         }
     }
 }
@@ -835,7 +854,7 @@ impl ServerConfig {
     /// Whether the relay issues TLS 1.3 resumption tickets (`[server.tls]
     /// session_tickets`, default true; honoured with ACME too).
     pub fn session_tickets(&self) -> bool {
-        self.tls.as_ref().map_or(true, |t| t.session_tickets)
+        self.tls.as_ref().is_none_or(|t| t.session_tickets)
     }
 
     pub fn tls_handshake_timeout(&self) -> Duration {
@@ -1092,7 +1111,7 @@ impl ServerConfig {
             .contains(&self.connection_timeout_secs)
         {
             bail!(
-                "connection_timeout_secs must be between {} and {} (clients send keepalives every 30 s; got {})",
+                "connection_timeout_secs must be between {} and {} (clients send keepalives every 30 s in the foreground and about every 240 s in the background; got {})",
                 MIN_CONNECTION_TIMEOUT_SECS,
                 MAX_CONNECTION_TIMEOUT_SECS,
                 self.connection_timeout_secs
@@ -1103,6 +1122,24 @@ impl ServerConfig {
                 "offline_queue_max_bytes_per_recipient ({}) must be at least max_message_bytes ({})",
                 self.offline_queue_max_bytes_per_recipient,
                 self.max_message_bytes
+            );
+        }
+        let held = &self.offline_queue;
+        if held.held_copy_max_bytes_per_connection < self.max_message_bytes
+            || held.held_copy_max_bytes_per_connection > held.held_copy_max_total_bytes
+        {
+            bail!(
+                "offline_queue.held_copy_max_bytes_per_connection ({}) must be at least max_message_bytes ({}) and at most held_copy_max_total_bytes ({})",
+                held.held_copy_max_bytes_per_connection,
+                self.max_message_bytes,
+                held.held_copy_max_total_bytes
+            );
+        }
+        if held.held_copy_max_total_bytes > MAX_RELAY_BUDGET_BYTES {
+            bail!(
+                "offline_queue.held_copy_max_total_bytes ({}) must be at most {}",
+                held.held_copy_max_total_bytes,
+                MAX_RELAY_BUDGET_BYTES
             );
         }
         if self.offline_queue_max_total_bytes < self.offline_queue_max_bytes_per_recipient {
@@ -1320,6 +1357,38 @@ mod tests {
         let mut small = c;
         small.offline_queue.knock_budget_bytes = 4096;
         assert!(small.validate().is_err());
+    }
+
+    /// Task 8 review M2: held copies have a budget of their own, 4 MiB per
+    /// connection and 64 MiB relay-wide by default, validated fail-closed.
+    #[test]
+    fn held_copy_budget_defaults_and_bounds() {
+        let c = ServerConfig::from_toml_str(
+            r#"
+            [server]
+            bind_addr = "127.0.0.1:1"
+            [server.offline_queue]
+            held_copy_max_bytes_per_connection = 8388608
+            held_copy_max_total_bytes = 134217728
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.offline_queue.held_copy_max_bytes_per_connection, 8 << 20);
+        assert_eq!(c.offline_queue.held_copy_max_total_bytes, 128 << 20);
+        c.validate().unwrap();
+        let d = ServerConfig::default();
+        assert_eq!(d.offline_queue.held_copy_max_bytes_per_connection, 4 << 20);
+        assert_eq!(d.offline_queue.held_copy_max_total_bytes, 64 << 20);
+        d.validate().unwrap();
+        let mut small = ServerConfig::default();
+        small.offline_queue.held_copy_max_bytes_per_connection = small.max_message_bytes - 1;
+        assert!(err_text(small.validate()).contains("held_copy_max_bytes_per_connection"));
+        let mut inverted = ServerConfig::default();
+        inverted.offline_queue.held_copy_max_total_bytes = 1 << 20;
+        assert!(err_text(inverted.validate()).contains("held_copy_max_bytes_per_connection"));
+        let mut huge = ServerConfig::default();
+        huge.offline_queue.held_copy_max_total_bytes = MAX_RELAY_BUDGET_BYTES + 1;
+        assert!(err_text(huge.validate()).contains("held_copy_max_total_bytes"));
     }
 
     #[test]

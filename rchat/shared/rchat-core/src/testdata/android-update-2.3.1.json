@@ -1,0 +1,9 @@
+{
+  "versionName": "2.3.1",
+  "versionCode": 10,
+  "url": "https://assets.r-chat.net/android/rchat-2.3.1.apk",
+  "sha256": "4854958fb4b00464a79713843f19d347cfd65bcee1f68d5abd683b0f456b13ad",
+  "size": 57419951,
+  "notes": "Video now shows on the other phone, the picture is the right way up whichever way you hold your phone, and the keyboard no longer covers a call.",
+  "expires": "2026-11-29T15:10:12Z"
+}

@@ -251,7 +251,7 @@ mod tests {
         let mut bytes = encode(Some((addr("198.51.100.4:1"), addr("127.0.0.1:2"))));
         let extra = MAX_ADDRESS_BLOCK - TCP4_LEN;
         bytes[14..16].copy_from_slice(&(MAX_ADDRESS_BLOCK as u16).to_be_bytes());
-        bytes.extend(std::iter::repeat(0xAB).take(extra));
+        bytes.extend(std::iter::repeat_n(0xAB, extra));
         bytes.extend_from_slice(b"after");
         let mut cursor = std::io::Cursor::new(bytes);
         let src = read_header(&mut cursor, T).await.unwrap();

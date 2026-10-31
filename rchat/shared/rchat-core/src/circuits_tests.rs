@@ -7312,3 +7312,133 @@ fn set_recipient_without_an_agreement_key_keeps_the_pin_and_kem_key() {
         Err(crate::RChatError::PeerNotAccepted { .. })
     ));
 }
+
+/// Final review I-2(a): a knock that arrived before the receiver pinned its
+/// sender is only a request; adding the sender from a code afterwards pins
+/// it and answers that knock with an ask, with no reconnect.
+#[test]
+fn pinning_a_requester_from_a_card_answers_its_knock() {
+    let (mut b, mut rx) = published(0xB2);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    feed(
+        &mut b,
+        queued(knock_from(&pa, &pb, crate::circuits::now_hour())),
+    );
+    assert!(b.peers.has_requested(&pa.hex));
+    assert!(asks(&mut rx).is_empty(), "a request alone asks nothing");
+    b.pin_peer(
+        &pa.hex,
+        &hex::encode(pa.bundle.identity_agreement_key),
+        Some(&hex::encode(&pa.bundle.kem_pk[..])),
+    )
+    .unwrap();
+    assert_eq!(asks(&mut rx).len(), 1, "the pin answers the noted knock");
+    // Pinning with no earlier request asks nothing (the app asks itself).
+    let (mut c, mut crx) = published(0xC3);
+    let pd = peer(0xD4);
+    c.pin_peer(
+        &pd.hex,
+        &hex::encode(pd.bundle.identity_agreement_key),
+        Some(&hex::encode(&pd.bundle.kem_pk[..])),
+    )
+    .unwrap();
+    assert!(asks(&mut crx).is_empty());
+}
+
+/// Final review M-5: a KEM key learned from a pinned contact's knock
+/// serves the ask that waited for it. The knock's answer is the one ask;
+/// the stale `deferred_asks` entry must not send a second at the next publish.
+#[test]
+fn a_kem_key_learned_from_a_knock_clears_the_deferred_ask() {
+    let (mut a, mut rx) = published(0xA1);
+    let (pa, pb) = (peer(0xA1), peer(0xB2));
+    a.pin_peer(
+        &pb.hex,
+        &hex::encode(pb.bundle.identity_agreement_key),
+        None,
+    )
+    .unwrap();
+    a.schedule_reask(&pb.hex);
+    assert!(a.deferred_asks.contains(&pb.hex));
+    feed(
+        &mut a,
+        queued(knock_from(&pb, &pa, crate::circuits::now_hour())),
+    );
+    assert!(a.peers.kem_pk_for(&pb.hex).is_some());
+    assert!(!a.deferred_asks.contains(&pb.hex), "no stale entry");
+    assert!(a.pending_reasks.contains_key(&pb.hex), "the knock's answer");
+    a.fire_due_reasks(Instant::now() + Duration::from_secs(700));
+    assert_eq!(asks(&mut rx).len(), 1);
+    a.after_publish_ok(Instant::now());
+    assert!(asks(&mut rx).is_empty(), "no second ask from a stale entry");
+}
+
+/// Final review I-2(b): an identity ask nobody answered is sent again on the
+/// same connection before the relay's 540 s hold ends, so a first ask is not
+/// lost for want of a reconnect. Not while the first is in flight, and not
+/// once the pair has a circuit.
+#[test]
+fn an_unanswered_identity_ask_is_refreshed_before_the_relay_expiry() {
+    let (mut a, mut rx) = published(0xA1);
+    a.ask_jitter_override = Some(0.0);
+    let pb = peer(0xB2);
+    a.peers.pin_card(&pb).unwrap();
+    let t0 = Instant::now();
+    a.ask(&pb.hex, AskTrigger::User, t0).unwrap();
+    assert_eq!(asks(&mut rx).len(), 1);
+    a.fire_due_reasks(t0 + Duration::from_secs(400));
+    assert!(asks(&mut rx).is_empty(), "too early");
+    let at = t0 + Duration::from_secs(490);
+    assert!(at < t0 + crate::circuits::RELAY_ASK_HOLD, "before expiry");
+    a.fire_due_reasks(at);
+    assert_eq!(asks(&mut rx).len(), 1, "refreshed");
+    a.fire_due_reasks(at + Duration::from_secs(1));
+    assert!(asks(&mut rx).is_empty(), "not again at once");
+    assert_eq!(
+        a.peers.backoff_mut(&pb.hex).attempts(),
+        1,
+        "a refresh is not a retry: no extra backoff"
+    );
+    // Answered (a circuit formed or the relay answered): nothing more.
+    a.clear_unanswered(&pb.hex);
+    a.fire_due_reasks(at + Duration::from_secs(2000));
+    assert!(asks(&mut rx).is_empty());
+}
+
+/// The refresh is bounded.
+#[test]
+fn the_ask_refresh_stops_after_a_few_rounds() {
+    let (mut a, mut rx) = published(0xA1);
+    a.ask_jitter_override = Some(0.0);
+    let pb = peer(0xB2);
+    a.peers.pin_card(&pb).unwrap();
+    let mut t = Instant::now();
+    a.ask(&pb.hex, AskTrigger::User, t).unwrap();
+    assert_eq!(asks(&mut rx).len(), 1);
+    let mut sent = 0;
+    for _ in 0..40 {
+        t += Duration::from_secs(500);
+        a.fire_due_reasks(t);
+        sent += asks(&mut rx).len();
+    }
+    assert_eq!(sent, crate::circuits::MAX_ASK_REFRESHES as usize);
+}
+
+/// Final review I-2(b): asks parked in `deferred_asks` are retried by the
+/// timer once the bundle is published (not only from `after_publish_ok`),
+/// and never while a drain runs or before the publish.
+#[test]
+fn deferred_asks_are_retried_by_the_timer_while_published() {
+    let (mut a, mut rx) = published(0xA1);
+    let pb = peer(0xB2);
+    a.peers.pin_card(&pb).unwrap();
+    a.deferred_asks.push(pb.hex.clone());
+    a.is_key_bundle_published = false;
+    a.fire_due_reasks(Instant::now());
+    assert!(asks(&mut rx).is_empty(), "not before the publish");
+    assert!(a.deferred_asks.contains(&pb.hex));
+    a.is_key_bundle_published = true;
+    a.fire_due_reasks(Instant::now());
+    assert_eq!(asks(&mut rx).len(), 1, "retried by the timer");
+    assert!(a.deferred_asks.is_empty());
+}

@@ -479,6 +479,11 @@ pub(crate) mod test_server {
             *self.acceptor.write() = acceptor(&self.cert, &self.key, tickets, false);
         }
 
+        /// The server certificate as PEM (Android CA store tests).
+        pub(crate) fn cert_pem(&self) -> Vec<u8> {
+            self.cert.to_pem().unwrap()
+        }
+
         pub(crate) fn trust(&self) -> X509Store {
             let mut b = X509StoreBuilder::new().unwrap();
             b.add_cert(self.cert.clone()).unwrap();

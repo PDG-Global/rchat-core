@@ -70,6 +70,8 @@ fn fake_conn(
             has_asked: false,
             blind_ask_bucket: None,
             peer_bundle: None,
+            held: None,
+            media: None,
         },
     );
     if let Some(i) = id {
@@ -662,7 +664,7 @@ async fn knock_racing_a_publish_is_delivered_not_stranded() {
         state
             .message_queues
             .get(&btag)
-            .map_or(true, |q| !q.pending.iter().any(|m| m.is_knock)),
+            .is_none_or(|q| !q.pending.iter().any(|m| m.is_knock)),
         "no knock left stranded in the store"
     );
 }

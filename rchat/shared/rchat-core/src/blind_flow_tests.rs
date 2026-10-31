@@ -884,35 +884,64 @@ fn contact_knock_during_a_blind_ask_is_answered_on_the_identity_path_at_its_time
     assert!(blind_tokens(&sent).is_empty(), "no further blind ask");
 }
 
-/// R35 (final review I-1): a relay withholds a contact's genuine knock (from
-/// an identity ask that declares no lost session), forces a blind re-pair in
-/// the same hour, then delivers it: first seen, new digest, issued this
-/// hour. Each such knock used to close the blinded circuit and ask on the
-/// identity path, so a relay could loop it past R20's one target-naming ask
-/// per pair per 24 h (and raise SessionReplaced each time). Now such a knock
-/// spends the pair's 24 h identity budget: one identity ask, then none.
+/// Both sides answer each other's fresh knock: the identity ask of each
+/// meets the other's, and the verified identity install on both sides is a
+/// completed identity re-pair. `a_knock` is the knock A acts on.
+fn complete_identity_repair(p: &mut Pair, relay: &mut FakeRelay, a_knock: Vec<u8>) {
+    let hour = crate::circuits::now_hour();
+    feed(&mut p.a, queued(a_knock));
+    feed(&mut p.b, queued(knock_from(&p.pa, &p.pb, hour)));
+    let at = Instant::now() + Duration::from_secs(700);
+    p.a.fire_due_reasks(at);
+    p.b.fire_due_reasks(at);
+    run(p, relay);
+    assert!(!relay.pairs.last().unwrap().2, "an identity pair");
+}
+
+/// R35 (final review I-1, re-expressed by the 2026-10-19 ruling): a relay
+/// withholds a contact's genuine knocks (from identity asks that declare no
+/// lost session), forces blind re-pairs in the same hour, then delivers
+/// them: first seen, new digest, issued this hour. Each used to close the
+/// blinded circuit and ask on the identity path, so a relay could loop it
+/// past R20's bound (and raise SessionReplaced each time). The bound is now
+/// on completed identity re-pairs: the first knock is answered and its
+/// re-pair completes; each later one, delivered after a blind re-pair
+/// within 24 h, changes nothing (no identity ask, the blinded circuit
+/// stays).
 #[test]
-fn withheld_contact_knocks_cost_one_identity_ask_per_day() {
+fn withheld_contact_knocks_force_at_most_one_completed_identity_repair_per_day() {
     let (mut p, mut relay) = blind_pair();
     let hour = crate::circuits::now_hour();
     let withheld = [
         knock_from(&p.pb, &p.pa, hour),
         knock_from(&p.pb, &p.pa, hour),
+        knock_from(&p.pb, &p.pa, hour),
     ];
-    let mut identity = 0;
-    for knock in withheld {
-        reconnect_both(&mut p, &mut relay); // the forced blind re-pair, this hour
+    let [first, second, third] = withheld;
+    reconnect_both(&mut p, &mut relay); // the forced blind re-pair, this hour
+    assert!(p.a.has_live_circuit(&p.pb.hex));
+    complete_identity_repair(&mut p, &mut relay, first);
+    assert!(p
+        .a
+        .session_manager
+        .get(&p.pb.hex)
+        .is_some_and(|s| { s.last_identity_fallback_unix == Some(p.a.pair_now_unix()) }));
+    let pairs = relay.pairs.len();
+    for knock in [second, third] {
+        reconnect_both(&mut p, &mut relay); // a forced blind re-pair
         assert!(p.a.has_live_circuit(&p.pb.hex));
         drain(&mut p.a_rx);
         feed(&mut p.a, queued(knock));
         p.a.fire_due_reasks(Instant::now() + Duration::from_secs(700));
-        identity += identity_asks(&rx_controls(&mut p.a_rx));
-        p.a.identity_wanted.clear(); // as after the identity install
+        assert_eq!(identity_asks(&rx_controls(&mut p.a_rx)), 0);
+        assert!(p.a.has_live_circuit(&p.pb.hex), "the blinded circuit stays");
+        assert!(!p.a.identity_wanted.contains_key(&p.pb.hex));
     }
-    assert_eq!(identity, 1, "one target-naming ask per pair per 24 h");
+    assert!(relay.pairs.len() > pairs, "the blind re-pairs went on");
 }
 
-/// R35: once the pair's 24 h identity budget is spent, a contact's knock
+/// R35: once an identity re-pair has completed within 24 h (stamped an hour
+/// ago here), a contact's knock
 /// that declares no lost session is ignored for re-pairing: the blinded
 /// circuit stays and nothing names the peer.
 #[test]
@@ -936,15 +965,15 @@ fn contact_knock_without_lost_session_is_ignored_once_the_budget_is_spent() {
     assert!(!p.a.identity_wanted.contains_key(&p.pb.hex));
 }
 
-/// R35 with M-1: a genuine reinstall (the knock declares no prior session)
-/// re-pairs at once, and stamps the pair's 24 h identity budget; a second
+/// R35 with M-1 (2026-10-19 ruling): a genuine reinstall (the knock declares
+/// no prior session) re-pairs at once: the ask goes out but stamps nothing.
+/// The completed identity re-pair stamps the budget on both sides; a second
 /// flagged knock within 24 h (one a relay withheld, delivered after a blind
 /// re-pair) triggers no identity ask.
 #[test]
-fn reinstall_knock_re_pairs_at_once_and_stamps_the_budget() {
+fn reinstall_knock_re_pairs_at_once_and_the_completed_re_pair_stamps_the_budget() {
     let (mut p, mut relay) = blind_pair();
     reconnect_both(&mut p, &mut relay);
-    let now = p.a.pair_now_unix();
     let created_hour = p.a.session_manager.get(&p.pb.hex).unwrap().created_at_unix / 3600;
     drain(&mut p.a_rx);
     feed(
@@ -952,20 +981,41 @@ fn reinstall_knock_re_pairs_at_once_and_stamps_the_budget() {
         queued(knock_from_no_prior(&p.pb, &p.pa, created_hour + 1)),
     );
     p.a.fire_due_reasks(Instant::now() + Duration::from_secs(700));
-    assert_eq!(
-        identity_asks(&rx_controls(&mut p.a_rx)),
-        1,
-        "an identity ask at once"
-    );
+    let sent = rx_controls(&mut p.a_rx);
+    assert_eq!(identity_asks(&sent), 1, "an identity ask at once");
     assert_eq!(
         p.a.session_manager
             .get(&p.pb.hex)
             .unwrap()
             .last_identity_fallback_unix,
-        Some(now),
-        "the immediate path stamps the budget"
+        None,
+        "an ask nobody answered yet spends nothing"
     );
-    p.a.identity_wanted.clear(); // as after the identity install
+    // B answers by identity too: the re-pair completes and stamps.
+    for m in sent {
+        for (_, f) in relay.control(0, m) {
+            feed(&mut p.b, f);
+        }
+    }
+    feed(
+        &mut p.b,
+        queued(knock_from(&p.pa, &p.pb, crate::circuits::now_hour())),
+    );
+    p.b.fire_due_reasks(Instant::now() + Duration::from_secs(700));
+    run(&mut p, &mut relay);
+    assert!(!relay.pairs.last().unwrap().2, "an identity pair");
+    let now = p.a.pair_now_unix();
+    for (inner, peer) in [(&p.a, &p.pb.hex), (&p.b, &p.pa.hex)] {
+        assert_eq!(
+            inner
+                .session_manager
+                .get(peer)
+                .unwrap()
+                .last_identity_fallback_unix,
+            Some(now),
+            "the completed identity re-pair stamps the budget"
+        );
+    }
     let withheld = knock_from_no_prior(&p.pb, &p.pa, created_hour + 1);
     reconnect_both(&mut p, &mut relay); // the forced blind re-pair
     assert!(p.a.has_live_circuit(&p.pb.hex));
@@ -975,9 +1025,113 @@ fn reinstall_knock_re_pairs_at_once_and_stamps_the_budget() {
     assert_eq!(
         identity_asks(&rx_controls(&mut p.a_rx)),
         0,
-        "one per pair per 24 h"
+        "one completed re-pair per pair per 24 h"
     );
     assert!(p.a.has_live_circuit(&p.pb.hex), "the blinded circuit stays");
+}
+
+/// A completed identity re-pair stamps the pair's budget with the time of
+/// the install; a second fresh knock within 24 h is ignored (the pair stays
+/// blind), and once 24 h have passed it is answered.
+#[test]
+fn completed_identity_repair_blocks_a_second_one_for_24h() {
+    let (mut p, mut relay) = blind_pair();
+    reconnect_both(&mut p, &mut relay);
+    assert_eq!(
+        p.a.session_manager
+            .get(&p.pb.hex)
+            .unwrap()
+            .last_identity_fallback_unix,
+        None
+    );
+    let hour = crate::circuits::now_hour();
+    let first = knock_from(&p.pb, &p.pa, hour);
+    complete_identity_repair(&mut p, &mut relay, first);
+    let stamped = p.a.pair_now_unix();
+    assert_eq!(
+        p.a.session_manager
+            .get(&p.pb.hex)
+            .unwrap()
+            .last_identity_fallback_unix,
+        Some(stamped)
+    );
+    reconnect_both(&mut p, &mut relay); // blind again
+    assert!(p.a.has_live_circuit(&p.pb.hex));
+    drain(&mut p.a_rx);
+    feed(&mut p.a, queued(knock_from(&p.pb, &p.pa, hour)));
+    p.a.fire_due_reasks(Instant::now() + Duration::from_secs(700));
+    assert_eq!(identity_asks(&rx_controls(&mut p.a_rx)), 0, "ignored");
+    assert!(p.a.has_live_circuit(&p.pb.hex), "the pair stays blind");
+    // 24 h on, a fresh knock is answered.
+    p.a.pair_clock_override = Some(stamped + crate::blind::IDENTITY_FALLBACK_INTERVAL_SECS);
+    feed(&mut p.a, queued(knock_from(&p.pb, &p.pa, hour)));
+    p.a.fire_due_reasks(Instant::now() + Duration::from_secs(1400));
+    assert_eq!(identity_asks(&rx_controls(&mut p.a_rx)), 1, "answered");
+}
+
+/// First contact (no pair secret before the install) is not a re-pair: the
+/// identity install stamps nothing.
+#[test]
+fn first_contact_install_does_not_stamp_the_budget() {
+    let p = establish(0xA1, 0xB2);
+    for (inner, peer) in [(&p.a, &p.pb.hex), (&p.b, &p.pa.hex)] {
+        let s = inner.session_manager.get(peer).unwrap();
+        assert!(s.pair_secret.is_some(), "an identity install derives PS");
+        assert_eq!(s.last_identity_fallback_unix, None);
+    }
+}
+
+/// After a timed identity fallback ask runs out unanswered, the next one
+/// waits a full 24 h from it (nothing is stamped, the blind clock restarts),
+/// also when the connection drops while it is out.
+#[test]
+fn no_second_timed_fallback_within_24h_of_one_that_ran_out() {
+    let (mut p, mut relay) = blind_pair();
+    let t0 = Instant::now();
+    let mut k = unanswered_fallback(&mut p, &mut relay, t0);
+    assert_eq!(
+        p.a.session_manager
+            .get(&p.pb.hex)
+            .unwrap()
+            .last_identity_fallback_unix,
+        None,
+        "an unanswered ask spends no budget"
+    );
+    let ran_out_at = NOON + u64::from(k) * (ASK_TTL.as_secs() + 1);
+    let asks = relay.identity_asks.len();
+    while NOON + u64::from(k) * (ASK_TTL.as_secs() + 1) < ran_out_at + 23 * 3600 {
+        k += 1;
+        let secs = u64::from(k) * (ASK_TTL.as_secs() + 1);
+        p.a.pair_clock_override = Some(NOON + secs);
+        relay.expire_asks();
+        p.a.fire_blind_timeouts(t0 + Duration::from_secs(secs));
+        pump_alone(&mut relay, &mut p.a, &mut p.a_rx);
+    }
+    assert_eq!(relay.identity_asks.len(), asks, "none within the day");
+    while relay.identity_asks.len() == asks {
+        k += 1;
+        assert!(k <= 600, "the next one comes");
+        let secs = u64::from(k) * (ASK_TTL.as_secs() + 1);
+        p.a.pair_clock_override = Some(NOON + secs);
+        relay.expire_asks();
+        p.a.fire_blind_timeouts(t0 + Duration::from_secs(secs));
+        pump_alone(&mut relay, &mut p.a, &mut p.a_rx);
+    }
+    let at = NOON + u64::from(k) * (ASK_TTL.as_secs() + 1);
+    assert!(at >= ran_out_at + IDENTITY_FALLBACK_AFTER_SECS, "a day on");
+    // It goes out with the connection: the next waits another day.
+    reconnect_in_place(&mut p.a, &mut p.a_rx);
+    pump_alone(&mut relay, &mut p.a, &mut p.a_rx);
+    let asks = relay.identity_asks.len();
+    for _ in 0..20 {
+        k += 1;
+        let secs = u64::from(k) * (ASK_TTL.as_secs() + 1);
+        p.a.pair_clock_override = Some(NOON + secs);
+        relay.expire_asks();
+        p.a.fire_blind_timeouts(t0 + Duration::from_secs(secs));
+        pump_alone(&mut relay, &mut p.a, &mut p.a_rx);
+    }
+    assert_eq!(relay.identity_asks.len(), asks, "not again right away");
 }
 
 /// The fallback clock, the last fallback and the blinded mark are
@@ -1116,6 +1270,70 @@ fn one_sided_reconnect_closes_the_identity_circuit_and_re_pairs_blind() {
         .iter()
         .all(|m| !matches!(m, ControlMessage::CloseCircuit { .. })));
     assert_eq!(blind_tokens(&sent).len(), 1);
+}
+
+/// Puts a live call with `peer` on `inner` (Connected, no media): what a
+/// call carried on the pair's identity circuit looks like to the circuits.
+fn live_call(inner: &mut ClientInner, peer: &str, id: crate::call::CallId) {
+    use crate::call::machine::{ActiveCall, Direction, Phase};
+    let now = Instant::now();
+    inner.call.active = Some(ActiveCall {
+        id,
+        peer: peer.to_string(),
+        direction: Direction::Outgoing,
+        placed_at: now,
+        started_at_ms: 0,
+        phase: Phase::Connected {
+            at: now,
+            last_status: now,
+        },
+        media: None,
+        video: Default::default(),
+    });
+}
+
+/// Final review N1: a chat reconnect during a call on the identity circuit
+/// (the call right after first contact) closes that circuit at once, as
+/// without a call: the relay keeps a token with live call connections
+/// across `CloseCircuit` (relay `a_close_keeps_a_token_with_live_call_connections`,
+/// `a_call_survives_a_chat_reconnect_that_closes_its_identity_circuit`).
+/// The pair re-forms blind in one round trip, and a chat message and the
+/// hang-up End then go out at once on the new circuit, not the old one.
+#[test]
+fn a_reconnect_during_a_call_closes_the_identity_circuit_and_sends_on_the_new_one() {
+    let (mut p, mut relay) = blind_pair();
+    let id = crate::call::CallId([9; 16]);
+    live_call(&mut p.a, &p.pb.hex, id);
+    reconnect_in_place(&mut p.a, &mut p.a_rx);
+    run(&mut p, &mut relay);
+    assert_eq!(relay.closes, vec![(0, C1)], "closed at once");
+    p.b.fire_due_reasks(Instant::now() + Duration::from_secs(5));
+    run(&mut p, &mut relay);
+    assert!(p.a.has_live_circuit(&p.pb.hex) && p.b.has_live_circuit(&p.pa.hex));
+    // A sends on the peer's side of the pair (its target circuit).
+    let new_circuit =
+        p.a.session_manager
+            .get(&p.pb.hex)
+            .and_then(|s| s.target_circuit_id.clone())
+            .expect("re-paired");
+    assert_ne!(new_circuit, C2, "not the old identity pair");
+    assert!(p.a.call.active.is_some(), "the call carries on");
+    p.a.send_tracked_for_test(&p.pb.hex, rand::random(), b"\x01\0\0\0\0during the call")
+        .unwrap();
+    p.a.call_end(id, Instant::now(), 0).unwrap();
+    let circuits: Vec<CircuitId> = drain(&mut p.a_rx)
+        .iter()
+        .filter_map(|f| crate::protocol::RelayPacket::decode(f))
+        .map(|pkt| pkt.circuit_id)
+        .collect();
+    assert!(
+        circuits.len() >= 2,
+        "message and End sent at once: {circuits:?}"
+    );
+    assert!(
+        circuits.iter().all(|c| *c == new_circuit),
+        "all on the new circuit: {circuits:?}"
+    );
 }
 
 /// R19 on the responder's side: B (role 1 in every re-pair here) has an
@@ -1598,10 +1816,12 @@ fn forged_stray_match_does_not_move_the_counter() {
 
 /// Fix round 2 N-2: the issue hour and digest of the last contact knock
 /// acted on are persisted, so a relay replaying that knock (or an older
-/// one) after an app restart cannot force another identity ask; a new knock
-/// of the same hour, as from a peer that lost its sessions again, counts.
+/// one) after an app restart changes nothing. The seen-knock set and the
+/// one-answer-per-day budget are memory only, so after a restart one new
+/// knock of the same hour (as from a peer that lost its sessions again) is
+/// answered, and no more than that one within 24 h.
 #[test]
-fn replayed_contact_knock_after_restart_is_ignored() {
+fn contact_knock_replay_after_restart_costs_at_most_one_answer() {
     let (sa, sb) = (MemorySink::default(), MemorySink::default());
     let mut p = stored_pair(&sa, &sb);
     p.a.handle_circuit_closed(C1);
@@ -1628,22 +1848,29 @@ fn replayed_contact_knock_after_restart_is_ignored() {
         !a2.identity_wanted.contains_key(&p.pb.hex),
         "an older knock changes nothing"
     );
-    // R35: the first knock spent the pair's 24 h identity budget, so a new
-    // same-hour knock that declares no lost session does not count...
+    // The answer budget did not survive the restart: one new knock of the
+    // same hour is answered...
     let again = knock_from(&p.pb, &p.pa, hour);
     feed(&mut a2, queued(again));
     assert!(
-        !a2.identity_wanted.contains_key(&p.pb.hex),
-        "a new knock without the flag waits for the budget"
+        a2.identity_wanted.contains_key(&p.pb.hex),
+        "one answer after a restart"
     );
-    // ...and (M-1) neither does a flagged one: the identity re-pair the
-    // first knock caused is the pair's one for 24 h.
-    let created_hour = a2.session_manager.get(&p.pb.hex).unwrap().created_at_unix / 3600;
-    let lost_again = knock_from_no_prior(&p.pb, &p.pa, created_hour + 1);
-    feed(&mut a2, queued(lost_again));
+    a2.identity_wanted.clear();
+    // ...and no second one within 24 h, flagged or not.
+    feed(&mut a2, queued(knock_from(&p.pb, &p.pa, hour)));
     assert!(
         !a2.identity_wanted.contains_key(&p.pb.hex),
-        "a flagged knock waits for the budget too"
+        "a further knock waits for the answer budget"
+    );
+    let created_hour = a2.session_manager.get(&p.pb.hex).unwrap().created_at_unix / 3600;
+    feed(
+        &mut a2,
+        queued(knock_from_no_prior(&p.pb, &p.pa, created_hour + 1)),
+    );
+    assert!(
+        !a2.identity_wanted.contains_key(&p.pb.hex),
+        "a flagged knock waits for it too"
     );
 }
 
@@ -1661,7 +1888,7 @@ fn step_ttls(p: &mut Pair, relay: &mut FakeRelay, t0: Instant, k: u32) {
 }
 
 /// Final review H-1 (from the reviewer's scratch test): a contact merely
-/// away. A fell back to identity an hour ago (its budget is spent, and its
+/// away. A completed an identity re-pair an hour ago (its budget is spent, and its
 /// knock waited at the relay for B). B returns and re-pairs blind, then
 /// acts on A's knock (B's budget is free): B closes the blinded circuit and
 /// asks by identity. A's budget is spent, so A ignores B's knock and stays
@@ -2258,4 +2485,141 @@ fn a_fifth_blind_ask_keeps_the_identity_asks_keys() {
         "the identity ask keeps its keys"
     );
     let _ = rx_controls(&mut p.a_rx);
+}
+
+/// One tick of the harness `k` ask TTLs after `t0` (clocks from `NOON`):
+/// held asks expire at the relay, timeouts and re-asks fire on both sides.
+fn tick_all(p: &mut Pair, relay: &mut FakeRelay, t0: Instant, k: u32) {
+    let secs = u64::from(k) * (ASK_TTL.as_secs() + 1);
+    p.a.pair_clock_override = Some(NOON + secs);
+    p.b.pair_clock_override = Some(NOON + secs);
+    relay.expire_asks();
+    let at = t0 + Duration::from_secs(secs);
+    p.a.fire_blind_timeouts(at);
+    p.b.fire_blind_timeouts(at);
+    p.a.fire_due_reasks(at);
+    p.b.fire_due_reasks(at);
+    run(p, relay);
+}
+
+/// A's timed identity fallback goes out while B is away and runs out
+/// unanswered. Returns the tick count reached.
+fn unanswered_fallback(p: &mut Pair, relay: &mut FakeRelay, t0: Instant) -> u32 {
+    drop(relay.leave(1)); // B is gone
+    reconnect_in_place(&mut p.a, &mut p.a_rx);
+    pump_alone(relay, &mut p.a, &mut p.a_rx);
+    let mut k = 0;
+    while relay.identity_asks.is_empty() {
+        k += 1;
+        assert!(k <= 200, "the fallback fires");
+        let secs = u64::from(k) * (ASK_TTL.as_secs() + 1);
+        p.a.pair_clock_override = Some(NOON + secs);
+        relay.expire_asks();
+        p.a.fire_blind_timeouts(t0 + Duration::from_secs(secs));
+        pump_alone(relay, &mut p.a, &mut p.a_rx);
+    }
+    while p.a.identity_fallback.contains_key(&p.pb.hex) {
+        k += 1;
+        assert!(k <= 400, "the fallback ask runs out");
+        let secs = u64::from(k) * (ASK_TTL.as_secs() + 1);
+        p.a.pair_clock_override = Some(NOON + secs);
+        relay.expire_asks();
+        p.a.fire_blind_timeouts(t0 + Duration::from_secs(secs));
+        pump_alone(relay, &mut p.a, &mut p.a_rx);
+    }
+    k
+}
+
+/// Seen on the owner's phones: A's timed identity fallback nobody answered
+/// used to spend A's 24 h identity budget, so A then refused B's genuine
+/// fallback knock ("identity budget spent; staying blind") and the pair
+/// stayed apart. Only a completed identity re-pair counts now: A answers,
+/// and the pair re-forms on the identity path.
+#[test]
+fn unanswered_fallback_does_not_block_answering_the_contacts_knock() {
+    let (mut p, mut relay) = blind_pair();
+    // B holds another pair secret: blind asks never meet, so B falls back too.
+    p.b.session_manager.get_mut(&p.pa.hex).unwrap().pair_secret =
+        Some(zeroize::Zeroizing::new([9; 32]));
+    let t0 = Instant::now();
+    let mut k = unanswered_fallback(&mut p, &mut relay, t0);
+    assert_eq!(
+        relay
+            .identity_asks
+            .iter()
+            .filter(|(s, _, _)| *s == 0)
+            .count(),
+        1,
+        "A's one fallback ask, unanswered"
+    );
+    assert!(relay.pairs.is_empty());
+    // B comes back with its own fallback due.
+    relay.join(1, &p.pb.bundle);
+    let now = NOON + u64::from(k) * (ASK_TTL.as_secs() + 1);
+    p.b.pair_clock_override = Some(now);
+    p.b.session_manager
+        .get_mut(&p.pa.hex)
+        .unwrap()
+        .blind_since_unix = Some(now - IDENTITY_FALLBACK_AFTER_SECS - 60);
+    reconnect_in_place(&mut p.b, &mut p.b_rx);
+    let b_asks = relay
+        .identity_asks
+        .iter()
+        .filter(|(s, _, _)| *s == 1)
+        .count();
+    assert_eq!(b_asks, 0);
+    while relay.identity_asks.iter().all(|(s, _, _)| *s != 1) {
+        k += 1;
+        assert!(k <= 480, "B's fallback fires");
+        tick_all(&mut p, &mut relay, t0, k);
+    }
+    // B's knock reached A. A answers within B's ask TTL.
+    let at = t0 + Duration::from_secs(u64::from(k) * (ASK_TTL.as_secs() + 1) + 120);
+    p.a.fire_due_reasks(at);
+    run(&mut p, &mut relay);
+    assert!(
+        relay.identity_asks.iter().any(|(s, _, _)| *s == 1),
+        "B fell back by identity"
+    );
+    assert!(!relay.pairs.is_empty(), "the pair re-forms");
+    assert!(!relay.pairs[0].2, "an identity pair");
+    assert!(p.a.has_live_circuit(&p.pb.hex) && p.b.has_live_circuit(&p.pa.hex));
+}
+
+/// Every identity ask carries a fresh knock, so with no limit on answers a
+/// relay that never matches the asks and delivers each one-sided ask's knock
+/// has A answer B, B answer A, and so on. One knock answer per pair per 24 h
+/// (memory only) ends it; neither side's own attempt spends it. After 24 h
+/// the contact is answered again.
+#[test]
+fn knock_answers_cannot_ping_pong() {
+    let (mut p, mut relay) = blind_pair();
+    reconnect_both(&mut p, &mut relay);
+    let pairs = relay.pairs.len();
+    // Blind asks never meet either, so nothing but knock answers asks.
+    p.b.session_manager.get_mut(&p.pa.hex).unwrap().pair_secret =
+        Some(zeroize::Zeroizing::new([9; 32]));
+    let t0 = Instant::now();
+    let hour = crate::circuits::now_hour();
+    feed(&mut p.a, queued(knock_from(&p.pb, &p.pa, hour)));
+    let per_side = |relay: &FakeRelay, side: usize| {
+        relay
+            .identity_asks
+            .iter()
+            .filter(|(s, _, _)| *s == side)
+            .count()
+    };
+    for k in 1..=100u32 {
+        tick_all(&mut p, &mut relay, t0, k); // about 16 h
+    }
+    assert_eq!(per_side(&relay, 0), 1, "A answered once");
+    assert_eq!(per_side(&relay, 1), 1, "B answered once");
+    assert_eq!(relay.pairs.len(), pairs, "no pair formed");
+    // 24 h after A's answer, a fresh knock is answered again.
+    let later = NOON + 25 * 3600;
+    p.a.pair_clock_override = Some(later);
+    feed(&mut p.a, queued(knock_from(&p.pb, &p.pa, hour)));
+    p.a.fire_due_reasks(t0 + Duration::from_secs(25 * 3600));
+    pump_alone(&mut relay, &mut p.a, &mut p.a_rx);
+    assert_eq!(per_side(&relay, 0), 2, "answered again after 24 h");
 }

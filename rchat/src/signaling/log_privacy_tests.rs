@@ -617,7 +617,17 @@ async fn rq5_forwarding_logs_one_identity_value_per_line() {
         "B's unresumed connection received the packet"
     );
 
-    // RQ2: B offline; the packet is queued.
+    // RQ2: B offline; the packet is queued. (B shows life first, so the
+    // relay's held copy of the hand-over is discarded, not re-queued:
+    // Task 8 B.)
+    wb2.send(
+        crate::protocol::unified::UnifiedFrame::Keepalive(
+            crate::protocol::unified::KeepaliveMessage::Ping { timestamp: 0 },
+        )
+        .encode(),
+    )
+    .await
+    .unwrap();
     drop(wb2);
     gone(&state).await;
     wa.send(send_a(b"RQ5-OFFLINE")).await.unwrap();
@@ -629,8 +639,12 @@ async fn rq5_forwarding_logs_one_identity_value_per_line() {
     eventually("queued", queued(1)).await;
 
     // RQ1b: B mapped to a connection that cannot receive; re-queued.
-    let (_client, rx) = test_support::proven_bare(&state, &b, None);
+    let (client, rx) = test_support::proven_bare(&state, &b, None);
     drop(rx);
+    // A foreground connection (it has asked): with records already waiting
+    // in B's queue, a connection that has not asked would get the packet
+    // filed behind them instead of handed over (Task 8 review L2).
+    state.connections.get_mut(&client).unwrap().has_asked = true;
     wa.send(send_a(b"RQ5-REQUEUE")).await.unwrap();
     eventually("re-queued", queued(2)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -690,6 +704,8 @@ async fn offline_queue_with_hostile_message_ids_does_not_panic_or_leak() {
                 has_asked: false,
                 blind_ask_bucket: None,
                 peer_bundle: None,
+                held: None,
+                media: None,
                 protocol_version: if proof_ready {
                     crate::protocol::PROTOCOL_VERSION
                 } else {
@@ -860,6 +876,7 @@ const SCANNED: &[&str] = &[
     "src/signaling/circuits.rs",
     "src/signaling/key_auth.rs",
     "src/signaling/tags.rs",
+    "src/signaling/media.rs",
     "src/protocol/relay.rs",
     "src/protocol/unified.rs",
     "src/tls.rs",
@@ -959,6 +976,8 @@ const IDENTITY_MARKERS: &[&str] = &[
     "pair_tag(",
     "IdTag",
     "PairTag",
+    "MediaTag",
+    "media_tag(",
     "asker_tag",
     "target_tag",
     "caller_tag",
@@ -1216,4 +1235,58 @@ async fn websocket_path_is_never_logged() {
         "the WebSocket path was logged:\n{logs}"
     );
     assert!(!logs.contains("rchat://"), "{logs}");
+}
+
+/// Android calls §5: a whole call (grants, joins, forwarding, a peer gone,
+/// a refused join, expiry) logs no identifier, no token and no two
+/// identity-derived values on one line.
+#[tokio::test]
+async fn calls_log_no_identifiers_or_tokens() {
+    let capture = capture_trace(tracing::Level::TRACE);
+    let (addr, state) = start(test_config()).await;
+    let (a, b) = (TestIdentity::random(), TestIdentity::random());
+    let (mut wa, mut wb, ca, cb) = super::test_support::pair_up(&state, addr, &a, &b).await;
+    let token = [0x77; 32];
+    wa.send(super::test_support::grant_message(ca.circuit_id, token))
+        .await
+        .unwrap();
+    wb.send(super::test_support::grant_message(cb.circuit_id, token))
+        .await
+        .unwrap();
+    eventually("usable", || state.media.is_usable(&token)).await;
+    let mut l0 = super::test_support::joined(&state, addr, token, 0, 0).await;
+    let mut l1 = super::test_support::joined(&state, addr, token, 0, 1).await;
+    l0.send(super::test_support::media_frame(1, 60))
+        .await
+        .unwrap();
+    let _ = super::test_support::next_media(&mut l1, Duration::from_secs(2)).await;
+    drop(l1);
+    let mut bad = super::test_support::call_connection(addr).await;
+    bad.send(super::test_support::join_message([0x78; 32], 0, 0))
+        .await
+        .unwrap();
+    let _ = super::test_support::closed_within(&mut bad, Duration::from_secs(2)).await;
+    let _ = super::test_support::closed_within(&mut l0, Duration::from_millis(200)).await;
+    media::sweep(Instant::now() + Duration::from_secs(120), &state);
+    let logs = capture.text();
+    // The capture is wired to this run: the call's own trace lines are in it,
+    // so the absence checks below cannot pass on an empty capture.
+    for line in ["Media token usable", "Call connection joined"] {
+        assert!(logs.contains(line), "capture missed {line:?}:\n{logs}");
+    }
+    super::circuits::assert_r6(&logs, &identity_needles(&[a.clone(), b.clone()]));
+    for needle in [
+        hex::encode(token),
+        hex::encode([0x78; 32]),
+        a.hex.clone(),
+        b.hex.clone(),
+    ] {
+        assert!(
+            !logs.to_lowercase().contains(&needle),
+            "log carries {needle}"
+        );
+    }
+    for id in [ca.circuit_id, cb.circuit_id] {
+        assert!(!logs.contains(&hex::encode(id.0)), "raw circuit id in logs");
+    }
 }

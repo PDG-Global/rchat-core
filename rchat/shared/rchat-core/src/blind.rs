@@ -9,8 +9,9 @@
 //!   that circuit: identity circuits before their first blind epoch); after
 //!   a pinned contact's fresh, first-seen knock (the peer is on the identity
 //!   path); and the timed identity fallback (R20): one identity ask, at most
-//!   once per pair per `IDENTITY_FALLBACK_INTERVAL_SECS`, once the pair has
-//!   asked blind unmatched for `IDENTITY_FALLBACK_AFTER_SECS`. If that ask
+//!   once per `IDENTITY_FALLBACK_AFTER_SECS` of unmatched blind asking (its
+//!   clock restarts with the ask), and not within
+//!   `IDENTITY_FALLBACK_INTERVAL_SECS` of a completed identity re-pair. If that ask
 //!   runs out unmatched, or the connection goes, the pair goes back to
 //!   blind. So does a knock-driven identity ask (final review H-1), unless
 //!   the knock declared that the contact holds no session with us; then,
@@ -80,8 +81,12 @@ pub const MAX_HELD_BLIND_ASKS: usize = 4;
 /// due (R20, §C.4).
 pub const IDENTITY_FALLBACK_AFTER_SECS: u64 = 24 * 3600;
 
-/// At most one identity fallback ask per pair in this long (R20): a relay
-/// can force at most one target-naming ask per pair per day.
+/// A completed identity re-pair with a contact (a verified identity install
+/// that replaced a session holding a pair secret) shuts the pair's identity
+/// re-pairs for this long (R20, ruling 2026-10-19): a relay can force at most
+/// one completed identity re-pair, and one `SessionReplaced`, per pair per
+/// day. An unanswered ask spends nothing; the timed fallback is paced by its
+/// own clock (`blind_since_unix`, restarted whenever a fallback ask is sent).
 pub const IDENTITY_FALLBACK_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Where a session's secret came from. Carried explicitly from the ask the
@@ -534,8 +539,10 @@ impl ClientInner {
     }
 
     /// The identity fallback is due for the peer (R20): unmatched blind
-    /// asking for `IDENTITY_FALLBACK_AFTER_SECS`, and no fallback ask in the
-    /// last `IDENTITY_FALLBACK_INTERVAL_SECS`.
+    /// asking for `IDENTITY_FALLBACK_AFTER_SECS` (the clock restarts each
+    /// time a fallback ask is sent, runs out or is lost, so the timed
+    /// fallback comes at most once a day), and no identity re-pair
+    /// completed in the last `IDENTITY_FALLBACK_INTERVAL_SECS`.
     fn identity_fallback_due(&self, peer_hex: &str, now_unix: u64) -> bool {
         self.session_manager.get(peer_hex).is_some_and(|s| {
             s.blind_since_unix
@@ -669,8 +676,10 @@ impl ClientInner {
                 continue;
             }
             if self.identity_fallback_due(&peer, now_unix) {
+                // The next timed fallback waits a full day from this ask,
+                // whether it runs out, matches or goes with the connection.
                 if let Some(mut s) = self.session_manager.get_mut(&peer) {
-                    s.last_identity_fallback_unix = Some(now_unix);
+                    s.blind_since_unix = Some(now_unix);
                 }
                 let _ = self.persist_peer(&peer);
                 self.identity_fallback.insert(peer.clone(), (now, epoch));
@@ -974,6 +983,7 @@ impl ClientInner {
         self.spent_blind_asks.retain(|_, s| s.peer != peer_hex);
         self.seen_knocks.remove(peer_hex);
         self.knock_acted.remove(peer_hex);
+        self.knock_answered.remove(peer_hex);
     }
 
     /// A `CircuitCreatedV3` consumed our ask `my_ek` to `peer_hex`. For a

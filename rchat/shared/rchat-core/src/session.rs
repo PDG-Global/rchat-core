@@ -101,9 +101,11 @@ pub struct ChatSession {
     /// `IDENTITY_FALLBACK_AFTER_SECS` old. A new session starts with none.
     /// Persisted.
     pub blind_since_unix: Option<u64>,
-    /// Unix time of the last identity fallback ask to the peer (R20: at
-    /// most one per `IDENTITY_FALLBACK_INTERVAL_SECS`), carried from session
-    /// to session. Persisted.
+    /// Unix time the last identity re-pair with the peer completed (a
+    /// verified identity install that replaced a session holding a pair
+    /// secret; not first contact, not an ask sent): an identity re-pair is
+    /// not answered again within `IDENTITY_FALLBACK_INTERVAL_SECS` (R20,
+    /// ruling 2026-10-19). Carried from session to session. Persisted.
     pub last_identity_fallback_unix: Option<u64>,
 }
 

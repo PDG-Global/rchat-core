@@ -573,6 +573,7 @@ impl ClientInner {
         self.hello_sync_due.remove(peer_hex);
         self.auto_resends.remove(peer_hex);
         self.unanswered_asks.remove(peer_hex);
+        self.ask_refresh.remove(peer_hex);
         self.reowes.retain(|(p, _), _| p != peer_hex);
         self.peers_dirty.remove(peer_hex);
         self.decrypt_failed_this_tick.remove(peer_hex);
@@ -625,6 +626,7 @@ impl ClientInner {
         self.retrying_held = false;
         self.auto_resends.clear();
         self.unanswered_asks.clear();
+        self.ask_refresh.clear();
         self.reowes.clear();
         self.meta_dirty = false;
         self.peers_dirty.clear();

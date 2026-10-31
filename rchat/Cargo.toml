@@ -1,11 +1,11 @@
 [package]
 name = "rchat-server"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["RChat Team"]
 description = "Secure end-to-end encrypted chat server"
 license = "AGPL-3.0-or-later"
-rust-version = "1.75"
+rust-version = "1.88"
 
 [dependencies]
 # Async runtime
@@ -152,6 +152,10 @@ test-mitm = []
 # changes; scripts/test-e2ee-complete.sh E22/E23). The relay does not use
 # them. NEVER in a build that serves users or in the app.
 e2e-hooks = ["rchat-core/test-hooks"]
+# Voice-call end-to-end runs only (android/scripts/e2e-calls.sh): the core's
+# libopus (`calls-codec`, D32) for test-ios-companion. Needs CMake. NEVER in
+# a build that serves users: the relay itself has no codec.
+calls-companion = ["rchat-core/calls-codec"]
 
 [dev-dependencies]
 # Tests only: a TLS 1.2-capable client, used to prove the server refuses 1.2,
@@ -159,8 +163,10 @@ e2e-hooks = ["rchat-core/test-hooks"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.13"
 # Tests only: the core's test hook that trusts the test relay's certificate
-# (no process-wide SSL_CERT_FILE in a multithreaded test binary).
-rchat-core = { path = "shared/rchat-core", default-features = false, features = ["test-hooks"] }
+# (no process-wide SSL_CERT_FILE in a multithreaded test binary), and real
+# Opus for the call network simulator (Android calls D28, D32). The relay's
+# own dependency has neither, so its release build stays CMake-free.
+rchat-core = { path = "shared/rchat-core", default-features = false, features = ["test-hooks", "calls-codec"] }
 # Tests only: a client that tries 0-RTT, to prove the relay never accepts it.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "early-data"] }
 # Paused-clock tests for the ACME retry floor.

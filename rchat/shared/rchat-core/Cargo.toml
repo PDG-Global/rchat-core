@@ -1,11 +1,11 @@
 [package]
 name = "rchat-core"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [lib]
-crate-type = ["lib", "staticlib"]
+crate-type = ["lib", "staticlib", "cdylib"]
 name = "rchat_core"
 
 [[bin]]
@@ -32,6 +32,15 @@ test-hooks = []
 # Debug): exports `rchat_parse_relay_invite_dev`, which also accepts a ws://
 # invite to this device. A release library must not export it (Part J).
 dev-invite = []
+# Debug Android libraries only (android/build_rust.sh): connection and pairing
+# diagnostics to logcat, URLs and paths redacted (src/android_log.rs).
+dev-log = []
+# Voice calls' codec (D32): libopus through opus-codec, built with CMake.
+# The app libraries turn it on (android/build_rust.sh,
+# ios/build_rust.sh), and so do the relay's dev-dependency (the call
+# network simulator) and its `calls-companion` feature (test-ios-companion
+# for the end-to-end run). The relay's own build never does.
+calls-codec = ["dep:opus-codec"]
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli", "tokio"], optional = true }
@@ -47,6 +56,8 @@ once_cell = "1.19"
 dashmap = "6.0"
 parking_lot = "0.12"
 socket2 = "0.5"
+# setsockopt for TCP_NOTSENT_LOWAT on call connections (transport.rs).
+libc = "0.2"
 tracing = "0.1"
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
@@ -64,6 +75,14 @@ zeroize = "1.7"
 # ML-KEM-768 (FIPS 203) for the v3 hybrid handshake. Pinned exactly; `deterministic`
 # provides FIPS 203 KeyGen_internal(d, z) for seeded keys (spec §A.1).
 ml-kem = { version = "=0.2.3", features = ["zeroize", "deterministic"] }
+# Opus for voice calls (Android calls spec §6, owner decision 2026-10-26):
+# libopus 1.6.1 bundled and built with CMake, behind `call::codec::Codec`
+# so the codec can be swapped later. Pinned exactly; DRED stays off (no
+# `dred` feature). Optional (D32): only the `calls-codec` feature builds it,
+# so the relay, which depends on this crate, stays CMake-free. Needs cmake
+# on the build host; `src/bindings.rs` ships pre-generated, so bindgen
+# never runs. Edition 2024, within the crate's Rust 1.88 minimum.
+opus-codec = { version = "=0.2.0", default-features = false, optional = true }
 uuid = { version = "1.0", features = ["v4"] }
 log = "0.4"
 boring = "5.1.0"
@@ -72,6 +91,20 @@ boring = "5.1.0"
 boring-sys = "5.1.0"
 foreign-types = "0.5"
 tokio-boring = "5.0.0"
+
+# Android: the JNI layer (`src/jni.rs`), as rVPN's.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+jni-sys = "0.3"
+libc = "0.2"
+
+# Host tests and clippy compile the JNI layer too, so its exports are
+# type-checked off-device.
+[dev-dependencies]
+jni = "0.21"
+jni-sys = "0.3"
+# Virtual time for the connect and DNS timeout tests.
+tokio = { version = "1.0", features = ["test-util"] }
 
 # Platform-specific dependencies for blake3
 # iOS: Use pure Rust implementation (no NEON assembly due to ___chkstk_darwin issue)

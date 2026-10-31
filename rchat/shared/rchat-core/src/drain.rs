@@ -283,6 +283,7 @@ impl ClientInner {
             // queued messages all wait for the next foreground connection.
             return false;
         }
+        self.call_tick(now, crate::call::unix_ms());
         self.fire_due_reasks(now);
         self.fire_due_receipts(now);
         self.fire_cover(now);

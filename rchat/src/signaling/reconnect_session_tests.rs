@@ -81,6 +81,14 @@ extern "C" fn on_rotated(
 }
 extern "C" fn on_status(_: c_int, _: *const c_char, _: *const c_char, _: c_int) {}
 extern "C" fn on_timer(_: *const c_char, _: u32, _: u64, _: c_int) {}
+extern "C" fn on_file_blocked(
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: u32,
+    _: u64,
+) {
+}
 #[allow(clippy::too_many_arguments)]
 extern "C" fn on_file(
     _: *const c_char,
@@ -145,6 +153,7 @@ fn sessions_survive_a_transport_only_disconnect_and_reconnect() {
             Some(on_status),
             Some(on_file),
             Some(on_timer),
+            Some(on_file_blocked),
         ),
         0
     );

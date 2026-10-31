@@ -193,6 +193,70 @@ impl AskBucket {
     }
 }
 
+/// Android calls §5: each call connection may send at most 64 kbps.
+pub const MEDIA_RATE_BYTES_PER_SEC: u64 = 8_000;
+/// The media bucket's burst: 16 KiB.
+pub const MEDIA_BURST_BYTES: u64 = 16 * 1024;
+/// D7: a call connection whose outbound queue already holds this much is
+/// "full"; a media frame for it is dropped, never queued behind.
+pub const MEDIA_QUEUED_MAX_BYTES: usize = 4 * 1024;
+
+/// Android video calls: each video call connection (lanes 2 and 3) may send
+/// at most about 4 Mbps.
+pub const VIDEO_RATE_BYTES_PER_SEC: u64 = 500_000;
+/// The video bucket's burst: 256 KiB.
+pub const VIDEO_BURST_BYTES: u64 = 256 * 1024;
+/// A video call connection whose outbound queue already holds this much is
+/// "full"; a video frame for it is dropped, never queued behind.
+pub const VIDEO_QUEUED_MAX_BYTES: usize = 256 * 1024;
+/// A relayed video frame still waiting in the target's queue this long
+/// after it arrived is dropped, not written: by then the receiver has moved
+/// on (it waits for a keyframe), and a late frame only competes with audio.
+pub const VIDEO_MAX_QUEUED_AGE: Duration = Duration::from_millis(500);
+
+/// A call connection's token bucket (64 kbps on audio lanes, about 4 Mbps on
+/// video lanes): a frame is forwarded only if the whole frame fits now
+/// (never negative, unlike `TokenBucket`); one that does not is dropped and
+/// counted.
+#[derive(Debug)]
+pub struct MediaBucket {
+    tokens: f64,
+    last: Instant,
+    per_sec: f64,
+    burst: f64,
+}
+
+impl MediaBucket {
+    pub fn audio_at(now: Instant) -> Self {
+        Self::with(MEDIA_RATE_BYTES_PER_SEC, MEDIA_BURST_BYTES, now)
+    }
+
+    pub fn video_at(now: Instant) -> Self {
+        Self::with(VIDEO_RATE_BYTES_PER_SEC, VIDEO_BURST_BYTES, now)
+    }
+
+    fn with(per_sec: u64, burst: u64, now: Instant) -> Self {
+        Self {
+            tokens: burst as f64,
+            last: now,
+            per_sec: per_sec as f64,
+            burst: burst as f64,
+        }
+    }
+
+    pub fn try_take_at(&mut self, bytes: usize, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = self.last.max(now);
+        self.tokens = (self.tokens + elapsed * self.per_sec).min(self.burst);
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Signature-work budget
 // ---------------------------------------------------------------------------
@@ -807,9 +871,17 @@ pub struct OutboundPermit {
     /// stored, so a record re-queued after a failed hand-over keeps its
     /// TTL (security review L-2). None for live frames.
     enqueued_at: Option<u64>,
+    /// For a relayed video frame: past this, it is too old to be worth
+    /// writing and the writer drops it (`VIDEO_MAX_QUEUED_AGE`).
+    stale_after: Option<Instant>,
 }
 
 impl OutboundPermit {
+    /// The message waited past its age cap (video media only).
+    pub fn is_stale(&self, now: Instant) -> bool {
+        self.stale_after.is_some_and(|t| now > t)
+    }
+
     /// When the record this permit belongs to was first stored, if it
     /// came from the offline queue.
     pub fn enqueued_at(&self) -> Option<u64> {
@@ -942,6 +1014,7 @@ impl ConnTx {
             _conn: conn,
             _global: global,
             enqueued_at: None,
+            stale_after: None,
         };
         match self.tx.try_send((msg, permit)) {
             Ok(()) => Ok(()),
@@ -1019,6 +1092,7 @@ impl ConnTx {
                 _conn: conn,
                 _global: global,
                 enqueued_at,
+                stale_after: None,
             };
             match tokio::time::timeout_at(deadline, self.tx.send((msg, permit))).await {
                 Ok(Ok(())) => Ok(()),
@@ -1042,6 +1116,14 @@ impl ConnTx {
     /// the knock instead, and the asker's read loop never waits on the
     /// target (spec §6.2, L7).
     pub fn try_send_or_return(&self, msg: Message) -> Result<(), Message> {
+        self.try_send_or_return_within(msg, None)
+    }
+
+    fn try_send_or_return_within(
+        &self,
+        msg: Message,
+        stale_after: Option<Instant>,
+    ) -> Result<(), Message> {
         if self.kill.is_cancelled() {
             return Err(msg);
         }
@@ -1057,6 +1139,7 @@ impl ConnTx {
             _conn: conn,
             _global: global,
             enqueued_at: None,
+            stale_after,
         };
         self.tx.try_send((msg, permit)).map_err(|e| match e {
             mpsc::error::TrySendError::Full((msg, _))
@@ -1064,9 +1147,94 @@ impl ConnTx {
         })
     }
 
+    /// A media frame (Android calls §5, D7): queued only while this
+    /// connection holds no more than `max_queued` bytes with it
+    /// (`MEDIA_QUEUED_MAX_BYTES` for audio, `VIDEO_QUEUED_MAX_BYTES` for
+    /// video), otherwise it comes back to be dropped. Never waits, never
+    /// disconnects anyone. With `max_age`, the writer drops the frame if it
+    /// is still waiting that long after now (video: a late frame is useless).
+    pub fn try_send_media(
+        &self,
+        msg: Message,
+        max_queued: usize,
+        max_age: Option<Duration>,
+    ) -> Result<(), Message> {
+        let queued = OUTBOUND_QUEUE_MAX_BYTES.saturating_sub(self.bytes.available_permits());
+        if queued + Self::cost(&msg) as usize > max_queued {
+            return Err(msg);
+        }
+        let stale_after = max_age.map(|a| Instant::now() + a);
+        self.try_send_or_return_within(msg, stale_after)
+    }
+
     /// Ask the connection to close.
     pub fn kill(&self) {
         self.kill.cancel();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Held-copy budget (Task 8 B, review M2)
+// ---------------------------------------------------------------------------
+
+/// Default bytes of held copies one connection may keep (Task 8 B): one
+/// message of the default `max_message_bytes`.
+pub const HELD_COPY_MAX_BYTES_PER_CONNECTION: usize = 4 << 20;
+/// Default bytes of held copies all connections together may keep.
+pub const HELD_COPY_MAX_TOTAL_BYTES: usize = 64 << 20;
+/// Most held copies one connection may keep, whatever their size.
+pub const HELD_COPY_MAX_PER_CONNECTION: usize = 1000;
+
+/// The relay-wide byte budget of held copies: separate from the offline
+/// store's (`OfflineBudget`), so held copies never crowd out messages
+/// waiting for offline recipients, nor those the copies (review M2).
+pub struct HeldBudget {
+    used: AtomicUsize,
+    max_total: usize,
+    max_per_connection: usize,
+}
+
+impl HeldBudget {
+    pub fn new(max_total: usize, max_per_connection: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            max_total,
+            max_per_connection,
+        }
+    }
+
+    pub fn max_per_connection(&self) -> usize {
+        self.max_per_connection
+    }
+
+    /// Bytes not held by any connection now.
+    pub fn free(&self) -> usize {
+        self.max_total
+            .saturating_sub(self.used.load(Ordering::Acquire))
+    }
+
+    /// Reserve `cost` bytes relay-wide, if they fit.
+    pub fn try_add(&self, cost: usize) -> bool {
+        let max = self.max_total;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let next = used.checked_add(cost)?;
+                (next <= max).then_some(next)
+            })
+            .is_ok()
+    }
+
+    pub fn release(&self, cost: usize) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(cost))
+            });
+    }
+
+    #[cfg(test)]
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
     }
 }
 
@@ -1164,6 +1332,72 @@ impl OfflineBudget {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn media_bucket_is_64_kbps_with_a_16_kib_burst() {
+        let t0 = Instant::now();
+        let mut b = MediaBucket::audio_at(t0);
+        // The burst: 16 KiB at once, then nothing.
+        assert!(b.try_take_at(16 * 1024, t0));
+        assert!(!b.try_take_at(1, t0));
+        // One second later: 8000 bytes, not 8001.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(!b.try_take_at(8001, t1));
+        assert!(b.try_take_at(8000, t1));
+        // A refused frame takes nothing.
+        let t2 = t1 + Duration::from_millis(100);
+        assert!(!b.try_take_at(900, t2));
+        assert!(b.try_take_at(800, t2));
+    }
+
+    #[test]
+    fn video_bucket_is_4_mbps_with_a_256_kib_burst() {
+        let t0 = Instant::now();
+        let mut b = MediaBucket::video_at(t0);
+        assert!(b.try_take_at(256 * 1024, t0));
+        assert!(!b.try_take_at(1, t0));
+        // A quarter second later: 125_000 bytes, not 125_001.
+        let t1 = t0 + Duration::from_millis(250);
+        assert!(!b.try_take_at(125_001, t1));
+        assert!(b.try_take_at(125_000, t1));
+        // Refill never exceeds the burst.
+        let t2 = t1 + Duration::from_secs(60);
+        assert!(!b.try_take_at(256 * 1024 + 1, t2));
+        assert!(b.try_take_at(256 * 1024, t2));
+    }
+
+    #[test]
+    fn try_send_media_honours_the_cap_it_is_given() {
+        let (tx, _rx, _kill) = ConnTx::channel();
+        let frame = || Message::Binary(vec![0x05; 1000]);
+        assert!(tx.try_send_media(frame(), 1000, None).is_ok());
+        assert!(tx.try_send_media(frame(), 1000, None).is_err());
+        assert!(tx.try_send_media(frame(), 2000, None).is_ok());
+        assert!(tx.try_send_media(frame(), 2000, None).is_err());
+        assert!(!tx.is_closed());
+    }
+
+    /// A video frame queued with an age cap is stale once the cap has
+    /// passed (the writer then drops it); audio frames and other messages
+    /// never are.
+    #[tokio::test]
+    async fn a_media_frame_with_an_age_cap_goes_stale() {
+        let (tx, mut rx, _kill) = ConnTx::channel();
+        let frame = || Message::Binary(vec![0x05; 100]);
+        tx.try_send_media(frame(), 1 << 20, Some(Duration::from_millis(30)))
+            .unwrap();
+        tx.try_send_media(frame(), 1 << 20, None).unwrap();
+        tx.try_send_or_return(frame()).unwrap();
+        let (_, video) = rx.recv().await.unwrap();
+        let (_, audio) = rx.recv().await.unwrap();
+        let (_, other) = rx.recv().await.unwrap();
+        let now = Instant::now();
+        assert!(!video.is_stale(now));
+        let later = now + Duration::from_millis(40);
+        assert!(video.is_stale(later));
+        assert!(!audio.is_stale(later + Duration::from_secs(60)));
+        assert!(!other.is_stale(later + Duration::from_secs(60)));
+    }
 
     // ---- relay-wide outbound budget (R-17) ----
 

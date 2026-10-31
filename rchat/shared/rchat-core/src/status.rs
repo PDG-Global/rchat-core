@@ -45,6 +45,8 @@ pub enum StatusEvent {
         peer: String,
         message_id: String,
     },
+    /// Call events are waiting: read them with `rchat_call_poll_event` (D19).
+    CallEvents,
 }
 
 impl StatusEvent {
@@ -78,6 +80,7 @@ impl StatusEvent {
             StatePersistFailed { peer } => (8, peer.clone().unwrap_or_default(), String::new(), 0),
             StateRestoreFailed { reason } => (9, String::new(), String::new(), i32::from(*reason)),
             ResendEligible { peer, message_id } => (10, peer.clone(), message_id.clone(), 0),
+            CallEvents => (11, String::new(), String::new(), 0),
         }
     }
 }

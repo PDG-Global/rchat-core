@@ -477,11 +477,125 @@ mod flow {
         assert_eq!(queued, vec![ids[0]], "a dropped file is never receipted");
     }
 
+    fn blocked(log: &std::sync::Mutex<Vec<Ev>>) -> Vec<crate::BlockedFile> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Ev::FileBlocked(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// File safety §3 (Review Focus 4): a blocked 0x07 never reaches the
+    /// file or message callback; the app gets `on_file_blocked` (cleaned
+    /// name, timer, time; no bytes) and the core queues the delivered
+    /// receipt itself, so the sender never retries (Decision 2).
+    #[test]
+    fn a_blocked_file_is_reported_wiped_and_receipted() {
+        let mut p = establish(0xA1, 0xB2);
+        p.b.receipt_delay_override = Some(Duration::from_secs(60));
+        let pe = encode_file(
+            "../invoice.pdf",
+            "application/pdf",
+            b"MZ\x90\x00\x03\x00\x00\x00",
+            300,
+        )
+        .unwrap();
+        let by_name = encode_file("photo.APK", "", b"harmless", 0).unwrap();
+        let ids = [[0x35u8; 16], [0x36; 16]];
+        for (id, pt) in ids.iter().zip([&pe, &by_name]) {
+            let msg = p.a.seal_ratchet(&p.pb.hex, *id, pt).unwrap();
+            p.b.handle_sealed_payload(&msg.payload);
+        }
+        assert!(files(&p.b_log).is_empty(), "never the file callback");
+        assert_eq!(messages(&p.b_log), 0, "never the message callback");
+        let got = blocked(&p.b_log);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].sender_identity, p.pa.hex);
+        assert_eq!(got[0].id, hex::encode(ids[0]));
+        assert_eq!(got[0].name, "_invoice.pdf", "the cleaned name");
+        assert_eq!(got[0].expire_secs, 300);
+        assert!(got[0].timestamp_ms > 0);
+        assert_eq!(got[1].name, "photo.APK");
+        let queued =
+            p.b.pending_receipts
+                .get(&(p.pa.hex.clone(), crate::receipts::DELIVERED))
+                .cloned()
+                .unwrap_or_default();
+        assert_eq!(queued, ids.to_vec(), "receipted by the core, no app step");
+        assert!(
+            p.b.peers.is_seen(&p.pa.hex, &ids[0]),
+            "a replay is receipted, not reported"
+        );
+        let msg = p.a.seal_ratchet(&p.pb.hex, [0x39; 16], &pe).unwrap();
+        p.b.handle_sealed_payload(&msg.payload);
+        p.b.handle_sealed_payload(&msg.payload);
+        assert_eq!(
+            blocked(&p.b_log).len(),
+            3,
+            "the same sealed file twice is reported once"
+        );
+        assert!(files(&p.b_log).is_empty() && messages(&p.b_log) == 0);
+    }
+
+    /// With no app attached a blocked file is still receipted.
+    #[test]
+    fn a_blocked_file_without_an_app_is_receipted() {
+        let mut p = establish(0xA1, 0xB2);
+        p.b.receipt_delay_override = Some(Duration::from_secs(60));
+        p.b.callbacks = None;
+        let pt = encode_file("run.sh", "", b"echo hi", 0).unwrap();
+        let id = [0x37u8; 16];
+        let msg = p.a.seal_ratchet(&p.pb.hex, id, &pt).unwrap();
+        p.b.handle_sealed_payload(&msg.payload);
+        let queued =
+            p.b.pending_receipts
+                .get(&(p.pa.hex.clone(), crate::receipts::DELIVERED))
+                .cloned()
+                .unwrap_or_default();
+        assert_eq!(queued, vec![id]);
+    }
+
+    /// The receipt reaches the sender's receipt callback: Delivered, and
+    /// exactly once (a later flush or a replay sends no second one, and
+    /// the app's own `mark_message_seen` is never needed).
+    #[test]
+    fn a_blocked_files_receipt_reaches_the_sender() {
+        let mut p = establish(0xA1, 0xB2);
+        let pt = encode_file("x.exe", "", b"MZ", 0).unwrap();
+        let id = [0x38u8; 16];
+        let packet = p.a.seal_ratchet(&p.pb.hex, id, &pt).unwrap();
+        p.a.send_now(packet.encode_with_frame_type()).unwrap();
+        relay_all(&mut p.a_rx, &mut p.b);
+        p.b.fire_due_receipts(Instant::now() + Duration::from_secs(3));
+        assert_eq!(relay_all(&mut p.b_rx, &mut p.a), 1);
+        let receipt = Ev::Receipt(
+            p.pb.hex.clone(),
+            hex::encode(id),
+            crate::receipts::DELIVERED,
+        );
+        assert!(p.a_log.lock().unwrap().contains(&receipt));
+        p.b.fire_due_receipts(Instant::now() + Duration::from_secs(60));
+        assert_eq!(relay_all(&mut p.b_rx, &mut p.a), 0, "nothing more to send");
+        let count = p
+            .a_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == receipt)
+            .count();
+        assert_eq!(count, 1, "the receipt goes out exactly once");
+        assert_eq!(blocked(&p.b_log).len(), 1);
+        assert!(files(&p.b_log).is_empty());
+    }
+
     /// The same sealed file twice (a relay replay) is delivered once.
     #[test]
     fn a_replayed_file_is_delivered_once() {
         let mut p = establish(0xA1, 0xB2);
-        let pt = encode_file("a.bin", "", &[1, 2, 3], 0).unwrap();
+        let pt = encode_file("a.dat", "", &[1, 2, 3], 0).unwrap();
         let msg = p.a.seal_ratchet(&p.pb.hex, [0x41; 16], &pt).unwrap();
         p.b.handle_sealed_payload(&msg.payload);
         p.b.handle_sealed_payload(&msg.payload);
@@ -658,6 +772,78 @@ fn client_send_file_checks_before_sending() {
     ));
 }
 
+/// File safety §3: every send path refuses a blocked file (`FileBlocked`,
+/// FFI code 30) after the MIME and size checks and before the connection
+/// check (Decision 4).
+#[test]
+fn client_refuses_a_blocked_file() {
+    use crate::{ClientConfig, RChatClient, RChatError};
+    const PEER: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
+    const PEER_AK: &str = "0100000000000000000000000000000000000000000000000000000000000001";
+    let client = RChatClient::new(ClientConfig::default()).unwrap();
+    client
+        .pin_peer_key(PEER.into(), PEER_AK.into(), None)
+        .unwrap();
+    let blocked = |r: Result<String, RChatError>| matches!(r, Err(RChatError::FileBlocked { .. }));
+    assert!(blocked(client.send_file_message(
+        PEER.into(),
+        "setup.exe".into(),
+        "".into(),
+        vec![1]
+    )));
+    assert!(blocked(client.send_file_message(
+        PEER.into(),
+        "notes.txt".into(),
+        "".into(),
+        b"#!/bin/sh".to_vec()
+    )));
+    let id = "ab".repeat(16);
+    assert!(blocked(client.send_file_message_using_id(
+        PEER.into(),
+        "x.apk".into(),
+        "".into(),
+        vec![1],
+        id.clone()
+    )));
+    assert!(blocked(client.retry_file_message_using_id(
+        PEER.into(),
+        "x.apk".into(),
+        "".into(),
+        vec![1],
+        0,
+        id.clone()
+    )));
+    assert!(blocked(client.resend_file_message_using_id(
+        PEER.into(),
+        "x.apk".into(),
+        "".into(),
+        vec![1],
+        0,
+        id
+    )));
+    assert!(
+        matches!(
+            client.send_file_message(
+                PEER.into(),
+                "x.exe".into(),
+                "".into(),
+                vec![0; MAX_FILE_PLAINTEXT]
+            ),
+            Err(RChatError::FileTooLarge { .. })
+        ),
+        "the size comes first"
+    );
+    assert!(matches!(
+        client.send_file_message(
+            PEER.into(),
+            "notes.txt".into(),
+            "".into(),
+            b"hello".to_vec()
+        ),
+        Err(RChatError::NotConnected)
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // R30 M-4: every plaintext copy on the file paths is wiped before it is
 // freed (`alloc_probe`)
@@ -674,7 +860,10 @@ mod wipes {
 
     /// A file body holding `n` (twice, so any slice copy holds it whole).
     fn body_with(n: &[u8; 32]) -> Vec<u8> {
-        let mut b = Vec::with_capacity(66);
+        // A fixed first byte: a random start could read as `MZ` or `#!`
+        // and be blocked before the path under test runs.
+        let mut b = Vec::with_capacity(67);
+        b.push(b'.');
         b.extend_from_slice(n);
         b.extend_from_slice(b"--");
         b.extend_from_slice(n);
@@ -704,6 +893,43 @@ mod wipes {
         let pt = encode_file("a", "", &body_with(&n), 0).unwrap();
         let msg = p.a.seal_ratchet(&p.pb.hex, [0x62; 16], &pt).unwrap();
         let hits = freed_containing(n, || p.b.handle_sealed_payload(&msg.payload));
+        assert_eq!(hits, 0);
+    }
+
+    /// A blocked file's bytes are wiped, never just freed.
+    #[test]
+    fn a_blocked_file_is_wiped() {
+        let mut p = establish(0xA1, 0xB2);
+        let n = needle();
+        let mut body = b"MZ".to_vec();
+        body.extend_from_slice(&body_with(&n));
+        let pt = encode_file("a.txt", "", &body, 0).unwrap();
+        let msg = p.a.seal_ratchet(&p.pb.hex, [0x64; 16], &pt).unwrap();
+        let hits = freed_containing(n, || p.b.handle_sealed_payload(&msg.payload));
+        assert_eq!(hits, 0);
+        assert_eq!(
+            p.b_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, Ev::FileBlocked(_)))
+                .count(),
+            1
+        );
+    }
+
+    /// A refused send wipes the encoded body it built (`file_body`).
+    #[test]
+    fn a_refused_send_wipes_its_body() {
+        use crate::{ClientConfig, RChatClient, RChatError};
+        let client = RChatClient::new(ClientConfig::default()).unwrap();
+        let n = needle();
+        let mut data = b"MZ".to_vec();
+        data.extend_from_slice(&body_with(&n));
+        let hits = freed_containing_any_thread(n, || {
+            let r = client.send_file_message("aa".repeat(32), "a.txt".into(), "".into(), data);
+            assert!(matches!(r, Err(RChatError::FileBlocked { category: 3 })));
+        });
         assert_eq!(hits, 0);
     }
 
@@ -1122,7 +1348,7 @@ mod same_id {
         let client = wrap(p.a);
         let sent = client.resend_file_message_using_id(
             peer_hex,
-            "a.bin".into(),
+            "a.dat".into(),
             "".into(),
             vec![1, 2, 3],
             0,
