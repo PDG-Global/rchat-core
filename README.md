@@ -9,7 +9,7 @@ This repository contains the relay (`rchat-server`) and the client library (`rch
 
 ## Architecture
 
-- **X3DH v2** key agreement, where both sides contribute ephemeral keys
+- **X3DH v3** key agreement — a post-quantum hybrid of X25519 and ML-KEM-768 (FIPS 203) — where both sides contribute ephemeral keys
 - **Double Ratchet** for continuous key rotation and forward secrecy
 - **XChaCha20-Poly1305** authenticated encryption
 - **Ed25519 / X25519** for signatures and key agreement
