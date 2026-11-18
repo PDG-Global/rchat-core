@@ -1,0 +1,30 @@
+name: installer-verify
+
+# Test vector for the installer trust chain. Guards the ssh-keygen -Y verify
+# mechanism over the signed aggregate manifest, the rollback-floor compare, and
+# the compiled-in trust-anchor / no-weaker-fallback invariants in install.sh.
+# Uses a throwaway test key (never the release key) and runs offline. The day
+# someone touches the allowed_signers pin, the namespace, the floor, or
+# reintroduces a per-artifact .sha256 fallback, this test says so.
+#
+# Runs on Ubuntu and macOS so both verifier environments are exercised. OpenSSH
+# (ssh-keygen -Y verify, >= 8.0) is preinstalled on both.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: installer-verify test vector
+        run: bash scripts/test-installer-verify.sh
