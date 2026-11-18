@@ -577,7 +577,7 @@ pub(crate) const HANDLER_SIGN: (&str, &str) = ("signWithDeviceKey", "([B)[B");
 pub(crate) const HANDLER_WRITE_STATE: (&str, &str) =
     ("writeStateRecord", "(Ljava/lang/String;[B)I");
 /// All three, for the parity test.
-#[cfg(test)]
+#[cfg(all(test, rchat_app_tree))]
 pub(crate) const HANDLER_METHODS: [(&str, &str); 3] =
     [HANDLER_ON_EVENT, HANDLER_SIGN, HANDLER_WRITE_STATE];
 
@@ -585,7 +585,7 @@ pub(crate) const HANDLER_METHODS: [(&str, &str); 3] =
 /// The parity test (`jni_parity_tests`) checks it against the exports,
 /// `ffi.rs` and `RChatCore.kt`; nothing else reads it, so it exists only in
 /// test builds.
-#[cfg(test)]
+#[cfg(all(test, rchat_app_tree))]
 pub(crate) const JNI_TO_FFI: &[(&str, &str)] = &[
     ("initialize", "rchat_initialize"),
     ("connectWithSeed", "rchat_connect_with_seed"),

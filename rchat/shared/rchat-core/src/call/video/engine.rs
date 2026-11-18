@@ -403,6 +403,9 @@ impl LaneSink for LaneEvents {
         let was = if up {
             self.lanes_up.fetch_add(1, Ordering::AcqRel)
         } else {
+            // MSRV 1.88: `try_update` (the non-deprecated name) is unstable
+            // there; keep `fetch_update` until the floor passes its stab.
+            #[allow(deprecated)]
             self.lanes_up
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                     Some(n.saturating_sub(1))

@@ -104,10 +104,7 @@ pub fn decode(pt: &[u8]) -> Option<Notice> {
     let n = Notice {
         flags: *flags,
         reason: *reason,
-        ids: ids
-            .chunks_exact(16)
-            .map(|c| c.try_into().expect("chunks of 16"))
-            .collect(),
+        ids: ids.as_chunks::<16>().0.to_vec(),
         sig,
     };
     encode(&n).map(|_| n)

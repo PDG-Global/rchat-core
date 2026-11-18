@@ -1234,7 +1234,9 @@ impl ClientInner {
         if self.in_drain() && frame.first() != Some(&protocol::FRAME_TYPE_SIGNALING) {
             return Err(RChatError::NotConnected);
         }
+        // MSRV 1.88: `try_update` (the non-deprecated name) is unstable there.
         #[cfg(test)]
+        #[allow(deprecated)]
         if self
             .refuse_sends_for_test
             .fetch_update(
