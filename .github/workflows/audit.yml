@@ -1,0 +1,33 @@
+name: Audit
+
+# cargo audit: weekly, plus any PR that changes either dependency lockfile.
+# The secret-scanning gate asks "did anyone commit a secret"; this asks
+# "does the lockfile still resolve to something with a known CVE". rChat has
+# two lockfiles — the relay's (rchat/Cargo.lock) and the client library's
+# (rchat/shared/rchat-core/Cargo.lock) — and both are audited.
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  pull_request:
+    paths:
+      - 'rchat/Cargo.lock'
+      - 'rchat/shared/rchat-core/Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --locked --version 0.23.0
+      - name: audit relay lockfile
+        run: cargo audit --file rchat/Cargo.lock
+      - name: audit core lockfile
+        run: cargo audit --file rchat/shared/rchat-core/Cargo.lock

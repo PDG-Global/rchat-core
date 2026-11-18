@@ -1,0 +1,58 @@
+name: gitleaks
+
+# Secret scanning in two shapes:
+#
+#   scan          — the required check on PRs. Scans only the PR's own
+#                   commits (base..head), so a PR can never add a secret,
+#                   and findings in old history cannot block new work.
+#   scan-history  — a nightly full-history scan over every commit ever
+#                   pushed. Known false positives are listed in
+#                   .gitleaksignore at the repo root, one fingerprint per
+#                   line, each with the reason it is not a secret.
+#
+# Runs with `pull_request` (never `pull_request_target`), so PRs from
+# outside forks execute with no secrets. No GITLEAKS_LICENSE: the CLI is
+# invoked directly rather than via gitleaks-action, whose org license
+# gate we don't need. Ported from rvpn-core's gitleaks workflow; the image
+# is pinned to the same version by registry digest (A1): a Docker tag is
+# mutable, so the tag alone is not a pin. Digest = the OCI index digest
+# registry-1.docker.io serves for v8.24.3 (Docker-Content-Digest),
+# cross-checked against the Docker Hub tag API, 2026-11-18.
+
+on:
+  pull_request:
+  schedule:
+    - cron: '43 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (PR commits, base..head)
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          zricethezav/gitleaks:v8.24.3@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+          git --redact
+          --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          /repo
+
+  scan-history:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (full history)
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          zricethezav/gitleaks:v8.24.3@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+          git --redact --log-opts="--all" /repo
