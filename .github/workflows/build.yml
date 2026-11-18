@@ -58,12 +58,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: core tests
         run: cargo test
       - name: core fmt
         run: cargo fmt --check
+      - name: core clippy
+        run: cargo clippy --all-targets -- -D warnings
 
   msrv:
     runs-on: ubuntu-latest
