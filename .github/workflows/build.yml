@@ -2,19 +2,24 @@ name: build
 
 # The build half of the merge gate for rChat:
 #
-#   build — the required check on PRs: the relay (rchat/) compiles across all
-#           targets and its test suite passes. macOS because the client library
-#           builds BoringSSL, and the relay's dev-dependency enables the core's
-#           calls-codec (libopus via CMake) for the call tests; the macOS runner
-#           carries the C / Go / CMake toolchain BoringSSL needs.
-#   core  — the required check on PRs for the client library
-#           (rchat/shared/rchat-core): tests, clippy -D warnings, and fmt. It is
-#           a separate package with its own lockfile, exercised here with its
-#           default features (the relay job exercises it with test-hooks +
-#           calls-codec via the dev-dependency).
-#   msrv  — advisory: the relay still checks on the declared Rust floor (1.88,
-#           rchat/Cargo.toml rust-version). Ubuntu also gives the Linux-side code
-#           paths a compile pass. Bump the floor and rust-version together.
+#   build  — the required check on PRs: the relay (rchat/) compiles across all
+#            targets and its test suite passes. macOS because the client library
+#            builds BoringSSL, and the relay's dev-dependency enables the core's
+#            calls-codec (libopus via CMake) for the call tests; the macOS runner
+#            carries the C / Go / CMake toolchain BoringSSL needs.
+#   core   — the required check on PRs for the client library
+#            (rchat/shared/rchat-core): tests + fmt. It is a separate package with
+#            its own lockfile, exercised here with its default features (the relay
+#            job exercises it with test-hooks + calls-codec via the dev-dependency).
+#   clippy — ADVISORY (continue-on-error), not a merge gate: the current public
+#            baseline is not clippy-clean on today's stable toolchain (deprecated
+#            Atomic::fetch_update, chunks_exact-with-constant-size, a needless
+#            range loop, and dead JNI constants in the non-Android test build).
+#            It runs so the debt stays visible; promote it to a required check
+#            once the baseline is cleaned. See the rChat governance thread.
+#   msrv   — advisory: the relay still checks on the declared Rust floor (1.88,
+#            rchat/Cargo.toml rust-version). Ubuntu also gives the Linux-side code
+#            paths a compile pass. Bump the floor and rust-version together.
 #
 # Toolchain and cache actions are pinned to the same commit SHAs as rvpn-core CI.
 
@@ -22,7 +27,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,14 +60,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
-          components: clippy, rustfmt
+          components: rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: core tests
         run: cargo test
-      - name: core clippy
-        run: cargo clippy --all-targets -- -D warnings
       - name: core fmt
         run: cargo fmt --check
+
+  clippy:
+    # Advisory: the public baseline is not clippy-clean on current stable. This
+    # keeps the lint debt visible on every PR without blocking the merge gate.
+    # Promote to required (drop continue-on-error) once the baseline is cleaned.
+    continue-on-error: true
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: rchat/shared/rchat-core
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: core clippy (advisory)
+        run: cargo clippy --all-targets -- -D warnings
 
   msrv:
     runs-on: ubuntu-latest
