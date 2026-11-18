@@ -118,7 +118,9 @@ fn is_heif(b: &[u8]) -> bool {
     };
     HEIF_BRANDS.iter().any(|h| **h == brand)
         && !compatible
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|c| AV1_BRANDS.iter().any(|a| &a[..] == c))
 }
 

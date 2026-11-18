@@ -33,12 +33,7 @@ pub fn decode(plaintext: &[u8]) -> Option<(u8, Vec<[u8; 16]>)> {
     {
         return None;
     }
-    Some((
-        kind,
-        rest.chunks_exact(16)
-            .map(|c| c.try_into().expect("16-byte chunk"))
-            .collect(),
-    ))
+    Some((kind, rest.as_chunks::<16>().0.to_vec()))
 }
 
 #[cfg(test)]

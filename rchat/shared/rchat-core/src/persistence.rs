@@ -478,7 +478,7 @@ impl ClientInner {
         // record; the rest stay in memory only (the held queue may hold
         // more than `MAX_RECORD_BYTES`, and the closes and asks must not be
         // lost with it).
-        let base = bincode::serialized_size(&rec).map_or(u64::MAX, |n| n);
+        let base = bincode::serialized_size(&rec).unwrap_or(u64::MAX);
         let mut budget = (MAX_RECORD_BYTES - SEAL_OVERHEAD) as u64;
         budget = budget.saturating_sub(base);
         for h in &self.pending_encrypted_messages {

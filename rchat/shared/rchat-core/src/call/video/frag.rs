@@ -336,10 +336,9 @@ impl Reassembler {
         };
         self.last = Some(n);
         // Anything still half-built that is older than this will never finish.
-        for j in 0..SLOTS {
-            if j != at && self.slots[j].state == State::Partial && newer(n, self.slots[j].frame_no)
-            {
-                self.slots[j].state = State::Free;
+        for (j, slot) in self.slots.iter_mut().enumerate().take(SLOTS) {
+            if j != at && slot.state == State::Partial && newer(n, slot.frame_no) {
+                slot.state = State::Free;
             }
         }
         if key {

@@ -58,9 +58,7 @@ parking_lot = "0.12"
 socket2 = "0.5"
 # setsockopt for TCP_NOTSENT_LOWAT on call connections (transport.rs).
 libc = "0.2"
-tracing = "0.1"
 chacha20poly1305 = "0.10"
-aes-gcm = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"

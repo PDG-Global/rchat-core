@@ -164,7 +164,7 @@ impl KemKeyPair {
 /// FIPS 203 §7.2 modulus check: every 12-bit coefficient of `t` is < q.
 /// Assumes `pk.len() == KEM_PK_LEN`.
 fn ek_is_canonical(pk: &[u8]) -> bool {
-    pk[..EK_T_LEN].chunks_exact(3).all(|b| {
+    pk[..EK_T_LEN].as_chunks::<3>().0.iter().all(|b| {
         let c0 = u16::from(b[0]) | (u16::from(b[1] & 0x0f) << 8);
         let c1 = u16::from(b[1] >> 4) | (u16::from(b[2]) << 4);
         c0 < Q && c1 < Q
