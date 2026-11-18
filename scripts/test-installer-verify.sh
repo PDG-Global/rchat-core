@@ -175,6 +175,11 @@ check "e2e: SIGNED suffixed version below floor (2.0.9-rc1) -> hard fail" \
     '! run_verify "2.0.9-rc1" "2.0.9-rc1"'
 check "e2e: signed manifest for a DIFFERENT release (1.9.9 vs $FLOOR) -> hard fail" \
     '! run_verify "1.9.9" "$FLOOR"'
+# Thomas's mutation: without the vm_mver != VERSION check this case passes —
+# a validly signed release AT the floor (so the floor lets it through) served
+# under a NEWER version path. Only the mismatch check refuses it.
+check "e2e: signed $FLOOR manifest served as a NEWER requested release (2.2.0) -> hard fail" \
+    '! run_verify "$FLOOR" "2.2.0"'
 check "e2e: strict below-floor version (2.0.9) -> hard fail" \
     '! run_verify "2.0.9" "2.0.9"'
 check "e2e: tampered manifest after signing -> hard fail" \
