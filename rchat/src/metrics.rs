@@ -194,6 +194,28 @@ pub const REJECT_RATE_LIMIT: &str = "rate_limit";
 pub const REJECT_OVERSIZED_FRAME: &str = "oversized_frame";
 /// Message refused (not acknowledged) because the offline queue is full.
 pub const REJECT_QUEUE_OVERFLOW: &str = "queue_overflow";
+/// A message for an offline recipient was refused because that recipient's
+/// store is over its per-account byte or message cap
+/// (`[server.offline_queue] max_bytes_per_recipient` /
+/// `max_messages_per_recipient`, security fix #2). The new message is
+/// dropped; nothing already queued — for that recipient or anyone else — is
+/// evicted.
+pub const REJECT_OFFLINE_RECIPIENT_CAP: &str = "offline_recipient_cap";
+/// A message was refused because the SENDING connection's rolling
+/// offline-send budget (`[server.offline_queue] sender_budget_*`) is spent.
+/// Per connection, not per address: one sender cannot fill the shared store
+/// with messages for many fresh recipient accounts, and a per-connection
+/// counter names no one. The new message is dropped; nothing queued is
+/// evicted.
+pub const REJECT_OFFLINE_SENDER_BUDGET: &str = "offline_sender_budget";
+/// A message was refused because the SENDING SOURCE's rolling
+/// offline-send budget is spent: `sender_budget_bytes x
+/// sender_source_budget_multiplier` per `sender_window_secs`, shared by
+/// every connection of the source (the relay's keyed source buckets —
+/// counters only, like the per-source connection counts). Binds what one
+/// address can pin in the shared store across many connections or a
+/// reconnect loop. The new message is dropped; nothing queued is evicted.
+pub const REJECT_OFFLINE_SOURCE_BUDGET: &str = "offline_source_budget";
 /// Connection closed because it stopped draining its outbound queue.
 pub const REJECT_SLOW_CONSUMER: &str = "slow_consumer";
 /// Connection closed for not completing the WebSocket upgrade in time.

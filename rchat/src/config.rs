@@ -178,9 +178,15 @@ pub struct ServerConfig {
     #[serde(default = "default_offline_queue_max_total_bytes")]
     pub offline_queue_max_total_bytes: usize,
 
-    /// Bytes the offline message store may hold for a single recipient.
-    #[serde(default = "default_offline_queue_max_bytes_per_recipient")]
-    pub offline_queue_max_bytes_per_recipient: usize,
+    /// Deprecated, accepted for one release: the per-recipient byte cap on
+    /// the offline store, now `[server.offline_queue]
+    /// max_bytes_per_recipient`. When the new key is unset this value maps
+    /// to it and validate() warns once at startup that the old key is
+    /// removed next release; when both are set the new key wins and this
+    /// one is ignored, with a warning. See
+    /// `offline_queue_max_bytes_per_recipient()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_queue_max_bytes_per_recipient: Option<usize>,
 
     /// Relay-wide cap on bytes queued for sending across all connections.
     /// When spent, the heaviest source's heaviest connection is shed. Size
@@ -559,10 +565,6 @@ fn default_offline_queue_max_total_bytes() -> usize {
     256 << 20 // 256 MiB
 }
 
-fn default_offline_queue_max_bytes_per_recipient() -> usize {
-    16 << 20 // 16 MiB
-}
-
 fn default_outbound_budget_bytes() -> usize {
     crate::limits::GLOBAL_OUTBOUND_MAX_BYTES
 }
@@ -647,6 +649,69 @@ pub struct OfflineQueueConfig {
     /// Global knock budget in bytes (separate from the message budget).
     #[serde(default = "default_knock_budget_bytes")]
     pub knock_budget_bytes: usize,
+    /// Bytes of queued messages one recipient account may hold at once. A
+    /// message is charged its size plus
+    /// [`limits::OFFLINE_MESSAGE_OVERHEAD_BYTES`], so one of
+    /// `max_message_bytes` needs the cap at least that much higher. A
+    /// message over the cap is refused for that recipient only
+    /// (`rchat_rejections_total{reason="offline_recipient_cap"}`); nothing
+    /// queued for that account or any other is ever evicted to make room.
+    /// At least `max_message_bytes`, at most
+    /// `offline_queue_max_total_bytes`. Default 4 MiB. (The deprecated
+    /// `[server] offline_queue_max_bytes_per_recipient` maps here for one
+    /// release while this is unset.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_recipient: Option<usize>,
+    /// Most queued messages one recipient account may hold at once, whatever
+    /// their size: many tiny messages (receipts, cover) each cost little but
+    /// pin a queue slot. Same refusal as the byte cap. The R26 steady-size
+    /// sub-cap is half of this. 1-4096. Default 256.
+    #[serde(default = "default_offline_queue_max_messages_per_recipient")]
+    pub max_messages_per_recipient: usize,
+    /// Rolling-window budget of bytes ONE sending connection may spend
+    /// queueing messages for offline recipients. Per connection, not per
+    /// source address: addresses may be shared behind NAT, and a
+    /// per-connection counter names no one. Bounds what one connection can
+    /// pin in the shared store with messages for many fresh recipient
+    /// accounts (the per-recipient caps bound each account; this bounds one
+    /// sender). A message over the budget is refused for that sender only
+    /// (`rchat_rejections_total{reason="offline_sender_budget"}`); nothing
+    /// queued is evicted. At least `max_message_bytes`, at most
+    /// `offline_queue_max_total_bytes`. Default 16 MiB.
+    #[serde(default = "default_sender_budget_bytes")]
+    pub sender_budget_bytes: usize,
+    /// Most messages ONE sending connection may queue for offline
+    /// recipients per rolling `sender_window_secs`, whatever their size.
+    /// Same refusal as `sender_budget_bytes`. 1-65536. Default 1024.
+    #[serde(default = "default_sender_budget_messages")]
+    pub sender_budget_messages: usize,
+    /// Length of the rolling window the two `sender_budget_*` caps are per.
+    /// The budget refills continuously: in any window this long, one
+    /// connection (or source, with `sender_source_budget_multiplier`)
+    /// spends at most those caps. Unset: `ttl_secs` — the window must be
+    /// at least the queue TTL (`validate()` fails otherwise), otherwise a
+    /// source banks its full budget every window while its earlier
+    /// messages are still queued, and reaches the total store in
+    /// ttl/window windows. At most 259200 (72 h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_window_secs: Option<u64>,
+    /// Multiple of the per-connection `sender_budget_*` caps that ONE
+    /// SOURCE may spend per rolling `sender_window_secs`. The source is
+    /// the relay's existing source bucket — a keyed digest of the IPv4
+    /// address or IPv6 /48, the same buckets as the connection caps and
+    /// the per-source fair shares; only counters are kept, nothing is
+    /// logged. The per-connection budget resets on reconnect, and a
+    /// handful of connections from one address fit under the connection
+    /// cap — this table binds the address across both (counters only,
+    /// keyed like the existing per-source counts). Sized as a multiple to
+    /// tolerate a few users behind one NAT address, and validated to stay
+    /// well under the total store. Does not apply where a connection's
+    /// source is unknown (`max_connections_per_ip = 0` without
+    /// `proxy_protocol`; startup warns). At least 1, and
+    /// `sender_budget_bytes` x this must be at most
+    /// `offline_queue_max_total_bytes`. Default 4.
+    #[serde(default = "default_sender_source_budget_multiplier")]
+    pub sender_source_budget_multiplier: usize,
     /// Keep queued items across restarts, encrypted (RCQ2). Default off.
     #[serde(default)]
     pub persist: bool,
@@ -686,11 +751,49 @@ fn default_knock_budget_bytes() -> usize {
     16 << 20
 }
 
+fn default_offline_queue_max_bytes_per_recipient() -> usize {
+    4 << 20 // 4 MiB
+}
+
+fn default_offline_queue_max_messages_per_recipient() -> usize {
+    256
+}
+
+fn default_sender_budget_bytes() -> usize {
+    16 << 20 // 16 MiB
+}
+
+fn default_sender_budget_messages() -> usize {
+    1024
+}
+
+fn default_sender_source_budget_multiplier() -> usize {
+    4
+}
+
+impl OfflineQueueConfig {
+    /// The rolling window the `sender_budget_*` caps are per:
+    /// `sender_window_secs` when set, else the queue TTL. The window must
+    /// be at least the TTL (`ServerConfig::validate()` fails otherwise):
+    /// with a shorter window a source banks its full budget every window
+    /// while its earlier messages are still queued, and reaches the total
+    /// store in ttl/window windows.
+    pub fn sender_window_secs(&self) -> u64 {
+        self.sender_window_secs.unwrap_or(self.ttl_secs)
+    }
+}
+
 impl Default for OfflineQueueConfig {
     fn default() -> Self {
         Self {
             ttl_secs: default_queue_ttl_secs(),
             knock_budget_bytes: default_knock_budget_bytes(),
+            max_bytes_per_recipient: None,
+            max_messages_per_recipient: default_offline_queue_max_messages_per_recipient(),
+            sender_budget_bytes: default_sender_budget_bytes(),
+            sender_budget_messages: default_sender_budget_messages(),
+            sender_window_secs: None,
+            sender_source_budget_multiplier: default_sender_source_budget_multiplier(),
             persist: false,
             persist_path: None,
             persist_key_path: None,
@@ -772,6 +875,17 @@ impl ServerConfig {
     /// as `knock_ttl_hours`).
     pub fn knock_ttl_secs(&self) -> u64 {
         self.offline_queue.ttl_secs.min(MAX_KNOCK_TTL_SECS)
+    }
+
+    /// The per-recipient offline-store byte cap: `[server.offline_queue]
+    /// max_bytes_per_recipient` when set; else the deprecated `[server]
+    /// offline_queue_max_bytes_per_recipient` for this one release; else
+    /// the default.
+    pub fn offline_queue_max_bytes_per_recipient(&self) -> usize {
+        self.offline_queue
+            .max_bytes_per_recipient
+            .or(self.offline_queue_max_bytes_per_recipient)
+            .unwrap_or_else(default_offline_queue_max_bytes_per_recipient)
     }
 
     pub fn with_cli_overrides(mut self, cli: &crate::Cli) -> Self {
@@ -1117,14 +1231,113 @@ impl ServerConfig {
                 self.connection_timeout_secs
             );
         }
-        if self.offline_queue_max_bytes_per_recipient < self.max_message_bytes {
+        if let Some(old) = self.offline_queue_max_bytes_per_recipient {
+            // Deprecated for one release (security fix #2, review): still
+            // accepted and mapped to [server.offline_queue]
+            // max_bytes_per_recipient while that is unset; removed next
+            // release. validate() runs once at startup, so this warns once.
+            if self.offline_queue.max_bytes_per_recipient.is_some() {
+                warn!(
+                    "offline_queue_max_bytes_per_recipient is deprecated and ignored: \
+                     [server.offline_queue] max_bytes_per_recipient is set ({}); remove the \
+                     old key — it stops parsing in the next release",
+                    old
+                );
+            } else {
+                warn!(
+                    "offline_queue_max_bytes_per_recipient ({}) is deprecated: rename it to \
+                     [server.offline_queue] max_bytes_per_recipient — the old key stops \
+                     parsing in the next release",
+                    old
+                );
+            }
+        }
+        let held = &self.offline_queue;
+        if self.offline_queue_max_bytes_per_recipient() < self.max_message_bytes {
             bail!(
-                "offline_queue_max_bytes_per_recipient ({}) must be at least max_message_bytes ({})",
-                self.offline_queue_max_bytes_per_recipient,
+                "offline_queue.max_bytes_per_recipient ({}) must be at least max_message_bytes ({})",
+                self.offline_queue_max_bytes_per_recipient(),
                 self.max_message_bytes
             );
         }
-        let held = &self.offline_queue;
+        if self.offline_queue_max_bytes_per_recipient() > self.offline_queue_max_total_bytes {
+            bail!(
+                "offline_queue.max_bytes_per_recipient ({}) must be at most offline_queue_max_total_bytes ({})",
+                self.offline_queue_max_bytes_per_recipient(),
+                self.offline_queue_max_total_bytes
+            );
+        }
+        if held.max_messages_per_recipient == 0
+            || held.max_messages_per_recipient > MAX_OFFLINE_MESSAGES_PER_RECIPIENT
+        {
+            bail!(
+                "offline_queue.max_messages_per_recipient must be between 1 and {} (got {})",
+                MAX_OFFLINE_MESSAGES_PER_RECIPIENT,
+                held.max_messages_per_recipient
+            );
+        }
+        // Thomas's review (security fix #2, round 3): the sender/source
+        // window must cover the retention period. The budgets refill, but
+        // queued messages stay for the TTL — with a shorter window a
+        // source banks its full budget every window while its earlier
+        // messages are still queued, and reaches the total store in
+        // ttl/window windows. Unset, the window defaults to the TTL.
+        if held.sender_window_secs() < self.offline_queue.ttl_secs
+            || held.sender_window_secs() > MAX_SENDER_WINDOW_SECS
+        {
+            bail!(
+                "offline_queue.sender_window_secs ({}) must be at least offline_queue.ttl_secs ({}) and at most {} — a shorter window lets a source bank its full budget per window while its earlier messages are still queued",
+                held.sender_window_secs(),
+                self.offline_queue.ttl_secs,
+                MAX_SENDER_WINDOW_SECS
+            );
+        }
+        if held.sender_budget_bytes < self.max_message_bytes
+            || held.sender_budget_bytes > self.offline_queue_max_total_bytes
+        {
+            bail!(
+                "offline_queue.sender_budget_bytes ({}) must be at least max_message_bytes ({}) and at most offline_queue_max_total_bytes ({})",
+                held.sender_budget_bytes,
+                self.max_message_bytes,
+                self.offline_queue_max_total_bytes
+            );
+        }
+        if held.sender_budget_messages == 0
+            || held.sender_budget_messages > MAX_SENDER_BUDGET_MESSAGES
+        {
+            bail!(
+                "offline_queue.sender_budget_messages must be between 1 and {} (got {})",
+                MAX_SENDER_BUDGET_MESSAGES,
+                held.sender_budget_messages
+            );
+        }
+        if held.sender_source_budget_multiplier == 0 {
+            bail!("offline_queue.sender_source_budget_multiplier must be at least 1 (got 0)");
+        }
+        if held
+            .sender_budget_bytes
+            .saturating_mul(held.sender_source_budget_multiplier)
+            > self.offline_queue_max_total_bytes
+        {
+            bail!(
+                "offline_queue.sender_budget_bytes ({}) x offline_queue.sender_source_budget_multiplier ({}) must be at most offline_queue_max_total_bytes ({})",
+                held.sender_budget_bytes,
+                held.sender_source_budget_multiplier,
+                self.offline_queue_max_total_bytes
+            );
+        }
+        if self.max_connections_per_ip == 0 && !self.proxy_protocol {
+            // Thomas's review (security fix #2, round 2): without per-
+            // address connection caps or a PROXY v2 source, every
+            // connection's source bucket is None and the per-source budget
+            // cannot apply — say so once at startup.
+            warn!(
+                "the per-source offline-send budget (offline_queue.sender_source_budget_multiplier) \
+                 does not apply: every connection's source is unknown with \
+                 max_connections_per_ip = 0 and proxy_protocol = false; the per-connection \
+                 budget still bounds each connection"
+            );
+        }
         if held.held_copy_max_bytes_per_connection < self.max_message_bytes
             || held.held_copy_max_bytes_per_connection > held.held_copy_max_total_bytes
         {
@@ -1140,13 +1353,6 @@ impl ServerConfig {
                 "offline_queue.held_copy_max_total_bytes ({}) must be at most {}",
                 held.held_copy_max_total_bytes,
                 MAX_RELAY_BUDGET_BYTES
-            );
-        }
-        if self.offline_queue_max_total_bytes < self.offline_queue_max_bytes_per_recipient {
-            bail!(
-                "offline_queue_max_total_bytes ({}) must be at least offline_queue_max_bytes_per_recipient ({})",
-                self.offline_queue_max_total_bytes,
-                self.offline_queue_max_bytes_per_recipient
             );
         }
         if self.outbound_budget_bytes < crate::limits::OUTBOUND_QUEUE_MAX_BYTES
@@ -1257,6 +1463,16 @@ const MIN_CONNECTION_TIMEOUT_SECS: u64 = 60;
 const MAX_CONNECTION_TIMEOUT_SECS: u64 = 86_400;
 /// Upper bounds for the anti-abuse settings.
 const MAX_PENDING_CIRCUIT_TARGETS: usize = 1_000_000;
+/// Upper bound for `offline_queue.max_messages_per_recipient` (a typo guard;
+/// the per-recipient byte cap is bounded by `offline_queue_max_total_bytes`).
+const MAX_OFFLINE_MESSAGES_PER_RECIPIENT: usize = 4096;
+/// Accepted range for `offline_queue.sender_window_secs`: at least the
+/// queue TTL (validated separately, stating both values) and at most the
+/// TTL's own maximum (72 h).
+const MAX_SENDER_WINDOW_SECS: u64 = MAX_QUEUE_TTL_SECS;
+/// Upper bound for `offline_queue.sender_budget_messages` (a typo guard; the
+/// byte budget is bounded by `offline_queue_max_total_bytes`).
+const MAX_SENDER_BUDGET_MESSAGES: usize = 65_536;
 const MAX_IDENTIFICATION_TIMEOUT_SECS: u64 = 300;
 const MAX_CIRCUITS_PER_CONNECTION: usize = 65_536;
 const MAX_CIRCUITS: usize = 10_000_000;
@@ -1294,7 +1510,7 @@ impl Default for ServerConfig {
             trusted_proxy: None,
             max_message_bytes: default_max_message_bytes(),
             offline_queue_max_total_bytes: default_offline_queue_max_total_bytes(),
-            offline_queue_max_bytes_per_recipient: default_offline_queue_max_bytes_per_recipient(),
+            offline_queue_max_bytes_per_recipient: None,
             outbound_budget_bytes: default_outbound_budget_bytes(),
             buffer_budget_bytes: default_buffer_budget_bytes(),
             websocket_path: default_websocket_path(),
@@ -1396,12 +1612,203 @@ mod tests {
         let c = ServerConfig::default();
         assert_eq!(c.offline_queue.ttl_secs, 259_200);
         assert_eq!(c.offline_queue.knock_budget_bytes, 16 << 20);
+        assert_eq!(c.offline_queue.max_bytes_per_recipient, None);
+        assert_eq!(c.offline_queue_max_bytes_per_recipient(), 4 << 20);
+        assert_eq!(c.offline_queue.max_messages_per_recipient, 256);
+        assert_eq!(c.offline_queue.sender_budget_bytes, 16 << 20);
+        assert_eq!(c.offline_queue.sender_budget_messages, 1024);
+        assert_eq!(c.offline_queue.sender_window_secs, None);
+        assert_eq!(c.offline_queue.sender_window_secs(), 259_200);
+        assert_eq!(c.offline_queue.sender_source_budget_multiplier, 4);
         assert!(!c.offline_queue.persist);
         assert!(!c.offline_queue.allow_persistent_key);
         let mut long = ServerConfig::default();
         long.offline_queue.ttl_secs = MAX_QUEUE_TTL_SECS;
         assert_eq!(long.knock_ttl_secs(), MAX_KNOCK_TTL_SECS);
         assert!(long.validate().is_ok(), "72 h is the largest accepted");
+    }
+
+    /// Security fix #2 (review, round 3): the sender/source window must
+    /// cover the retention period, and defaults to the queue TTL — the
+    /// budgets refill, but queued messages stay for the TTL, so a shorter
+    /// window would let a source bank its full budget per window while its
+    /// earlier messages are still queued.
+    #[test]
+    fn sender_window_defaults_to_the_ttl_and_must_cover_it() {
+        // Unset, the window tracks the TTL; explicit values are kept.
+        let c = ServerConfig::default();
+        assert_eq!(
+            c.offline_queue.sender_window_secs(),
+            c.offline_queue.ttl_secs
+        );
+        let mut short_ttl = ServerConfig::default();
+        short_ttl.offline_queue.ttl_secs = 3_600;
+        assert_eq!(short_ttl.offline_queue.sender_window_secs(), 3_600);
+        let mut set = ServerConfig::default();
+        set.offline_queue.sender_window_secs = Some(259_200);
+        assert_eq!(set.offline_queue.sender_window_secs(), 259_200);
+        set.validate().unwrap();
+
+        // A window under the TTL is a startup error, naming both values.
+        let mut bad = ServerConfig::default();
+        bad.offline_queue.sender_window_secs = Some(259_199);
+        let e = err_text(bad.validate());
+        assert!(
+            e.contains("offline_queue.sender_window_secs (259199)"),
+            "{e}"
+        );
+        assert!(e.contains("offline_queue.ttl_secs (259200)"), "{e}");
+        // ...however small the TTL, the window must be at least it.
+        let mut bad = ServerConfig::default();
+        bad.offline_queue.ttl_secs = 3_600;
+        bad.offline_queue.sender_window_secs = Some(3_599);
+        assert!(err_text(bad.validate()).contains("must be at least offline_queue.ttl_secs"));
+        // Equal is accepted; above the TTL's own maximum is not.
+        let mut ok = ServerConfig::default();
+        ok.offline_queue.ttl_secs = 3_600;
+        ok.offline_queue.sender_window_secs = Some(3_600);
+        ok.validate().unwrap();
+        let mut over = ServerConfig::default();
+        over.offline_queue.sender_window_secs = Some(MAX_SENDER_WINDOW_SECS + 1);
+        assert!(err_text(over.validate()).contains("offline_queue.sender_window_secs"));
+    }
+
+    /// Security fix #2: the per-account caps on the offline store are config
+    /// keys under `[server.offline_queue]`, validated fail-closed.
+    #[test]
+    fn offline_queue_per_recipient_caps_parse_and_validate() {
+        let c = ServerConfig::from_toml_str(
+            r#"
+            [server]
+            bind_addr = "127.0.0.1:1"
+            [server.offline_queue]
+            max_bytes_per_recipient = 8388608
+            max_messages_per_recipient = 512
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.offline_queue.max_bytes_per_recipient, Some(8 << 20));
+        assert_eq!(c.offline_queue_max_bytes_per_recipient(), 8 << 20);
+        assert_eq!(c.offline_queue.max_messages_per_recipient, 512);
+        c.validate().unwrap();
+
+        // Bytes: under max_message_bytes, over the total budget, or zero —
+        // whichever key supplied the value.
+        for bytes in [0usize, 1, ServerConfig::default().max_message_bytes - 1] {
+            let mut c = ServerConfig::default();
+            c.offline_queue.max_bytes_per_recipient = Some(bytes);
+            assert!(
+                err_text(c.validate()).contains("offline_queue.max_bytes_per_recipient"),
+                "{bytes}"
+            );
+            let old = ServerConfig {
+                offline_queue_max_bytes_per_recipient: Some(bytes),
+                ..ServerConfig::default()
+            };
+            assert!(
+                err_text(old.validate()).contains("offline_queue.max_bytes_per_recipient"),
+                "deprecated key: {bytes}"
+            );
+        }
+        let mut over = ServerConfig::default();
+        over.offline_queue.max_bytes_per_recipient = Some(over.offline_queue_max_total_bytes + 1);
+        assert!(err_text(over.validate()).contains("offline_queue.max_bytes_per_recipient"));
+
+        // Message count: zero and above the typo guard are refused; the
+        // largest accepted value validates. A negative count never parses.
+        for n in [0usize, MAX_OFFLINE_MESSAGES_PER_RECIPIENT + 1] {
+            let mut c = ServerConfig::default();
+            c.offline_queue.max_messages_per_recipient = n;
+            assert!(
+                err_text(c.validate()).contains("offline_queue.max_messages_per_recipient"),
+                "{n}"
+            );
+        }
+        let mut top = ServerConfig::default();
+        top.offline_queue.max_messages_per_recipient = MAX_OFFLINE_MESSAGES_PER_RECIPIENT;
+        top.validate().unwrap();
+        assert!(ServerConfig::from_toml_str(
+            "[server]\nbind_addr = \"127.0.0.1:1\"\n[server.offline_queue]\nmax_messages_per_recipient = -1\n"
+        )
+        .is_err());
+    }
+
+    /// Security fix #2 review: a rolling per-connection budget bounds what
+    /// one sending connection can queue for offline recipients, and the
+    /// deprecated `[server] offline_queue_max_bytes_per_recipient` is
+    /// accepted for one release, mapping to the new cap while that is unset
+    /// (the new key wins when both are set; validate() warns at startup).
+    #[test]
+    fn sender_budget_and_deprecated_per_recipient_key() {
+        let c = ServerConfig::from_toml_str(
+            r#"
+            [server]
+            bind_addr = "127.0.0.1:1"
+            [server.offline_queue]
+            ttl_secs = 7200
+            sender_budget_bytes = 8388608
+            sender_budget_messages = 64
+            sender_window_secs = 7200
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.offline_queue.sender_budget_bytes, 8 << 20);
+        assert_eq!(c.offline_queue.sender_budget_messages, 64);
+        assert_eq!(c.offline_queue.sender_window_secs, Some(7_200));
+        c.validate().unwrap();
+
+        // The sender budget is validated fail-closed.
+        let mut low = ServerConfig::default();
+        low.offline_queue.sender_budget_bytes = low.max_message_bytes - 1;
+        assert!(err_text(low.validate()).contains("offline_queue.sender_budget_bytes"));
+        let mut over = ServerConfig::default();
+        over.offline_queue.sender_budget_bytes = over.offline_queue_max_total_bytes + 1;
+        assert!(err_text(over.validate()).contains("offline_queue.sender_budget_bytes"));
+        for n in [0usize, MAX_SENDER_BUDGET_MESSAGES + 1] {
+            let mut c = ServerConfig::default();
+            c.offline_queue.sender_budget_messages = n;
+            assert!(
+                err_text(c.validate()).contains("offline_queue.sender_budget_messages"),
+                "{n}"
+            );
+        }
+        for secs in [0u64, 3_600, MAX_SENDER_WINDOW_SECS + 1] {
+            let mut c = ServerConfig::default();
+            c.offline_queue.sender_window_secs = Some(secs);
+            assert!(
+                err_text(c.validate()).contains("offline_queue.sender_window_secs"),
+                "{secs}"
+            );
+        }
+        for mult in [0usize, usize::MAX] {
+            let mut c = ServerConfig::default();
+            c.offline_queue.sender_source_budget_multiplier = mult;
+            assert!(
+                err_text(c.validate()).contains("sender_source_budget_multiplier"),
+                "{mult}"
+            );
+        }
+
+        // Deprecated key: accepted and mapped while the new key is unset...
+        let old = ServerConfig::from_toml_str(
+            "[server]\nbind_addr = \"127.0.0.1:1\"\noffline_queue_max_bytes_per_recipient = 8388608\n",
+        )
+        .unwrap();
+        old.validate().unwrap();
+        assert_eq!(old.offline_queue_max_bytes_per_recipient(), 8 << 20);
+        // ...overridden when both are set...
+        let both = ServerConfig::from_toml_str(
+            "[server]\nbind_addr = \"127.0.0.1:1\"\noffline_queue_max_bytes_per_recipient = 8388608\n[server.offline_queue]\nmax_bytes_per_recipient = 4194304\n",
+        )
+        .unwrap();
+        both.validate().unwrap();
+        assert_eq!(both.offline_queue_max_bytes_per_recipient(), 4 << 20);
+        // ...and fail-closed when the mapped value is out of range.
+        let bad_old = ServerConfig {
+            offline_queue_max_bytes_per_recipient: Some(1),
+            ..ServerConfig::default()
+        };
+        assert!(err_text(bad_old.validate()).contains("offline_queue.max_bytes_per_recipient"));
     }
 
     #[test]
@@ -2147,7 +2554,16 @@ mod tests {
             |c| c.max_message_bytes = 1024,
             |c| c.max_message_bytes = usize::MAX,
             |c| c.connection_timeout_secs = 5,
-            |c| c.offline_queue_max_bytes_per_recipient = 1,
+            |c| c.offline_queue.max_bytes_per_recipient = Some(1),
+            |c| c.offline_queue.max_messages_per_recipient = 0,
+            |c| c.offline_queue.sender_budget_bytes = 1,
+            |c| {
+                c.offline_queue.sender_budget_bytes = c.offline_queue_max_total_bytes + 1;
+            },
+            |c| c.offline_queue.sender_budget_messages = 0,
+            |c| c.offline_queue.sender_budget_messages = MAX_SENDER_BUDGET_MESSAGES + 1,
+            |c| c.offline_queue.sender_window_secs = Some(0),
+            |c| c.offline_queue.sender_window_secs = Some(MAX_SENDER_WINDOW_SECS + 1),
             |c| c.offline_queue_max_total_bytes = 1,
             |c| c.outbound_budget_bytes = 1 << 20,
             |c| c.outbound_budget_bytes = usize::MAX,

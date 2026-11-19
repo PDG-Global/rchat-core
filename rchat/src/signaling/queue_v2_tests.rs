@@ -2,8 +2,9 @@
 //! quota end to end, the legacy file wipe and the removed plaintext path.
 
 use super::test_support::{
-    ask, ask_each_other, authed, created, eventually, next_control, queue_test_message, relay_on,
-    start, test_config, TestIdentity,
+    ask, ask_each_other, authed, created, eventually, next_control, proven_bare,
+    queue_test_message, queue_test_message_at, queued_len, relay_on, start, test_config,
+    TestIdentity,
 };
 use super::*;
 use std::io::Read;
@@ -87,6 +88,321 @@ async fn messages_expire_by_strict_comparison_with_the_stored_time() {
         vec![now - ttl, now + 3_600],
         "age == ttl kept, ttl+1 dropped, future kept"
     );
+}
+
+/// Security fix #2: a recipient over their per-account byte cap stops
+/// accepting new messages; the refusal is counted on its own label, nothing
+/// queued is evicted, and other recipients are unaffected.
+#[tokio::test]
+async fn per_recipient_byte_cap_refuses_new_messages_only_for_that_recipient() {
+    let mut config = test_config();
+    config.offline_queue.max_bytes_per_recipient = Some(1_000);
+    let state = RelayState::new(Arc::new(config));
+    let full = TestIdentity::random();
+    let fine = TestIdentity::random();
+    let full_tag = tags::id_tag(&full.bytes);
+    let fine_tag = tags::id_tag(&fine.bytes);
+    let payload = |n: usize| {
+        let mut p = vec![0x22u8; n];
+        p[0] = 0x02;
+        p
+    };
+    // 800 + 64 overhead = 864 charged bytes; a second message would be
+    // 1,728 > 1,000.
+    let before = crate::metrics::rejections(crate::metrics::REJECT_OFFLINE_RECIPIENT_CAP);
+    let guard = pair_lock::ID_LOCKS.lock(full_tag).await;
+    assert!(store_offline(full_tag, payload(800), &state));
+    assert!(
+        !store_offline(full_tag, payload(800), &state),
+        "over the per-recipient byte cap"
+    );
+    assert!(
+        crate::metrics::rejections(crate::metrics::REJECT_OFFLINE_RECIPIENT_CAP) > before,
+        "the refusal is counted on the per-recipient-cap label"
+    );
+    assert_eq!(queued_len(&state, &full), 1, "nothing evicted");
+    drop(guard);
+
+    let guard = pair_lock::ID_LOCKS.lock(fine_tag).await;
+    assert!(
+        store_offline(fine_tag, payload(800), &state),
+        "another recipient is unaffected"
+    );
+    drop(guard);
+}
+
+/// Security fix #2: the per-account message-count cap refuses further
+/// messages at the cap, whatever their size, without touching other
+/// recipients.
+#[tokio::test]
+async fn per_recipient_message_count_cap_refuses_at_the_cap() {
+    let mut config = test_config();
+    config.offline_queue.max_bytes_per_recipient = Some(1 << 20);
+    config.offline_queue.max_messages_per_recipient = 3;
+    let state = RelayState::new(Arc::new(config));
+    let capped = TestIdentity::random();
+    let fine = TestIdentity::random();
+    let capped_tag = tags::id_tag(&capped.bytes);
+    let fine_tag = tags::id_tag(&fine.bytes);
+    let payload = |i: u8| {
+        let mut p = vec![0x33u8; usize::from(i) + 1];
+        p[0] = 0x02;
+        p
+    };
+    let guard = pair_lock::ID_LOCKS.lock(capped_tag).await;
+    for i in 0..3u8 {
+        assert!(store_offline(capped_tag, payload(i), &state), "message {i}");
+    }
+    assert!(
+        !store_offline(capped_tag, payload(0), &state),
+        "over the message-count cap"
+    );
+    assert_eq!(queued_len(&state, &capped), 3, "nothing evicted");
+    drop(guard);
+
+    let guard = pair_lock::ID_LOCKS.lock(fine_tag).await;
+    assert!(
+        store_offline(fine_tag, payload(0), &state),
+        "another recipient is unaffected"
+    );
+    drop(guard);
+}
+
+/// Security fix #2: expiry releases the per-account counters together with
+/// the global budget — once the expired records go, the recipient accepts
+/// new messages again.
+#[tokio::test]
+async fn expiry_releases_the_per_recipient_counters() {
+    let mut config = test_config();
+    config.offline_queue.max_bytes_per_recipient = Some(1_000);
+    config.offline_queue.max_messages_per_recipient = 5;
+    let state = RelayState::new(Arc::new(config));
+    let r = TestIdentity::random();
+    let tag = tags::id_tag(&r.bytes);
+    let now = crate::protocol::timestamp();
+    let ttl = state.config.offline_queue.ttl_secs;
+    let payload = |i: u8| {
+        let mut p = vec![0x44u8; 800];
+        p[0] = 0x02;
+        p[1] = i;
+        p
+    };
+    // Two records fill the byte cap (2 x 864); both are one second past the
+    // TTL counted from `now`.
+    queue_test_message_at(&state, &r, payload(0), now - ttl - 1);
+    queue_test_message_at(&state, &r, payload(1), now - ttl - 1);
+    {
+        let guard = pair_lock::ID_LOCKS.lock(tag).await;
+        assert!(
+            !store_offline(tag, payload(2), &state),
+            "the cap holds before expiry"
+        );
+        drop(guard);
+    }
+    expire_queues(now, &state);
+    assert!(
+        state.message_queues.get(&tag).is_none(),
+        "expired records dropped, empty queue entry removed"
+    );
+    assert_eq!(state.offline_budget.used(), 0, "budget released");
+    let guard = pair_lock::ID_LOCKS.lock(tag).await;
+    assert!(
+        store_offline(tag, payload(2), &state),
+        "after expiry the recipient accepts new messages"
+    );
+    drop(guard);
+}
+
+/// Security fix #2 (Thomas's review): per-recipient caps don't close the
+/// hole — one sender with many fresh recipient accounts fills the TOTAL
+/// store. The rolling per-connection offline-send budget bounds one
+/// connection's contribution: with the total store shrunk so the flood
+/// would otherwise fill it, the flood stops at the sender's budget, and an
+/// unrelated user's offline delivery is not blocked.
+#[tokio::test]
+async fn one_connection_flooding_many_recipients_cannot_block_other_users() {
+    let mut config = test_config();
+    config.offline_queue_max_total_bytes = 20_000;
+    config.offline_queue.max_bytes_per_recipient = Some(1_000);
+    config.offline_queue.max_messages_per_recipient = 64;
+    let state = RelayState::new(Arc::new(config));
+    let attacker = TestIdentity::random();
+    let (attacker_conn, _rx) = proven_bare(&state, &attacker, None);
+    // A tight budget on the attacker's connection (proven_bare builds
+    // default connections: 16 MiB/1024 per 15 min).
+    state
+        .connections
+        .get_mut(&attacker_conn)
+        .unwrap()
+        .offline_send_budget =
+        limits::OfflineSendBudget::new(2_000, 100, Duration::from_secs(3_600));
+    let payload = |i: u8| vec![0x02, i]; // 66 charged bytes each (2 + 64)
+    let cost = crate::limits::OfflineBudget::message_cost(2, 0, 0);
+    // 200 fresh recipients: at 66 bytes each the flood would pin 13,200 of
+    // the store's 20,000 bytes (and go on past it); every victim is well
+    // under their own per-recipient cap, so only the sender budget stops it.
+    let victims: Vec<TestIdentity> = (0..200).map(|_| TestIdentity::random()).collect();
+    let mut stored = 0usize;
+    for (i, victim) in victims.iter().enumerate() {
+        let tag = tags::id_tag(&victim.bytes);
+        let guard = pair_lock::ID_LOCKS.lock(tag).await;
+        if charge_offline_send(&state, attacker_conn, cost).is_none()
+            && store_offline(tag, payload(i as u8), &state)
+        {
+            stored += 1;
+        }
+        drop(guard);
+    }
+    assert_eq!(
+        stored, 30,
+        "2,000 / 66 = 30 messages, then the budget refuses"
+    );
+    assert_eq!(
+        victims.len() - stored,
+        170,
+        "every further flood message is refused (counted on the wire path)"
+    );
+    assert!(
+        state.offline_budget.used() <= 2_000,
+        "one connection pinned {} of the 20,000-byte store; the rest keeps room",
+        state.offline_budget.used()
+    );
+    // The unrelated user's delivery is not blocked: another connection
+    // queues for a fresh recipient without touching the attacker's budget.
+    let other = TestIdentity::random();
+    let (other_conn, _rx2) = proven_bare(&state, &other, None);
+    let victim = TestIdentity::random();
+    let tag = tags::id_tag(&victim.bytes);
+    let guard = pair_lock::ID_LOCKS.lock(tag).await;
+    for _ in 0..5 {
+        assert!(
+            charge_offline_send(&state, other_conn, cost).is_none()
+                && store_offline(tag, payload(0), &state),
+            "another connection's offline send is unaffected"
+        );
+    }
+    drop(guard);
+}
+
+/// Security fix #2 (review, round 2): the per-connection budget resets on
+/// reconnect, and 16 connections from one address fit comfortably under
+/// the 64-connection cap — either way one address could fill the store.
+/// The per-source budget (a multiple of the per-connection one, keyed by
+/// the relay's existing source buckets, counters only) binds the address
+/// across all of its connections.
+#[tokio::test]
+async fn many_connections_from_one_source_cannot_block_other_users() {
+    use super::test_support::source_key;
+    let mut config = test_config();
+    config.offline_queue_max_total_bytes = 20_000;
+    config.offline_queue.max_bytes_per_recipient = Some(1_000);
+    config.offline_queue.max_messages_per_recipient = 64;
+    config.offline_queue.sender_budget_bytes = 1_000; // per connection
+    config.offline_queue.sender_source_budget_multiplier = 2; // 2,000 per source
+    let state = RelayState::new(Arc::new(config));
+    let payload = |i: u8| vec![0x02, i]; // 66 charged bytes each (2 + 64)
+    let cost = crate::limits::OfflineBudget::message_cost(2, 0, 0);
+    // 16 connections from one source, each with its own fresh
+    // per-connection budget: only the shared source budget can stop them.
+    let conns: Vec<crate::protocol::ClientId> = (0..16)
+        .map(|_| proven_bare(&state, &TestIdentity::random(), Some(source_key(7))).0)
+        .collect();
+    let mut stored = 0usize;
+    for (round, conn) in conns.iter().cycle().take(64).enumerate() {
+        let victim = TestIdentity::random();
+        let tag = tags::id_tag(&victim.bytes);
+        let guard = pair_lock::ID_LOCKS.lock(tag).await;
+        if charge_offline_send(&state, *conn, cost).is_none()
+            && store_offline(tag, payload(round as u8), &state)
+        {
+            stored += 1;
+        }
+        drop(guard);
+    }
+    assert_eq!(
+        stored, 30,
+        "16 connections share one 2,000-byte source budget: 30 messages, then refusal"
+    );
+    assert_eq!(
+        charge_offline_send(&state, conns[15], cost),
+        Some(crate::metrics::REJECT_OFFLINE_SOURCE_BUDGET),
+        "a fresh per-connection budget does not help: the source label"
+    );
+    assert!(
+        state.offline_budget.used() <= 2_000,
+        "one source pinned {} of the 20,000-byte store; the rest keeps room",
+        state.offline_budget.used()
+    );
+    // An unrelated source is unaffected.
+    let (other_conn, _rx) = proven_bare(&state, &TestIdentity::random(), Some(source_key(8)));
+    let victim = TestIdentity::random();
+    let tag = tags::id_tag(&victim.bytes);
+    let guard = pair_lock::ID_LOCKS.lock(tag).await;
+    for _ in 0..5 {
+        assert!(
+            charge_offline_send(&state, other_conn, cost).is_none()
+                && store_offline(tag, payload(0), &state),
+            "another source's offline send is unaffected"
+        );
+    }
+    drop(guard);
+}
+
+/// Security fix #2 (review, round 2): a reconnect loop — fresh connections,
+/// each with a fresh per-connection budget — still shares the source's one
+/// budget, so it cannot refill its way to a full store.
+#[tokio::test]
+async fn a_reconnect_loop_cannot_refill_the_source_budget() {
+    use super::test_support::source_key;
+    let mut config = test_config();
+    config.offline_queue_max_total_bytes = 20_000;
+    config.offline_queue.max_bytes_per_recipient = Some(1_000);
+    config.offline_queue.max_messages_per_recipient = 64;
+    config.offline_queue.sender_budget_bytes = 1_000; // per connection
+    config.offline_queue.sender_source_budget_multiplier = 2; // 2,000 per source
+    let state = RelayState::new(Arc::new(config));
+    let payload = |i: u8| vec![0x02, i];
+    let cost = crate::limits::OfflineBudget::message_cost(2, 0, 0);
+    // 40 generations of connect → send → disconnect, all one source. Each
+    // connection's own budget is fresh and would admit the send; the
+    // source budget is what must hold.
+    let mut stored = 0usize;
+    for i in 0..40u8 {
+        let (conn, _rx) = proven_bare(&state, &TestIdentity::random(), Some(source_key(7)));
+        let victim = TestIdentity::random();
+        let tag = tags::id_tag(&victim.bytes);
+        let guard = pair_lock::ID_LOCKS.lock(tag).await;
+        if charge_offline_send(&state, conn, cost).is_none()
+            && store_offline(tag, payload(i), &state)
+        {
+            stored += 1;
+        }
+        drop(guard);
+        state.connections.remove(&conn); // the reconnect
+    }
+    assert_eq!(
+        stored, 30,
+        "40 fresh connections, one source budget: 30 messages, then refusal"
+    );
+    assert_eq!(
+        charge_offline_send(
+            &state,
+            proven_bare(&state, &TestIdentity::random(), Some(source_key(7))).0,
+            cost
+        ),
+        Some(crate::metrics::REJECT_OFFLINE_SOURCE_BUDGET)
+    );
+    // An unrelated source is unaffected.
+    let (other_conn, _rx) = proven_bare(&state, &TestIdentity::random(), Some(source_key(8)));
+    let victim = TestIdentity::random();
+    let tag = tags::id_tag(&victim.bytes);
+    let guard = pair_lock::ID_LOCKS.lock(tag).await;
+    assert!(
+        charge_offline_send(&state, other_conn, cost).is_none()
+            && store_offline(tag, payload(0), &state),
+        "another source's offline send is unaffected"
+    );
+    drop(guard);
 }
 
 #[tokio::test]
@@ -480,7 +796,7 @@ async fn salvage_is_admitted_through_the_offline_budget() {
 #[tokio::test]
 async fn salvage_respects_the_per_recipient_cap_and_keeps_knocks_as_knocks() {
     let mut config = test_config();
-    config.offline_queue_max_bytes_per_recipient = 600;
+    config.offline_queue.max_bytes_per_recipient = Some(600);
     let state = RelayState::new(Arc::new(config));
     let x = TestIdentity::random();
     let (tx, rx, _kill) = ConnTx::channel();

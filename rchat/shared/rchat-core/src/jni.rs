@@ -598,6 +598,7 @@ pub(crate) const JNI_TO_FFI: &[(&str, &str)] = &[
     ("registerHandler", "rchat_register_callbacks"),
     ("setStateStore", "rchat_set_state_store"),
     ("importStateRecord", "rchat_import_state_record"),
+    ("resealStateRecord", "rchat_reseal_state_record"),
     ("clearState", "rchat_clear_state"),
     ("refreshTrustStore", "rchat_refresh_trust_store"),
     ("setCoverTraffic", "rchat_set_cover_traffic"),
@@ -1244,6 +1245,58 @@ mod exports {
         }
         let (p, n) = bytes_ptr(&b);
         unsafe { crate::ffi::rchat_import_state_record(ptr(&k), p, n) }
+    }
+
+    /// One record's reseal under a new state key, packed as Kotlin reads it:
+    /// the length byte, the ASCII record key, and (on a reseal) the sealed
+    /// record. Null on the C side's -1/-2 (codes 9/37 recorded).
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_rchat_client_core_RChatCore_resealStateRecord(
+        env: Env,
+        _class: jclass,
+        our_ik: jbyteArray,
+        old_key: jbyteArray,
+        new_key: jbyteArray,
+        record_key: jstring,
+        sealed: jbyteArray,
+    ) -> jbyteArray {
+        let mut j = unsafe { Jni::new(env) };
+        let ik = unsafe { j.bytes(our_ik) };
+        let old = unsafe { j.bytes(old_key) };
+        let new = unsafe { j.bytes(new_key) };
+        let k = unsafe { j.s(record_key) };
+        let b = unsafe { j.bytes(sealed) };
+        if !j.ok() {
+            return std::ptr::null_mut();
+        }
+        let mut out = zeroize::Zeroizing::new(vec![0u8; 33 + b.as_ref().map_or(0, |b| b.len())]);
+        let (ip, _) = bytes_ptr(&ik);
+        let (op, _) = bytes_ptr(&old);
+        let (np, _) = bytes_ptr(&new);
+        let (bp, bn) = bytes_ptr(&b);
+        let rc = unsafe {
+            crate::ffi::rchat_reseal_state_record(
+                ip,
+                op,
+                np,
+                ptr(&k),
+                bp,
+                bn,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if rc < 0 {
+            return std::ptr::null_mut();
+        }
+        let written = 1 + usize::from(out[0]) + if rc == 0 { bn } else { 0 };
+        let raw = {
+            let Some(env) = j.env() else {
+                return std::ptr::null_mut();
+            };
+            byte_array(env, &out[..written])
+        };
+        j.check(raw).map_or(std::ptr::null_mut(), |a| a.into_raw())
     }
 
     #[no_mangle]

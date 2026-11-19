@@ -289,9 +289,12 @@ impl ChatSession {
             .unwrap_or(false)
     }
 
+    /// Encrypt a message that travels under `message_id`. The id is bound
+    /// into the AEAD only once `SEND_BOUND_MESSAGE_IDS` is on (rollout).
     pub fn encrypt_message(
         &mut self,
         plaintext: &[u8],
+        message_id: &[u8; 16],
     ) -> Result<(Vec<u8>, RatchetHeader), RChatError> {
         if !self.is_established {
             return Err(RChatError::SessionNotEstablished {
@@ -307,16 +310,20 @@ impl ChatSession {
             .ok_or_else(|| RChatError::SessionNotEstablished {
                 identity: self.recipient_identity.clone(),
             })?;
-        let (ciphertext, header) = ratchet.encrypt(plaintext, &ad)?;
+        let bind = crate::crypto::SEND_BOUND_MESSAGE_IDS.then_some(message_id);
+        let (ciphertext, header) = ratchet.encrypt_with_id(plaintext, &ad, bind)?;
         self.last_activity = Instant::now();
         Ok((ciphertext, header))
     }
 
-    /// Decrypt a message from this session (identities must be bound).
+    /// Decrypt a message from this session (identities must be bound) that
+    /// arrived under `message_id`. Both AAD forms are accepted during the
+    /// rollout (`DoubleRatchet::decrypt_compat`).
     pub fn decrypt_message(
         &mut self,
         ciphertext: &[u8],
         header: &RatchetHeader,
+        message_id: &[u8; 16],
     ) -> Result<Vec<u8>, RChatError> {
         let ad = self.ad_recv.ok_or_else(|| RChatError::DecryptionFailed {
             message: "session identities not bound".to_string(),
@@ -327,7 +334,10 @@ impl ChatSession {
             .ok_or_else(|| RChatError::SessionNotEstablished {
                 identity: self.recipient_identity.clone(),
             })?;
-        let plaintext = ratchet.decrypt(ciphertext, header, &ad)?;
+        let (plaintext, binding) = ratchet.decrypt_compat(ciphertext, header, &ad, message_id)?;
+        if binding == crate::crypto::IdBinding::Legacy {
+            log::debug!("[RUST] message id not bound (legacy sender)");
+        }
         self.last_activity = Instant::now();
         if !self.is_established {
             self.is_established = true;
@@ -530,8 +540,9 @@ impl SessionManager {
         peer_hex: &str,
         ciphertext: &[u8],
         header: &RatchetHeader,
+        message_id: &[u8; 16],
     ) -> Result<(Vec<u8>, DecryptedBy), RChatError> {
-        self.decrypt_bound(peer_hex, ciphertext, header)
+        self.decrypt_bound(peer_hex, ciphertext, header, message_id)
             .map(|(plaintext, by, _)| (plaintext, by))
     }
 
@@ -543,9 +554,10 @@ impl SessionManager {
         peer_hex: &str,
         ciphertext: &[u8],
         header: &RatchetHeader,
+        message_id: &[u8; 16],
     ) -> Result<(Vec<u8>, DecryptedBy, Option<[u8; 32]>), RChatError> {
         let current = self.sessions.get_mut(peer_hex).map(|mut s| {
-            s.decrypt_message(ciphertext, header)
+            s.decrypt_message(ciphertext, header, message_id)
                 .map(|plaintext| (plaintext, s.session_binding))
         });
         let current = match current {
@@ -567,7 +579,7 @@ impl SessionManager {
                 || r.decrypts >= RETIRED_MAX_DECRYPTS
         });
         let retired = self.retired.get_mut(peer_hex).map(|mut r| {
-            let result = r.session.decrypt_message(ciphertext, header);
+            let result = r.session.decrypt_message(ciphertext, header, message_id);
             if result.is_ok() {
                 r.decrypts += 1;
             }
@@ -919,6 +931,9 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
 
+    /// Envelope id the tests send under.
+    const TEST_ID: [u8; 16] = [0x5a; 16];
+
     /// Two established sessions (A initiator, B responder) for `secret`.
     fn established_pair(secret: [u8; 32]) -> (ChatSession, ChatSession) {
         use x25519_dalek::{PublicKey, StaticSecret};
@@ -943,12 +958,12 @@ mod tests {
     fn sessions_bind_identities_into_the_aead() {
         let (mut alice, mut bob) = established_pair([1; 32]);
         assert_eq!(bob.peer_identity_key(), Some([0xAA; 32]));
-        let (ct, header) = alice.encrypt_message(b"x").unwrap();
-        assert_eq!(bob.decrypt_message(&ct, &header).unwrap(), b"x");
+        let (ct, header) = alice.encrypt_message(b"x", &TEST_ID).unwrap();
+        assert_eq!(bob.decrypt_message(&ct, &header, &TEST_ID).unwrap(), b"x");
         let (mut unbound, _) = established_pair([2; 32]);
         unbound.ad_send = None;
         assert!(matches!(
-            unbound.encrypt_message(b"x"),
+            unbound.encrypt_message(b"x", &TEST_ID),
             Err(RChatError::EncryptionFailed { .. })
         ));
     }
@@ -964,7 +979,7 @@ mod tests {
         let mgr = SessionManager::new();
         mgr.install(peer.clone(), bob1);
         assert_eq!(mgr.retired_count(&peer), 0);
-        let (c1, h1) = alice1.encrypt_message(b"one").unwrap();
+        let (c1, h1) = alice1.encrypt_message(b"one", &TEST_ID).unwrap();
         assert!(!mgr.get(&peer).unwrap().replaced_established);
         mgr.install(peer.clone(), bob2);
         assert_eq!(mgr.retired_count(&peer), 1);
@@ -973,11 +988,11 @@ mod tests {
             "the new session replaced an established one"
         );
         assert_eq!(
-            mgr.decrypt_from(&peer, &c1, &h1).unwrap(),
+            mgr.decrypt_from(&peer, &c1, &h1, &TEST_ID).unwrap(),
             (b"one".to_vec(), DecryptedBy::Retired),
             "retired session decrypts"
         );
-        let (c1_late, h1_late) = alice1.encrypt_message(b"late").unwrap();
+        let (c1_late, h1_late) = alice1.encrypt_message(b"late", &TEST_ID).unwrap();
         mgr.install(peer.clone(), bob3);
         assert_eq!(
             mgr.retired_count(&peer),
@@ -985,17 +1000,20 @@ mod tests {
             "still exactly one retired session"
         );
         assert!(
-            mgr.decrypt_from(&peer, &c1_late, &h1_late).is_err(),
+            mgr.decrypt_from(&peer, &c1_late, &h1_late, &TEST_ID)
+                .is_err(),
             "the oldest was discarded"
         );
-        let (c2, h2) = alice2.encrypt_message(b"two").unwrap();
+        let (c2, h2) = alice2.encrypt_message(b"two", &TEST_ID).unwrap();
         assert_eq!(
-            mgr.decrypt_from(&peer, &c2, &h2).map(|(p, _)| p).unwrap(),
+            mgr.decrypt_from(&peer, &c2, &h2, &TEST_ID)
+                .map(|(p, _)| p)
+                .unwrap(),
             b"two"
         );
-        let (c3, h3) = alice3.encrypt_message(b"three").unwrap();
+        let (c3, h3) = alice3.encrypt_message(b"three", &TEST_ID).unwrap();
         assert_eq!(
-            mgr.decrypt_from(&peer, &c3, &h3).unwrap(),
+            mgr.decrypt_from(&peer, &c3, &h3, &TEST_ID).unwrap(),
             (b"three".to_vec(), DecryptedBy::Current),
             "current still works"
         );
@@ -1010,8 +1028,8 @@ mod tests {
         mgr.install(peer.clone(), bob1);
         mgr.install(peer.clone(), bob2);
         mgr.age_retired_for_test(&peer, RETIRED_MAX_AGE.as_secs() + 1);
-        let (c, h) = alice1.encrypt_message(b"too late").unwrap();
-        assert!(mgr.decrypt_from(&peer, &c, &h).is_err());
+        let (c, h) = alice1.encrypt_message(b"too late", &TEST_ID).unwrap();
+        assert!(mgr.decrypt_from(&peer, &c, &h, &TEST_ID).is_err());
         assert_eq!(mgr.retired_count(&peer), 0);
     }
 
@@ -1024,14 +1042,20 @@ mod tests {
         mgr.install(peer.clone(), bob1);
         mgr.install(peer.clone(), bob2);
         for i in 0..RETIRED_MAX_DECRYPTS {
-            let (c, h) = alice1.encrypt_message(&i.to_be_bytes()).unwrap();
-            assert!(mgr.decrypt_from(&peer, &c, &h).is_ok(), "decrypt {i}");
+            let (c, h) = alice1.encrypt_message(&i.to_be_bytes(), &TEST_ID).unwrap();
+            assert!(
+                mgr.decrypt_from(&peer, &c, &h, &TEST_ID).is_ok(),
+                "decrypt {i}"
+            );
         }
         // Kept until its last decrypt is durable (D28), then dropped by the
         // caller or the timer's purge; never used for a 1,001st decrypt.
         assert_eq!(mgr.retired_count(&peer), 1);
-        let (c, h) = alice1.encrypt_message(b"one more").unwrap();
-        assert!(mgr.decrypt_from(&peer, &c, &h).is_err(), "no 1,001st");
+        let (c, h) = alice1.encrypt_message(b"one more", &TEST_ID).unwrap();
+        assert!(
+            mgr.decrypt_from(&peer, &c, &h, &TEST_ID).is_err(),
+            "no 1,001st"
+        );
         assert_eq!(mgr.retired_count(&peer), 0);
     }
 

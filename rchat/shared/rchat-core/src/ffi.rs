@@ -207,6 +207,9 @@ static DISCONNECT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// 34 = Video is unavailable (VideoUnavailable: the call cannot start video)
 /// 35 = The relay needs an update for video (RelayNoVideo: no `video-v1`)
 /// 36 = Video was asked for too soon (VideoTooSoon)
+/// 37 = A stored state record could not be resealed (ResealFailed: it opens
+///      under neither the old nor the new state key, or it is malformed;
+///      `rchat_reseal_state_record` only)
 ///
 /// `rchat_set_steady_traffic` returns 9 (Invalid parameter) for a slot
 /// length other than 500, 1000 or 2000 ms.
@@ -4460,6 +4463,116 @@ pub unsafe extern "C" fn rchat_import_state_record(
     0
 }
 
+/// Re-seal one stored session record under a new state key (fix #3, the
+/// Android state-key rotation): stateless, needs no `rchat_initialize` and
+/// touches no client. Opens the RCS1 record `<record_key_in>.rcs` holds with
+/// `old_key` and seals the same kind and counter under `new_key`; the
+/// record's file name is HMAC(state_key, peer_ik), so the new name is
+/// derived here — the core owns the record format and the app cannot
+/// re-derive it. A record that already opens under `new_key` (a rotation
+/// interrupted after resealing it) is reported, not re-sealed.
+///
+/// `out` is the caller's buffer, written on success: the first byte is the
+/// new record key's length (4 for `meta`, else 32), then the ASCII record
+/// key itself, and on 0 the re-sealed record follows (exactly `sealed_len`
+/// bytes — a reseal preserves the sealed length). `out_len` must be at least
+/// `33 + sealed_len` and is checked before `sealed` is read.
+///
+/// Returns 0 resealed (wrote 1 + name length + `sealed_len`), 1 already
+/// under `new_key` (wrote 1 + name length: the record's name under
+/// `new_key`, equal to `record_key_in`'s content being valid — the caller
+/// drops the stale-named duplicate), -1 invalid (a NULL or wrong-length key,
+/// NULL or malformed `record_key_in`, NULL `sealed` or `sealed_len == 0`,
+/// `out_len` too small; code 9), -2 the record opens under neither key or is
+/// malformed or oversize (code 37). `old_key == new_key` makes the call an
+/// authentication check: 0 or 1 when the record opens under that key, -2
+/// otherwise.
+///
+/// # Safety
+///
+/// `our_ik`, `old_key` and `new_key` must be NULL or valid for reads of 32
+/// bytes; `record_key_in` must be NULL or a NUL-terminated string; `sealed`
+/// must be NULL or valid for reads of `sealed_len` bytes; `out` must be NULL
+/// or valid for writes of `out_len` bytes, for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn rchat_reseal_state_record(
+    our_ik: *const u8,
+    old_key: *const u8,
+    new_key: *const u8,
+    record_key_in: *const c_char,
+    sealed: *const u8,
+    sealed_len: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> c_int {
+    let mut ik = zeroize::Zeroizing::new([0u8; 32]);
+    let mut ok = zeroize::Zeroizing::new([0u8; 32]);
+    let mut nk = zeroize::Zeroizing::new([0u8; 32]);
+    let invalid = |msg: &str| -> c_int {
+        record_error(9, msg.to_string());
+        -1
+    };
+    // Before anything reads the buffers (the Task 2 carry-over).
+    if sealed_len > crate::state_store::MAX_RECORD_BYTES {
+        record_error(37, "Record too large".to_string());
+        return -2;
+    }
+    if our_ik.is_null() || old_key.is_null() || new_key.is_null() {
+        return invalid("Invalid parameter");
+    }
+    if sealed.is_null() || sealed_len == 0 {
+        return invalid("Invalid parameter");
+    }
+    if out.is_null() || out_len < 33 + sealed_len {
+        return invalid("Invalid parameter");
+    }
+    let Some(key_in) = arg(record_key_in).filter(|k| crate::state_store::is_valid_record_key(k))
+    else {
+        return invalid("Invalid record key");
+    };
+    // SAFETY: non-null with 32 readable bytes each, checked above.
+    unsafe {
+        ik.copy_from_slice(std::slice::from_raw_parts(our_ik, 32));
+        ok.copy_from_slice(std::slice::from_raw_parts(old_key, 32));
+        nk.copy_from_slice(std::slice::from_raw_parts(new_key, 32));
+    }
+    // SAFETY: non-null with `sealed_len` readable bytes, checked above.
+    let bytes = unsafe { std::slice::from_raw_parts(sealed, sealed_len) };
+    let write_name = |out: *mut u8, record_key: &str| {
+        // SAFETY: `out` holds at least 33 writable bytes; a record key is at
+        // most 32 (`meta` or 32 hex digits).
+        unsafe {
+            out.write(u8::try_from(record_key.len()).expect("a record key is at most 32 bytes"));
+            std::ptr::copy_nonoverlapping(record_key.as_ptr(), out.add(1), record_key.len());
+        }
+    };
+    match crate::state_store::reseal_record(&ik, &ok, &nk, &key_in, bytes) {
+        Ok(crate::state_store::ResealOutcome::Resealed {
+            record_key,
+            sealed: resealed,
+        }) => {
+            write_name(out, &record_key);
+            // SAFETY: `out` holds `out_len` >= 33 + sealed_len writable bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    resealed.as_ptr(),
+                    out.add(1 + record_key.len()),
+                    resealed.len(),
+                );
+            }
+            0
+        }
+        Ok(crate::state_store::ResealOutcome::AlreadyNewKey { record_key }) => {
+            write_name(out, &record_key);
+            1
+        }
+        Err(e) => {
+            record_error(37, format!("Reseal failed: {e:?}"));
+            -2
+        }
+    }
+}
+
 /// Forget the platform trust roots read so far (Android's system CA store,
 /// without the CAs the user disabled): the next TLS handshake reads them
 /// again, so a CA disabled in the system settings stops being trusted
@@ -7659,6 +7772,172 @@ pub(crate) mod tests {
             g.staged_records.is_empty() && g.state_key.is_none() && g.state_write.is_none(),
             "a full disconnect drops the account's store and staged records"
         );
+    }
+
+    /// Fix #3: the stateless reseal helper renames and reseals a record,
+    /// reports an already-migrated one, validates every argument, and needs
+    /// no `rchat_initialize`.
+    #[test]
+    fn reseal_state_record_ffi() {
+        use crate::state_store::{PeerRecordV2, StateKeys, KIND_PEER, META_KEY};
+        let me = [0xA1; 32];
+        let peer = [0xBB; 32];
+        let old = StateKeys::new([1; 32]);
+        let new = StateKeys::new([2; 32]);
+        let body = bincode::serialize(&PeerRecordV2 {
+            peer_ik: peer,
+            seen_ids: vec![[5; 16]],
+            ..Default::default()
+        })
+        .unwrap();
+        let old_name = old.record_key_for(&peer);
+        let new_name = new.record_key_for(&peer);
+        let sealed = old.seal(&me, &old_name, KIND_PEER, 9, &body);
+        let meta = old.seal(&me, META_KEY, crate::state_store::KIND_META, 1, &body);
+
+        let call = |old_key: &[u8; 32],
+                    new_key: &[u8; 32],
+                    name: &str,
+                    bytes: &[u8],
+                    out: &mut [u8]|
+         -> (i32, usize) {
+            let c = CString::new(name).unwrap();
+            let rc = unsafe {
+                rchat_reseal_state_record(
+                    me.as_ptr(),
+                    old_key.as_ptr(),
+                    new_key.as_ptr(),
+                    c.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            (
+                rc,
+                if rc < 0 {
+                    0
+                } else if rc == 0 {
+                    1 + name.len() + bytes.len()
+                } else {
+                    1 + name.len()
+                },
+            )
+        };
+        let name_of = |out: &[u8]| -> String {
+            String::from_utf8(out[1..1 + out[0] as usize].to_vec()).unwrap()
+        };
+
+        // Uninitialised is fine: the helper is stateless.
+        let mut out = vec![0u8; 33 + sealed.len()];
+        let (rc, n) = call(&[1; 32], &[2; 32], &old_name, &sealed, &mut out);
+        assert_eq!(rc, 0);
+        assert_eq!(name_of(&out), new_name);
+        let (kind, counter, plain) = new.open(&me, &new_name, &out[33..n]).unwrap();
+        assert_eq!(
+            (kind, counter, plain.as_slice()),
+            (KIND_PEER, 9, body.as_slice())
+        );
+
+        // Already under the new key: only the name comes back.
+        let under_new = new.seal(&me, &new_name, KIND_PEER, 9, &body);
+        let (rc, n) = call(&[1; 32], &[2; 32], &new_name, &under_new, &mut out);
+        assert_eq!(rc, 1);
+        assert_eq!(n, 1 + new_name.len());
+        assert_eq!(name_of(&out), new_name);
+
+        // Equal keys authenticate: meta keeps its name.
+        let mut meta_out = vec![0u8; 33 + meta.len()];
+        let (rc, n) = call(&[1; 32], &[1; 32], META_KEY, &meta, &mut meta_out);
+        assert_eq!(rc, 0);
+        assert_eq!(name_of(&meta_out), META_KEY);
+        assert_eq!(n, 1 + META_KEY.len() + meta.len());
+
+        // Wrong key, tampering and oversize: -2 with code 37.
+        let (rc, _) = call(&[9; 32], &[2; 32], &old_name, &sealed, &mut out);
+        assert_eq!(rc, -2);
+        assert_eq!(rchat_last_error_code(), 37);
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let (rc, _) = call(&[1; 32], &[2; 32], &old_name, &tampered, &mut out);
+        assert_eq!(rc, -2);
+        assert_eq!(rchat_last_error_code(), 37);
+        let huge = vec![0u8; crate::state_store::MAX_RECORD_BYTES + 1];
+        let (rc, _) = call(&[1; 32], &[2; 32], &old_name, &huge, &mut out);
+        assert_eq!(rc, -2);
+        assert_eq!(rchat_last_error_code(), 37);
+
+        // Argument validation: -1 with code 9. The out-length check runs
+        // before `sealed` is read, so a 1-byte buffer is never overflowed.
+        let c = CString::new(&*old_name).unwrap();
+        let mut small = [0u8; 4];
+        assert_eq!(
+            unsafe {
+                rchat_reseal_state_record(
+                    me.as_ptr(),
+                    [1u8; 32].as_ptr(),
+                    [2u8; 32].as_ptr(),
+                    c.as_ptr(),
+                    [1u8].as_ptr(),
+                    1,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+        assert_eq!(
+            unsafe {
+                rchat_reseal_state_record(
+                    std::ptr::null(),
+                    [1u8; 32].as_ptr(),
+                    [2u8; 32].as_ptr(),
+                    c.as_ptr(),
+                    sealed.as_ptr(),
+                    sealed.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        let bad = CString::new("../meta").unwrap();
+        assert_eq!(
+            unsafe {
+                rchat_reseal_state_record(
+                    me.as_ptr(),
+                    [1u8; 32].as_ptr(),
+                    [2u8; 32].as_ptr(),
+                    bad.as_ptr(),
+                    sealed.as_ptr(),
+                    sealed.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(rchat_last_error_code(), 9);
+        // The sealed length is checked before the buffer is read.
+        assert_eq!(
+            unsafe {
+                rchat_reseal_state_record(
+                    me.as_ptr(),
+                    [1u8; 32].as_ptr(),
+                    [2u8; 32].as_ptr(),
+                    c.as_ptr(),
+                    [1u8].as_ptr(),
+                    usize::MAX,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -2
+        );
+        assert_eq!(rchat_last_error_code(), 37);
     }
 
     #[test]

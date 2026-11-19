@@ -372,6 +372,73 @@ pub fn is_valid_record_key(k: &str) -> bool {
     k == META_KEY || (k.len() == 32 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
+/// What [`reseal_record`] did with one stored record (fix #3, the Android
+/// state-key rotation): the outcome tells the caller whether it holds new
+/// sealed bytes or a stale-named duplicate of an already-migrated record.
+#[derive(Debug)]
+pub enum ResealOutcome {
+    /// Opened under the old key and re-sealed under the new one: the record's
+    /// name under the new key (the meta record keeps `meta`) and the RCS1
+    /// sealed bytes, same kind, version and counter.
+    Resealed { record_key: String, sealed: Vec<u8> },
+    /// Already opened under the new key (an interrupted earlier rotation):
+    /// `record_key` is the name the record is valid under, which equals
+    /// `record_key_in` (the AAD binds the name). The caller drops the
+    /// stale-named duplicate file.
+    AlreadyNewKey { record_key: String },
+}
+
+/// Re-seal one stored record under a new state key: open `record_key_in`'s
+/// record with `old_key`, seal the same kind and counter under `new_key` and
+/// derive the record's new name, which is HMAC(state_key, peer_ik) and so
+/// changes with the key (the core owns the record format; the app cannot
+/// re-derive the name). A record that already opens under `new_key` is
+/// reported as [`ResealOutcome::AlreadyNewKey`], so a rotation interrupted
+/// between writing the new file and deleting the old one resumes cleanly.
+/// Any other failure is the record's [`RestoreError`] and the caller leaves
+/// the file alone (it then fails closed at import, as today). With
+/// `old_key == new_key` the call is an authentication check: it succeeds
+/// exactly when the record opens under that key.
+pub fn reseal_record(
+    our_ik: &[u8; 32],
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    record_key_in: &str,
+    sealed: &[u8],
+) -> Result<ResealOutcome, RestoreError> {
+    let old = StateKeys::new(*old_key);
+    match old.open(our_ik, record_key_in, sealed) {
+        Ok((kind, counter, body)) => {
+            let new = StateKeys::new(*new_key);
+            let record_key = record_key_under(&new, kind, &body)?;
+            let sealed = new.seal(our_ik, &record_key, kind, counter, &body);
+            Ok(ResealOutcome::Resealed { record_key, sealed })
+        }
+        // Only an old-generation record that simply doesn't open (a wrong
+        // name, a tampered blob) may already be sealed under the new key.
+        Err(RestoreError::Tag) if old_key != new_key => {
+            let new = StateKeys::new(*new_key);
+            match new.open(our_ik, record_key_in, sealed) {
+                Ok(_) => Ok(ResealOutcome::AlreadyNewKey {
+                    record_key: record_key_in.to_string(),
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The record's file name under `keys`: `meta` for the meta record, else
+/// HMAC-derived from the peer identity carried in the (opened) body.
+fn record_key_under(keys: &StateKeys, kind: u8, body: &[u8]) -> Result<String, RestoreError> {
+    if kind == KIND_META {
+        return Ok(META_KEY.to_string());
+    }
+    let rec: PeerRecordV2 = bincode::deserialize(body).map_err(|_| RestoreError::Parse)?;
+    Ok(keys.record_key_for(&rec.peer_ik))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +568,125 @@ mod tests {
             (a, vec![[4; 16]]),
             "SP3: a peer record round-trips"
         );
+    }
+
+    /// Fix #3: reseal preserves kind, counter and body, renames the record to
+    /// the name the new key derives, and refuses a wrong key, tampering and
+    /// an oversize record; the meta record keeps `meta`.
+    #[test]
+    fn reseal_round_trips_and_renames() {
+        let old = StateKeys::new([1; 32]);
+        let new = StateKeys::new([2; 32]);
+        let me = [0xA1; 32];
+        let peer = [0xBB; 32];
+        let peer_body = bincode::serialize(&PeerRecordV2 {
+            peer_ik: peer,
+            seen_ids: vec![[5; 16]],
+            ..Default::default()
+        })
+        .unwrap();
+        let old_name = old.record_key_for(&peer);
+        let sealed = old.seal(&me, &old_name, KIND_PEER, 11, &peer_body);
+        let new_name = new.record_key_for(&peer);
+        match reseal_record(&me, &[1; 32], &[2; 32], &old_name, &sealed).unwrap() {
+            ResealOutcome::Resealed {
+                record_key,
+                sealed: resealed,
+            } => {
+                assert_eq!(record_key, new_name, "the new name matches record_key_for");
+                assert_ne!(record_key, old_name);
+                let (kind, counter, plain) = new.open(&me, &record_key, &resealed).unwrap();
+                assert_eq!(
+                    (kind, counter, plain.as_slice()),
+                    (KIND_PEER, 11, peer_body.as_slice())
+                );
+                // The same kind and counter byte-for-byte in the header.
+                assert_eq!(&resealed[..14], &sealed[..14]);
+            }
+            other => panic!("expected Resealed, got {:?}", outcome_kind(&other)),
+        }
+        // Wrong old key: neither key opens the old generation's record.
+        assert_eq!(
+            reseal_record(&me, &[9; 32], &[2; 32], &old_name, &sealed).unwrap_err(),
+            RestoreError::Tag
+        );
+        // Tampered bytes fail the tag under both keys.
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert_eq!(
+            reseal_record(&me, &[1; 32], &[2; 32], &old_name, &tampered).unwrap_err(),
+            RestoreError::Tag
+        );
+        // Oversize is refused before anything is parsed.
+        let huge = vec![0u8; MAX_RECORD_BYTES + 1];
+        assert_eq!(
+            reseal_record(&me, &[1; 32], &[2; 32], &old_name, &huge).unwrap_err(),
+            RestoreError::TooLarge
+        );
+        // The meta record keeps its name across a reseal.
+        let meta_body = body();
+        let meta = old.seal(&me, META_KEY, KIND_META, 3, &meta_body);
+        match reseal_record(&me, &[1; 32], &[2; 32], META_KEY, &meta).unwrap() {
+            ResealOutcome::Resealed { record_key, sealed } => {
+                assert_eq!(record_key, META_KEY);
+                let (kind, counter, plain) = new.open(&me, META_KEY, &sealed).unwrap();
+                assert_eq!(
+                    (kind, counter, plain.as_slice()),
+                    (KIND_META, 3, meta_body.as_slice())
+                );
+            }
+            other => panic!("expected Resealed, got {:?}", outcome_kind(&other)),
+        }
+    }
+
+    /// Fix #3: a record that already opens under the new key (an interrupted
+    /// rotation) is reported, not re-sealed; old_key == new_key is an open
+    /// check that succeeds only when the record opens under that key.
+    #[test]
+    fn reseal_reports_already_migrated_and_checks_with_one_key() {
+        let new = StateKeys::new([2; 32]);
+        let me = [0xA1; 32];
+        let peer = [0xBB; 32];
+        let peer_body = bincode::serialize(&PeerRecordV2 {
+            peer_ik: peer,
+            ..Default::default()
+        })
+        .unwrap();
+        let new_name = new.record_key_for(&peer);
+        let under_new = new.seal(&me, &new_name, KIND_PEER, 4, &peer_body);
+        // Already migrated: the name it carries is the new key's name for it.
+        match reseal_record(&me, &[1; 32], &[2; 32], &new_name, &under_new).unwrap() {
+            ResealOutcome::AlreadyNewKey { record_key } => assert_eq!(record_key, new_name),
+            other => panic!("expected AlreadyNewKey, got {:?}", outcome_kind(&other)),
+        }
+        // The same call with equal keys is the verify pass: opens under the key.
+        match reseal_record(&me, &[2; 32], &[2; 32], &new_name, &under_new).unwrap() {
+            ResealOutcome::Resealed { record_key, .. } => assert_eq!(record_key, new_name),
+            other => panic!("expected Resealed, got {:?}", outcome_kind(&other)),
+        }
+        // A damaged record fails the check under one key without a retry path.
+        let mut damaged = under_new.clone();
+        let last = damaged.len() - 2;
+        damaged[last] ^= 1;
+        assert_eq!(
+            reseal_record(&me, &[2; 32], &[2; 32], &new_name, &damaged).unwrap_err(),
+            RestoreError::Tag
+        );
+        // A peer record with an unparseable body opens but cannot be renamed.
+        let junk_body = vec![0xDE; 64];
+        let bad_body = new.seal(&me, &new_name, KIND_PEER, 1, &junk_body);
+        assert_eq!(
+            reseal_record(&me, &[2; 32], &[2; 32], &new_name, &bad_body).unwrap_err(),
+            RestoreError::Parse
+        );
+    }
+
+    fn outcome_kind(o: &ResealOutcome) -> &'static str {
+        match o {
+            ResealOutcome::Resealed { .. } => "Resealed",
+            ResealOutcome::AlreadyNewKey { .. } => "AlreadyNewKey",
+        }
     }
 
     /// Carry-over from the Task 1 review: a body is serialised into a wiped

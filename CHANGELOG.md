@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.1 (2026-11-19)
+
+Security fixes. Relay operators should update; apps keep working with 2.1.0 and 2.1.1 relays in both directions.
+
+- Relay: per-account caps on the offline message store. Previously the only bounds were a server-level byte cap and a fixed 1000-message cap, so a small number of free accounts could fill the shared store and stop offline delivery for everyone. The new limits are per account and configurable; the defaults refuse nothing a single normal account can reach.
+- Core: the ratchet's authenticated data can now bind the message id (rollout step 1 of 3: this release accepts both forms and still sends the legacy one, so nothing changes on the wire yet). Without the binding, a relay could re-wrap one message's body under another message's id.
+- Core: the state-store sealing gains a per-generation key API (used by the Android app for its per-generation Keystore aliases).
+- Dependencies: rustls 0.23.46, rustls-webpki 0.103.16, tokio-rustls 0.26.6, webpki-roots 1.0.11, tokio 1.54.1, rand 0.8.8.
+
 ## 2.1.0 (2026-10-31)
 
 Voice and video calls through your own relay. Calls need a 2.1.0 relay and an app with calls (Android today); messaging stays compatible with 2.0.0 apps and relays.

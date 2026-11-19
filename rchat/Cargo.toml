@@ -1,6 +1,6 @@
 [package]
 name = "rchat-server"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2021"
 authors = ["RChat Team"]
 description = "Secure end-to-end encrypted chat server"
@@ -51,7 +51,6 @@ prometheus = { version = "0.13", default-features = false }
 lazy_static = "1.4"
 
 # Configuration
-config = "0.14"
 
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }

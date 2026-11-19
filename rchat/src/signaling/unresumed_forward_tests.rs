@@ -234,12 +234,53 @@ async fn rq3b_publish_racing_the_offline_store_is_never_stranded() {
     assert_eq!(queued_len(&state, &b), 0, "never stranded");
 }
 
+/// Security fix #2 (review): the rolling per-connection offline-send
+/// budget is charged where A's message enters the offline store. Over it,
+/// A's message is refused with the same queue-full answer as a full queue
+/// (never acknowledged), counted on its own label; what A already queued
+/// is untouched.
+#[tokio::test]
+async fn sender_budget_over_the_window_refuses_with_the_queue_full_answer() {
+    let mut config = test_config();
+    config.offline_queue.sender_budget_bytes = 400;
+    config.offline_queue.sender_window_secs = Some(3_600);
+    let (addr, state) = start(config).await;
+    let (a, b) = (TestIdentity::from_seed(0x9e), TestIdentity::from_seed(0x9f));
+    let (mut wa, wb, ca, _cb) = pair_up(&state, addr, &a, &b).await;
+    drop(wb);
+    b_gone(&state, &b).await;
+    let before = metrics::rejections(metrics::REJECT_OFFLINE_SENDER_BUDGET);
+    // 72 + 64 overhead = 136 charged bytes each: two fit the 400-byte
+    // budget, the third is over it (B's own caps are nowhere near).
+    for i in 0..2 {
+        wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 72]))
+            .await
+            .unwrap();
+        let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
+        assert!(has_ack(&got), "message {i} queued and acked: {got:?}");
+    }
+    wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 72]))
+        .await
+        .unwrap();
+    let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
+    assert!(
+        has_queue_full(&got),
+        "a spent sender budget reads as a full queue: {got:?}"
+    );
+    assert!(!has_ack(&got), "a refused message is never acknowledged");
+    assert!(
+        metrics::rejections(metrics::REJECT_OFFLINE_SENDER_BUDGET) > before,
+        "counted on its own label"
+    );
+    assert_eq!(queued_len(&state, &b), 2, "nothing queued was evicted");
+}
+
 /// RQ1c: the hand-over fails and B's queue has no room: the re-queue is
 /// refused, so A gets the queue-full error and no acknowledgement.
 #[tokio::test]
 async fn rq1c_failed_forward_over_the_caps_is_refused_not_acked() {
     let mut config = test_config();
-    config.offline_queue_max_bytes_per_recipient = 600;
+    config.offline_queue.max_bytes_per_recipient = Some(600);
     let (addr, state) = start(config).await;
     let (a, b) = (TestIdentity::from_seed(0x9a), TestIdentity::from_seed(0x9b));
     let (mut wa, wb, ca, _cb) = pair_up(&state, addr, &a, &b).await;
@@ -304,7 +345,7 @@ async fn rq1d_failed_forward_requeue_is_admitted_and_charged() {
 async fn rq6_full_queue_answer_is_the_same_online_or_offline() {
     async fn frames(online: bool, seed: u8) -> Vec<(u8, usize)> {
         let mut config = test_config();
-        config.offline_queue_max_bytes_per_recipient = 600;
+        config.offline_queue.max_bytes_per_recipient = Some(600);
         let (addr, state) = start(config).await;
         let (a, b) = (
             TestIdentity::from_seed(seed),
@@ -378,10 +419,10 @@ async fn rq7_a_stuck_unresumed_member_never_stalls_the_sender() {
 }
 
 /// R26: steady-sized entries (exactly `STEADY_SEALED_LEN`) may fill at most
-/// half of a recipient's offline queue. Beyond that they are refused like a
-/// full queue and never acknowledged (the sender keeps them tracked), and
-/// nothing already queued is evicted; other sizes are still admitted up to
-/// the full per-recipient limit.
+/// half of a recipient's message-count cap. Beyond that they are refused
+/// like a full queue and never acknowledged (the sender keeps them tracked),
+/// and nothing already queued is evicted; other sizes are still admitted up
+/// to the full count cap.
 #[tokio::test]
 async fn steady_sized_entries_are_capped_at_half_the_offline_queue() {
     let (addr, state) = start(test_config()).await;
@@ -390,7 +431,8 @@ async fn steady_sized_entries_are_capped_at_half_the_offline_queue() {
     drop(wb);
     b_gone(&state, &b).await;
     let steady = || vec![0x02; limits::STEADY_SEALED_LEN];
-    let cap = limits::OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT;
+    let max = state.config.offline_queue.max_messages_per_recipient;
+    let cap = max / 2;
     for _ in 0..cap - 1 {
         queue_test_message(&state, &b, steady());
     }
@@ -413,7 +455,7 @@ async fn steady_sized_entries_are_capped_at_half_the_offline_queue() {
     );
     assert_eq!(queued_len(&state, &b), cap, "nothing evicted");
     // Other sizes still fill the queue up to the full limit.
-    for _ in 0..limits::OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT - cap - 1 {
+    for _ in 0..max - cap - 1 {
         queue_test_message(&state, &b, vec![0x02; 200]);
     }
     wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 200]))
@@ -421,10 +463,7 @@ async fn steady_sized_entries_are_capped_at_half_the_offline_queue() {
         .unwrap();
     let got = frames_until_quiet(&mut wa, Duration::from_millis(300)).await;
     assert!(has_ack(&got), "another size, up to the full limit: {got:?}");
-    assert_eq!(
-        queued_len(&state, &b),
-        limits::OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT
-    );
+    assert_eq!(queued_len(&state, &b), max);
     wa.send(relay_on(ca.target_circuit_id, &ca.token, vec![0x02; 200]))
         .await
         .unwrap();

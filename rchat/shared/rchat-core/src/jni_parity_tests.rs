@@ -139,7 +139,7 @@ fn table_exports_and_kotlin_agree() {
         kotlin.len(),
         "overloaded or repeated external fun"
     );
-    assert_eq!(t.len(), 84);
+    assert_eq!(t.len(), 85);
 }
 
 #[test]
@@ -229,8 +229,8 @@ fn kotlin_error_enum_mirrors_the_ffi_table() {
         .collect();
     assert_eq!(
         ffi_codes,
-        (0..=36).collect::<BTreeSet<_>>(),
-        "ffi.rs documents 0..=36"
+        (0..=37).collect::<BTreeSet<_>>(),
+        "ffi.rs documents 0..=37"
     );
     assert_eq!(kt_codes, ffi_codes, "CoreError.kt mirrors ffi.rs");
 }
@@ -288,6 +288,7 @@ const ERROR_NAMES: &[(&str, i32, &[&str])] = &[
     ("VIDEO_UNAVAILABLE", 34, &["VideoUnavailable"]),
     ("RELAY_NO_VIDEO", 35, &["RelayNoVideo"]),
     ("VIDEO_TOO_SOON", 36, &["VideoTooSoon"]),
+    ("RESEAL_FAILED", 37, &[]),
 ];
 
 #[test]
