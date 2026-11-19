@@ -18,7 +18,10 @@ fn big_config() -> ServerConfig {
         max_message_bytes: 16 << 20,
         // Room for more than one copy of a big frame: a double salvage
         // would be admitted, and caught, rather than refused by the cap.
-        offline_queue_max_bytes_per_recipient: 64 << 20,
+        offline_queue: crate::config::OfflineQueueConfig {
+            max_bytes_per_recipient: Some(64 << 20),
+            ..Default::default()
+        },
         ..test_config()
     }
 }
@@ -315,7 +318,7 @@ async fn salvaged_steady_sized_records_over_the_sub_cap_are_kept() {
     let state = server.state();
     let r = TestIdentity::random();
     let tag = tags::id_tag(&r.bytes);
-    let cap = limits::OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT;
+    let cap = state.config.offline_queue.max_messages_per_recipient / 2;
     for i in 0..cap {
         queue_test_message(&state, &r, payload(limits::STEADY_SEALED_LEN, i as u8));
     }

@@ -714,6 +714,11 @@ async fn offline_queue_with_hostile_message_ids_does_not_panic_or_leak() {
                 auth_nonce: proof_ready.then_some([0x4e; 32]),
                 channel_binding: [0x42; 32],
                 proven_identity: None,
+                offline_send_budget: crate::limits::OfflineSendBudget::new(
+                    16 << 20,
+                    1024,
+                    Duration::from_secs(900),
+                ),
             },
         );
         rx

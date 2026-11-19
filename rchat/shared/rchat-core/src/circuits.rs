@@ -3225,7 +3225,7 @@ impl ClientInner {
         } else {
             crate::padding::pad(plaintext)
         });
-        let (ciphertext, header) = session.encrypt_message(&padded)?;
+        let (ciphertext, header) = session.encrypt_message(&padded, &message_id)?;
         // §A.4: the first message sealed under a session we initiated
         // travels as its session-init. Claimed under this guard, so a
         // concurrent seal cannot make a second init.
@@ -3871,24 +3871,25 @@ impl ClientInner {
             .then(|| self.session_manager.ratchet_snapshots(sender_hex));
         self.decrypt_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (padded, by, binding) = match self
-            .session_manager
-            .decrypt_bound(sender_hex, ciphertext, &header)
-        {
-            Ok(ok) => ok,
-            Err(_) if self.awaiting_init(sender_hex) => {
-                // Possibly under the session whose init is still on its way
-                // (§A.3): held, retried once it is installed.
-                if self.hold_pending(held()) {
-                    self.schedule_reask(sender_hex);
+        let (padded, by, binding) =
+            match self
+                .session_manager
+                .decrypt_bound(sender_hex, ciphertext, &header, &message_id)
+            {
+                Ok(ok) => ok,
+                Err(_) if self.awaiting_init(sender_hex) => {
+                    // Possibly under the session whose init is still on its way
+                    // (§A.3): held, retried once it is installed.
+                    if self.hold_pending(held()) {
+                        self.schedule_reask(sender_hex);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Err(_) => {
-                self.record_undecryptable(&report_as, message_id, lost_resend);
-                return Ok(());
-            }
-        };
+                Err(_) => {
+                    self.record_undecryptable(&report_as, message_id, lost_resend);
+                    return Ok(());
+                }
+            };
         if by == DecryptedBy::Current {
             // The peer's first reply under a session we initiated: it has
             // our session-init, which is no longer re-sent (§A.4).

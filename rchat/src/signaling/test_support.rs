@@ -444,6 +444,14 @@ pub(super) fn bare_connection(
             peer_bundle: None,
             held: None,
             media: None,
+            offline_send_budget: {
+                let queue = &crate::config::ServerConfig::default().offline_queue;
+                crate::limits::OfflineSendBudget::new(
+                    queue.sender_budget_bytes,
+                    queue.sender_budget_messages,
+                    Duration::from_secs(queue.sender_window_secs()),
+                )
+            },
         },
         rx,
     )

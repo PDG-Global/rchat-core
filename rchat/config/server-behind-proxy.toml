@@ -69,7 +69,11 @@ rate_limit_bps = 1048576
 max_message_bytes = 4194304
 connection_timeout_secs = 300
 offline_queue_max_total_bytes = 268435456
-offline_queue_max_bytes_per_recipient = 16777216
+# Per-recipient-account caps on the offline store live in
+# [server.offline_queue] (see config/server.toml): max_bytes_per_recipient
+# and max_messages_per_recipient. The old offline_queue_max_bytes_per_recipient
+# key is deprecated for one release: accepted with a startup warning and
+# mapped to max_bytes_per_recipient while that is unset; then it is removed.
 # See docs/deployment/07-resource-limits.md for what each limit does.
 # Offline queue retention and opt-in encrypted persistence: [server.offline_queue]
 # (see config/server.toml); queued messages are memory-only by default.

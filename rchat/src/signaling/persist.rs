@@ -879,7 +879,10 @@ mod tests {
         }
         .budget_cost();
         let state = Server::new(ServerConfig {
-            offline_queue_max_bytes_per_recipient: 3 * cost,
+            offline_queue: crate::config::OfflineQueueConfig {
+                max_bytes_per_recipient: Some(3 * cost),
+                ..Default::default()
+            },
             ..test_config()
         })
         .await

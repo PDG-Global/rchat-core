@@ -356,6 +356,48 @@ pub fn ratchet_aad(header: &RatchetHeader, ad: &[u8; 64]) -> [u8; 104] {
     aad
 }
 
+/// Ratchet AAD that also binds the envelope's `message_id`: header(40) ||
+/// ad(64) || message_id(16). Without it the id lives only in the outer
+/// sealed envelope, which anyone who knows the recipient's agreement key
+/// can build, so a relay could re-wrap one message's body under another
+/// message's id (security review 2026-11-03, finding 1). Its length (120)
+/// differs from `ratchet_aad` (104), so the two forms never collide.
+pub fn ratchet_aad_bound(
+    header: &RatchetHeader,
+    ad: &[u8; 64],
+    message_id: &[u8; 16],
+) -> [u8; 120] {
+    let mut aad = [0u8; 120];
+    aad[..104].copy_from_slice(&ratchet_aad(header, ad));
+    aad[104..].copy_from_slice(message_id);
+    aad
+}
+
+/// Whether new messages are sent with the message id bound
+/// (`ratchet_aad_bound`). Rollout (security review 2026-11-03, finding 1):
+/// release N accepts both forms and still sends legacy, so older clients
+/// keep decrypting; release N+1 turns this on once clients that accept the
+/// bound form are the floor; release N+2 removes legacy acceptance.
+pub const SEND_BOUND_MESSAGE_IDS: bool = false;
+
+/// Which AAD form a received message was authenticated under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdBinding {
+    /// `ratchet_aad_bound`: the message id is authenticated end to end.
+    Bound,
+    /// `ratchet_aad`: sent by a client without the binding. Accepted during
+    /// the rollout only; the id is not authenticated.
+    Legacy,
+}
+
+/// The AAD bytes for `message_id` (bound) or none (legacy).
+fn aad_for(header: &RatchetHeader, ad: &[u8; 64], message_id: Option<&[u8; 16]>) -> Vec<u8> {
+    match message_id {
+        Some(id) => ratchet_aad_bound(header, ad, id).to_vec(),
+        None => ratchet_aad(header, ad).to_vec(),
+    }
+}
+
 /// A skipped message key in a ratchet snapshot. Wiped on drop.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkippedKeyV1 {
@@ -718,11 +760,23 @@ impl DoubleRatchet {
     }
 
     /// Encrypt with XChaCha20-Poly1305. `ad` = IK_sender || IK_recipient.
-    /// The header is built first so the AEAD can authenticate it.
+    /// The header is built first so the AEAD can authenticate it. Legacy
+    /// form: the message id is not bound (see `encrypt_with_id`).
     pub fn encrypt(
         &mut self,
         plaintext: &[u8],
         ad: &[u8; 64],
+    ) -> Result<(Vec<u8>, RatchetHeader), RChatError> {
+        self.encrypt_with_id(plaintext, ad, None)
+    }
+
+    /// `encrypt`, binding `message_id` into the AAD when given
+    /// (`ratchet_aad_bound`); `None` is the legacy form.
+    pub fn encrypt_with_id(
+        &mut self,
+        plaintext: &[u8],
+        ad: &[u8; 64],
+        message_id: Option<&[u8; 16]>,
     ) -> Result<(Vec<u8>, RatchetHeader), RChatError> {
         // Responder's first send: derive the sending chain via DH ratchet.
         if self.sending_chain_key.is_none() {
@@ -765,7 +819,7 @@ impl DoubleRatchet {
             previous_chain_length: self.previous_sending_chain_length,
             dh_public_key,
         };
-        let aad = ratchet_aad(&header, ad);
+        let aad = aad_for(&header, ad, message_id);
         let cipher = XChaCha20Poly1305::new_from_slice(&message_key[..]).map_err(|e| {
             RChatError::EncryptionFailed {
                 message: format!("Failed to create cipher: {}", e),
@@ -804,13 +858,47 @@ impl DoubleRatchet {
         header: &RatchetHeader,
         ad: &[u8; 64],
     ) -> Result<Vec<u8>, RChatError> {
+        self.decrypt_with_id(ciphertext_with_nonce, header, ad, None)
+    }
+
+    /// `decrypt` under one AAD form: bound to `message_id` when given,
+    /// legacy when `None`. Transactional, like `decrypt`.
+    pub fn decrypt_with_id(
+        &mut self,
+        ciphertext_with_nonce: &[u8],
+        header: &RatchetHeader,
+        ad: &[u8; 64],
+        message_id: Option<&[u8; 16]>,
+    ) -> Result<Vec<u8>, RChatError> {
         // The trial copy is bounded (caps below) and wiped when dropped, on
         // failure here or (as the replaced state) on success.
         let mut trial = self.clone();
-        let plaintext = trial.decrypt_in_place(ciphertext_with_nonce, header, ad)?;
+        let aad = aad_for(header, ad, message_id);
+        let plaintext = trial.decrypt_in_place(ciphertext_with_nonce, header, &aad)?;
         trial.enforce_bounds();
         *self = trial;
         Ok(plaintext)
+    }
+
+    /// Decrypt a message carried under `message_id`, accepting both AAD
+    /// forms during the rollout: bound first, then legacy. Each attempt is
+    /// transactional, so a failed first attempt leaves no trace. A bound
+    /// body re-wrapped under another id fails both forms (its AAD carries
+    /// the original id), so the relay cannot move it; only bodies a legacy
+    /// sender produced remain movable until legacy acceptance is removed.
+    pub fn decrypt_compat(
+        &mut self,
+        ciphertext_with_nonce: &[u8],
+        header: &RatchetHeader,
+        ad: &[u8; 64],
+        message_id: &[u8; 16],
+    ) -> Result<(Vec<u8>, IdBinding), RChatError> {
+        match self.decrypt_with_id(ciphertext_with_nonce, header, ad, Some(message_id)) {
+            Ok(plaintext) => Ok((plaintext, IdBinding::Bound)),
+            Err(_) => self
+                .decrypt_with_id(ciphertext_with_nonce, header, ad, None)
+                .map(|plaintext| (plaintext, IdBinding::Legacy)),
+        }
     }
 
     /// Skipped keys held across the current and stashed chains.
@@ -863,9 +951,8 @@ impl DoubleRatchet {
         &mut self,
         ciphertext_with_nonce: &[u8],
         header: &RatchetHeader,
-        ad: &[u8; 64],
+        aad: &[u8],
     ) -> Result<Vec<u8>, RChatError> {
-        let aad = ratchet_aad(header, ad);
         let header_dh = header.dh_public_key;
         let is_current = self
             .remote_dh_key
@@ -878,7 +965,7 @@ impl DoubleRatchet {
             if let Some(old) = self.old_receiving_chains.get_mut(&header_dh) {
                 return Self::decrypt_on_chain(
                     ciphertext_with_nonce,
-                    &aad,
+                    aad,
                     header,
                     &mut old.chain_key,
                     &mut old.next_message_number,
@@ -912,7 +999,7 @@ impl DoubleRatchet {
         let mut skipped = std::mem::take(&mut self.skipped_message_keys);
         let result = Self::decrypt_on_chain(
             ciphertext_with_nonce,
-            &aad,
+            aad,
             header,
             &mut chain,
             &mut next_num,
@@ -1560,6 +1647,68 @@ mod tests {
         bob.initialize_bob(&bob_identity, &alice_ephemeral_pub)
             .unwrap();
         (alice, bob)
+    }
+
+    /// Security review 2026-11-03, finding 1: a bound message decrypts
+    /// only under its own id, as `Bound`; legacy messages still decrypt
+    /// through `decrypt_compat`, as `Legacy`.
+    #[test]
+    fn bound_message_id_round_trip_and_legacy_compat() {
+        let (mut alice, mut bob) = ratchet_pair();
+        let x1 = [1u8; 16];
+        let (c1, h1) = alice
+            .encrypt_with_id(b"bound", &ad(1, 2), Some(&x1))
+            .unwrap();
+        assert_eq!(
+            bob.decrypt_compat(&c1, &h1, &ad(1, 2), &x1).unwrap(),
+            (b"bound".to_vec(), IdBinding::Bound)
+        );
+        let x2 = [2u8; 16];
+        let (c2, h2) = alice.encrypt(b"legacy", &ad(1, 2)).unwrap();
+        assert_eq!(
+            bob.decrypt_compat(&c2, &h2, &ad(1, 2), &x2).unwrap(),
+            (b"legacy".to_vec(), IdBinding::Legacy)
+        );
+    }
+
+    /// Finding 1 attack: the relay re-wraps bound message X2's body under
+    /// X3's id. It fails both forms, leaves the ratchet intact, and the real
+    /// X2 and X3 still decrypt afterwards under their own ids.
+    #[test]
+    fn bound_body_under_another_id_is_refused_without_state_change() {
+        let (mut alice, mut bob) = ratchet_pair();
+        let (x2, x3) = ([2u8; 16], [3u8; 16]);
+        let (c2, h2) = alice.encrypt_with_id(b"two", &ad(1, 2), Some(&x2)).unwrap();
+        let (c3, h3) = alice
+            .encrypt_with_id(b"three", &ad(1, 2), Some(&x3))
+            .unwrap();
+        assert!(bob.decrypt_compat(&c2, &h2, &ad(1, 2), &x3).is_err());
+        assert!(bob.decrypt_with_id(&c2, &h2, &ad(1, 2), None).is_err());
+        assert_eq!(
+            bob.decrypt_compat(&c3, &h3, &ad(1, 2), &x3).unwrap(),
+            (b"three".to_vec(), IdBinding::Bound)
+        );
+        assert_eq!(
+            bob.decrypt_compat(&c2, &h2, &ad(1, 2), &x2).unwrap(),
+            (b"two".to_vec(), IdBinding::Bound)
+        );
+    }
+
+    /// The two AAD forms never collide: a bound body never opens as legacy
+    /// and a legacy body never opens as bound.
+    #[test]
+    fn bound_and_legacy_forms_do_not_cross() {
+        let (mut alice, mut bob) = ratchet_pair();
+        let id = [7u8; 16];
+        let (cb, hb) = alice.encrypt_with_id(b"b", &ad(1, 2), Some(&id)).unwrap();
+        assert!(bob.decrypt_with_id(&cb, &hb, &ad(1, 2), None).is_err());
+        let (cl, hl) = alice.encrypt(b"l", &ad(1, 2)).unwrap();
+        assert!(bob.decrypt_with_id(&cl, &hl, &ad(1, 2), Some(&id)).is_err());
+        assert_eq!(
+            bob.decrypt_with_id(&cb, &hb, &ad(1, 2), Some(&id)).unwrap(),
+            b"b"
+        );
+        assert_eq!(bob.decrypt(&cl, &hl, &ad(1, 2)).unwrap(), b"l");
     }
 
     /// K14 (AAD): a flipped header bit fails, and the failure leaves the

@@ -10,7 +10,8 @@
 //! * [`TokenBucket`] - per-connection inbound byte budget (`rate_limit_bps`).
 //! * [`ConnTx`] - bounded per-connection outbound queue with an explicit
 //!   slow-consumer policy (see the type docs).
-//! * [`OfflineBudget`] - global byte budget for the offline message store.
+//! * [`OfflineBudget`] - the offline message store's budgets: a global byte
+//!   ceiling plus per-recipient-account byte and message-count caps.
 //!
 //! None of this code logs addresses. The per-address table stores only a
 //! keyed BLAKE3 digest of the (normalised) address, with a random key that
@@ -24,6 +25,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_tungstenite::tungstenite::Message;
@@ -70,9 +72,6 @@ pub const MAX_SIGNALING_BYTES: usize = 16 << 10;
 /// header peek. The TLS handshake timeout is handled by the acceptor.
 pub const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum number of queued offline messages per recipient identity.
-pub const OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT: usize = 1000;
-
 /// Length of a steady-traffic sealed payload (protocol v3 §B): the ratchet
 /// envelope around a plaintext padded to exactly 1 KiB. Kept equal to the
 /// core's constants below.
@@ -81,21 +80,6 @@ const _: () = assert!(
     STEADY_SEALED_LEN
         == rchat_core::sealed::RATCHET_ENVELOPE_OVERHEAD + rchat_core::steady::STEADY_PLAINTEXT_LEN
 );
-
-/// R26: entries of exactly `STEADY_SEALED_LEN` may fill at most half of a
-/// recipient's offline queue (by count). Beyond it they are refused like a
-/// full queue (no ack, so the sender keeps them tracked); nothing is ever
-/// evicted. Counted per recipient only: no per-sender share or tag, which
-/// would link senders to recipients beyond §5.2's rule.
-pub const OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT: usize =
-    OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT / 2;
-
-/// Whether a payload of `payload_len` bytes fits the steady-size sub-cap of
-/// a queue already holding `steady_sized` entries of that size. Other sizes
-/// always pass (the full-queue limits still apply to them).
-pub fn steady_sized_admits(steady_sized: usize, payload_len: usize) -> bool {
-    payload_len != STEADY_SEALED_LEN || steady_sized < OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT
-}
 
 /// Fixed per-message bookkeeping overhead counted against the offline budget
 /// in addition to the payload and id strings.
@@ -1214,6 +1198,7 @@ impl HeldBudget {
     }
 
     /// Reserve `cost` bytes relay-wide, if they fit.
+    #[allow(deprecated)] // MSRV: std's fetch_update deprecation wants try_update (stabilised 1.105); keep fetch_update until the MSRV passes it.
     pub fn try_add(&self, cost: usize) -> bool {
         let max = self.max_total;
         self.used
@@ -1224,6 +1209,7 @@ impl HeldBudget {
             .is_ok()
     }
 
+    #[allow(deprecated)] // MSRV: std's fetch_update deprecation wants try_update (stabilised 1.105); keep fetch_update until the MSRV passes it.
     pub fn release(&self, cost: usize) {
         let _ = self
             .used
@@ -1245,25 +1231,49 @@ impl HeldBudget {
 /// Why a message could not be stored for an offline recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfflineRejection {
+    /// The recipient's account is over its per-recipient byte or
+    /// message-count cap (`[server.offline_queue] max_bytes_per_recipient`
+    /// / `max_messages_per_recipient`).
     RecipientFull,
+    /// The relay-wide offline store budget is spent.
     TotalFull,
+    /// The recipient's queue is over the R26 steady-size sub-cap: a
+    /// [`STEADY_SEALED_LEN`]-sized payload while half of the
+    /// message-count cap is already steady-sized entries. Produced only by
+    /// the `store_offline` folding (which reads it as a full queue, so the
+    /// sender keeps the message tracked); `try_reserve` never returns it.
+    SteadyCap,
 }
 
-/// Byte budget for the offline message store.
+/// Byte and message-count budget of the offline message store.
 ///
-/// One per relay (`RelayState::offline_budget`), sized from the config.
+/// One per relay (`RelayState::offline_budget`), sized from the config: the
+/// global byte ceiling (`offline_queue_max_total_bytes`, the total the
+/// store may hold across all recipients) and, per recipient account, a byte
+/// cap and a message-count cap (`[server.offline_queue]
+/// max_bytes_per_recipient` and `max_messages_per_recipient`). The
+/// per-account caps bound what senders — or one sender with many accounts —
+/// can pin for a single recipient; the global budget bounds the store as a
+/// whole. A message over either per-account cap is refused for that
+/// recipient only; nothing already queued is ever evicted to make room.
 pub struct OfflineBudget {
     used: AtomicUsize,
     max_total: AtomicUsize,
     max_per_recipient: AtomicUsize,
+    max_messages_per_recipient: AtomicUsize,
 }
 
 impl OfflineBudget {
-    pub const fn new(max_total: usize, max_per_recipient: usize) -> Self {
+    pub const fn new(
+        max_total: usize,
+        max_per_recipient: usize,
+        max_messages_per_recipient: usize,
+    ) -> Self {
         Self {
             used: AtomicUsize::new(0),
             max_total: AtomicUsize::new(max_total),
             max_per_recipient: AtomicUsize::new(max_per_recipient),
+            max_messages_per_recipient: AtomicUsize::new(max_messages_per_recipient),
         }
     }
 
@@ -1274,13 +1284,14 @@ impl OfflineBudget {
 
     /// Reserve `cost` bytes for a recipient whose queue currently holds
     /// `recipient_bytes` bytes in `recipient_count` messages.
+    #[allow(deprecated)] // MSRV: std's fetch_update deprecation wants try_update (stabilised 1.105); keep fetch_update until the MSRV passes it.
     pub fn try_reserve(
         &self,
         recipient_bytes: usize,
         recipient_count: usize,
         cost: usize,
     ) -> Result<(), OfflineRejection> {
-        if recipient_count >= OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT
+        if recipient_count >= self.max_messages_per_recipient.load(Ordering::Relaxed)
             || recipient_bytes.saturating_add(cost) > self.max_per_recipient.load(Ordering::Relaxed)
         {
             return Err(OfflineRejection::RecipientFull);
@@ -1298,7 +1309,7 @@ impl OfflineBudget {
     /// Whether `try_reserve` would admit `cost` now, without reserving (the
     /// D34 presence check, final review L-2).
     pub fn would_admit(&self, recipient_bytes: usize, recipient_count: usize, cost: usize) -> bool {
-        recipient_count < OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT
+        recipient_count < self.max_messages_per_recipient.load(Ordering::Relaxed)
             && recipient_bytes.saturating_add(cost)
                 <= self.max_per_recipient.load(Ordering::Relaxed)
             && self
@@ -1308,12 +1319,26 @@ impl OfflineBudget {
                 .is_some_and(|next| next <= self.max_total.load(Ordering::Relaxed))
     }
 
+    /// R26: whether a payload of `payload_len` bytes fits the steady-size
+    /// sub-cap of a queue already holding `steady_sized` entries of that
+    /// size. Entries of exactly [`STEADY_SEALED_LEN`] may fill at most half
+    /// of a recipient's message-count cap; beyond it they are refused like
+    /// a full queue (no ack, so the sender keeps them tracked); nothing is
+    /// ever evicted. Counted per recipient only: no per-sender share or
+    /// tag, which would link senders to recipients beyond §5.2's rule.
+    /// Other sizes always pass (the full-queue limits still apply to them).
+    pub fn steady_sized_admits(&self, steady_sized: usize, payload_len: usize) -> bool {
+        payload_len != STEADY_SEALED_LEN
+            || steady_sized < self.max_messages_per_recipient.load(Ordering::Relaxed) / 2
+    }
+
     /// Account for bytes that were not admitted through `try_reserve`
     /// (messages restored from disk, or re-queued after a failed drain).
     pub fn force_add(&self, cost: usize) {
         self.used.fetch_add(cost, Ordering::AcqRel);
     }
 
+    #[allow(deprecated)] // MSRV: std's fetch_update deprecation wants try_update (stabilised 1.105); keep fetch_update until the MSRV passes it.
     pub fn release(&self, cost: usize) {
         let _ = self
             .used
@@ -1325,6 +1350,152 @@ impl OfflineBudget {
     #[cfg(test)]
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection offline-send budget (security fix #2, review)
+// ---------------------------------------------------------------------------
+
+/// A rolling-window budget of offline sends (bytes and messages) for ONE
+/// sending connection, charged where the connection's message would enter
+/// the offline store. Per-recipient caps bound what can be pinned for each
+/// recipient account; this bounds what ONE connection can pin in the shared
+/// store across many fresh recipient accounts (security review 2026-11-03:
+/// per-recipient caps alone do not stop the total store being filled with
+/// ~64 identities at 4 MiB each).
+///
+/// Per connection, not per source address: addresses may be shared behind
+/// NAT (one budget would punish everyone behind the address), and a
+/// per-connection counter names no one. A spent budget refuses the NEW
+/// message — answered exactly like a full queue (no ack, so the sender
+/// keeps it tracked) — and never evicts anything queued.
+///
+/// The budget refills continuously, by the elapsed fraction of the window,
+/// never past the caps: in any window of `window`, one connection spends at
+/// most `max_bytes` and `max_messages`. Unlike [`TokenBucket`] it never
+/// goes negative: a take that does not fit whole is refused whole.
+#[derive(Debug)]
+pub struct OfflineSendBudget {
+    bytes: f64,
+    messages: f64,
+    byte_cap: f64,
+    message_cap: f64,
+    window: Duration,
+    last: Instant,
+}
+
+impl OfflineSendBudget {
+    /// A full budget: `max_bytes` and `max_messages` per rolling `window`.
+    pub fn new(max_bytes: usize, max_messages: usize, window: Duration) -> Self {
+        Self {
+            bytes: max_bytes as f64,
+            messages: max_messages as f64,
+            byte_cap: max_bytes as f64,
+            message_cap: max_messages as f64,
+            window,
+            last: Instant::now(),
+        }
+    }
+
+    /// Take `bytes` and one message; false when the budget is spent
+    /// (nothing is taken). Refills by the elapsed fraction of the window.
+    pub fn try_take(&mut self, bytes: usize) -> bool {
+        self.try_take_at(bytes, Instant::now())
+    }
+
+    pub fn try_take_at(&mut self, bytes: usize, now: Instant) -> bool {
+        let window = self.window.as_secs_f64().max(f64::MIN_POSITIVE);
+        let frac = (now.saturating_duration_since(self.last).as_secs_f64() / window).min(1.0);
+        self.last = self.last.max(now);
+        self.bytes = (self.bytes + frac * self.byte_cap).min(self.byte_cap);
+        self.messages = (self.messages + frac * self.message_cap).min(self.message_cap);
+        let bytes = bytes as f64;
+        if self.bytes >= bytes && self.messages >= 1.0 {
+            self.bytes -= bytes;
+            self.messages -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the budget has been idle for at least `window`: it is then
+    /// fully refilled and behaves exactly like a fresh entry, so the
+    /// [`SourceSendBudgets`] table may drop it without losing accounting.
+    pub(crate) fn idle_for_at_least(&self, window: Duration, now: Instant) -> bool {
+        now.saturating_duration_since(self.last) >= window
+    }
+}
+
+/// Per-source rolling budgets for offline sends, keyed by the relay's
+/// existing source buckets ([`SourceKey`]: the keyed BLAKE3 digest of the
+/// IPv4 address or IPv6 /48 that the connection caps and the per-source
+/// fair shares already use). Counters only: no addresses are stored and
+/// nothing is logged.
+///
+/// The per-connection [`OfflineSendBudget`] resets on reconnect, and a
+/// handful of connections from one address fit under the connection cap —
+/// either way one address could fill the shared offline store. This table
+/// bounds what ONE SOURCE can pin across all its connections and
+/// reconnects. The cap is a multiple of the per-connection budget
+/// (`[server.offline_queue] sender_source_budget_multiplier`), sized to
+/// tolerate a few users behind one NAT address while staying well under
+/// the total store (validated). Entries idle for at least a window are
+/// pruned by the relay's sweep.
+#[derive(Debug)]
+pub struct SourceSendBudgets {
+    budgets: DashMap<SourceKey, OfflineSendBudget>,
+    byte_cap: usize,
+    message_cap: usize,
+    window: Duration,
+}
+
+impl SourceSendBudgets {
+    /// One rolling budget per source: `multiplier` times the per-connection
+    /// caps, per the same `window`.
+    pub fn new(
+        per_connection_bytes: usize,
+        per_connection_messages: usize,
+        multiplier: usize,
+        window: Duration,
+    ) -> Self {
+        Self {
+            budgets: DashMap::new(),
+            byte_cap: per_connection_bytes.saturating_mul(multiplier),
+            message_cap: per_connection_messages.saturating_mul(multiplier),
+            window,
+        }
+    }
+
+    /// Charge `bytes` (and one message) against `source`'s budget, making
+    /// the entry full on first sight. False when the source's window is
+    /// spent; nothing is evicted anywhere.
+    pub fn charge(&self, source: SourceKey, bytes: usize) -> bool {
+        self.charge_at(source, bytes, Instant::now())
+    }
+
+    fn charge_at(&self, source: SourceKey, bytes: usize, now: Instant) -> bool {
+        self.budgets
+            .entry(source)
+            .or_insert_with(|| OfflineSendBudget::new(self.byte_cap, self.message_cap, self.window))
+            .try_take_at(bytes, now)
+    }
+
+    /// Drop entries idle for at least a window (fully refilled, so
+    /// equivalent to fresh). Called by the relay's sweep.
+    pub fn prune(&self) {
+        self.prune_at(Instant::now());
+    }
+
+    fn prune_at(&self, now: Instant) {
+        self.budgets
+            .retain(|_, b| !b.idle_for_at_least(self.window, now));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.budgets.len()
     }
 }
 
@@ -1468,18 +1639,20 @@ mod tests {
 
     #[test]
     fn steady_sized_entries_may_fill_half_of_a_recipient_queue() {
-        assert_eq!(
-            OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT,
-            OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT / 2
-        );
         assert_eq!(STEADY_SEALED_LEN, 1226);
-        let cap = OFFLINE_QUEUE_MAX_STEADY_SIZED_PER_RECIPIENT;
-        assert!(steady_sized_admits(cap - 1, STEADY_SEALED_LEN));
-        assert!(!steady_sized_admits(cap, STEADY_SEALED_LEN));
-        assert!(!steady_sized_admits(cap + 7, STEADY_SEALED_LEN));
+        // The sub-cap is half of the configured per-recipient message cap.
+        let b = OfflineBudget::new(usize::MAX, usize::MAX, 100);
+        let cap = 50;
+        assert!(b.steady_sized_admits(cap - 1, STEADY_SEALED_LEN));
+        assert!(!b.steady_sized_admits(cap, STEADY_SEALED_LEN));
+        assert!(!b.steady_sized_admits(cap + 7, STEADY_SEALED_LEN));
         for len in [0, 458, STEADY_SEALED_LEN - 1, STEADY_SEALED_LEN + 1, 4298] {
-            assert!(steady_sized_admits(cap * 2, len), "{len}");
+            assert!(b.steady_sized_admits(cap * 2, len), "{len}");
         }
+        // An odd cap rounds down.
+        let odd = OfflineBudget::new(usize::MAX, usize::MAX, 101);
+        assert!(odd.steady_sized_admits(49, STEADY_SEALED_LEN));
+        assert!(!odd.steady_sized_admits(50, STEADY_SEALED_LEN));
     }
 
     // ---- token bucket ----
@@ -1783,7 +1956,7 @@ mod tests {
 
     #[test]
     fn offline_budget_enforces_total_and_per_recipient() {
-        let b = OfflineBudget::new(1000, 600);
+        let b = OfflineBudget::new(1000, 600, 1000);
         b.try_reserve(0, 0, 500).unwrap();
         // Per-recipient: 500 + 200 > 600.
         assert_eq!(
@@ -1801,12 +1974,136 @@ mod tests {
     }
 
     #[test]
-    fn offline_budget_enforces_message_count() {
-        let b = OfflineBudget::new(usize::MAX, usize::MAX);
-        assert_eq!(
-            b.try_reserve(0, OFFLINE_QUEUE_MAX_MESSAGES_PER_RECIPIENT, 1),
-            Err(OfflineRejection::RecipientFull)
+    fn offline_budget_enforces_the_configured_message_count() {
+        let b = OfflineBudget::new(usize::MAX, usize::MAX, 3);
+        b.try_reserve(0, 2, 1).unwrap();
+        // The third message reaches the count cap, whatever its size.
+        assert_eq!(b.try_reserve(0, 3, 1), Err(OfflineRejection::RecipientFull));
+        // Another recipient under the same budget is unaffected.
+        b.try_reserve(0, 0, 1).unwrap();
+        assert_eq!(b.used(), 2);
+    }
+
+    // ---- per-connection offline-send budget (security fix #2, review) ----
+
+    /// A rolling window: both caps are spent independently, refill by the
+    /// elapsed fraction of the window, never past the caps, and a take that
+    /// does not fit whole is refused whole.
+    #[test]
+    fn offline_send_budget_is_a_rolling_window() {
+        let mut b = OfflineSendBudget::new(1_000, 2, Duration::from_secs(900));
+        // Constructed before t0 so the clocks below are in order.
+        let t0 = Instant::now();
+        assert!(b.try_take_at(600, t0));
+        assert!(b.try_take_at(400, t0));
+        // Both caps spent.
+        assert!(!b.try_take_at(1, t0));
+        // Half a window later: half of each cap is back, not more.
+        let t1 = t0 + Duration::from_secs(450);
+        assert!(!b.try_take_at(501, t1));
+        assert!(b.try_take_at(500, t1));
+        assert!(!b.try_take_at(1, t1), "only one message refilled");
+        // A full window refills both caps, never past them.
+        let t2 = t1 + Duration::from_secs(900);
+        assert!(b.try_take_at(1_000, t2));
+        assert!(!b.try_take_at(1, t2));
+        // A message bigger than the cap never fits.
+        let mut big = OfflineSendBudget::new(100, 10, Duration::from_secs(900));
+        assert!(!big.try_take_at(101, t0));
+        assert!(big.try_take_at(100, t0));
+        assert!(!big.try_take_at(1, t0));
+        // An out-of-order clock never refills.
+        assert!(!b.try_take_at(1, t0), "earlier clock: no refill");
+    }
+
+    /// The per-source table: one rolling window per source bucket (however
+    /// many connections or reconnects share it), other sources unaffected,
+    /// a full window restores a spent budget, and entries idle for a
+    /// window are pruned without losing accounting.
+    #[test]
+    fn source_send_budgets_bind_a_source_not_its_connections() {
+        let t0 = Instant::now();
+        // 2,000 bytes / 200 messages per source (1,000 x 2).
+        let budgets = SourceSendBudgets::new(1_000, 100, 2, Duration::from_secs(900));
+        let s1 = SourceKey([1; 32]);
+        let s2 = SourceKey([2; 32]);
+        for i in 0..30u8 {
+            assert!(budgets.charge_at(s1, 66, t0), "take {i}");
+        }
+        assert_eq!(30 * 66, 1_980, "test arithmetic");
+        assert!(
+            !budgets.charge_at(s1, 66, t0),
+            "the source cap is spent however fresh the connection"
         );
+        assert!(
+            budgets.charge_at(s2, 66, t0),
+            "another source is unaffected"
+        );
+        // A full window restores the spent source's budget.
+        let t1 = t0 + Duration::from_secs(900);
+        assert!(budgets.charge_at(s1, 2_000, t1));
+        assert!(!budgets.charge_at(s1, 1, t1), "spent again until refill");
+        // Entries idle for at least a window are pruned; an active entry
+        // keeps its partial budget.
+        let budgets = SourceSendBudgets::new(1_000, 100, 2, Duration::from_secs(900));
+        assert!(budgets.charge_at(s1, 66, t0));
+        assert!(budgets.charge_at(s2, 66, t1));
+        assert_eq!(budgets.len(), 2);
+        let t2 = t1 + Duration::from_secs(899);
+        budgets.prune_at(t2);
+        assert_eq!(budgets.len(), 1, "the idle source's entry is pruned");
+        assert!(
+            budgets.charge_at(s2, 1_980, t2),
+            "the active source keeps its partially spent budget"
+        );
+        // A pruned source comes back with a full budget.
+        assert!(budgets.charge_at(s1, 1_980, t2));
+    }
+
+    /// Review round 3: the budgets refill, but queued messages stay for
+    /// the TTL. With the old 15-minute window a source banked its full
+    /// budget every window — reaching the total store in about an hour —
+    /// because its earlier messages had not expired. With the window at
+    /// least the TTL (the default tracks it), four consecutive windows
+    /// inside the TTL bank about one budget, not four; an unrelated
+    /// source is unaffected throughout.
+    #[test]
+    fn source_window_must_cover_the_ttl_or_one_source_banks_a_budget_per_window() {
+        let t0 = Instant::now();
+        let attacker = SourceKey([7; 32]);
+        let other = SourceKey([8; 32]);
+        // 2,000 bytes per source; four consecutive 15-minute windows
+        // (nothing queued has expired: the TTL is 72 h).
+        let ttl_sized = SourceSendBudgets::new(2_000, 1_000, 1, Duration::from_secs(259_200));
+        let short_window = SourceSendBudgets::new(2_000, 1_000, 1, Duration::from_secs(900));
+        let banked = |budgets: &SourceSendBudgets| -> usize {
+            let mut total = 0usize;
+            for w in 0..4u64 {
+                let at = t0 + Duration::from_secs(900) * w as u32;
+                while budgets.charge_at(attacker, 66, at) {
+                    total += 66;
+                }
+            }
+            total
+        };
+        let with_ttl_window = banked(&ttl_sized);
+        let with_short_window = banked(&short_window);
+        assert!(
+            with_short_window >= 4 * 1_900,
+            "the short window banks a full budget per window: {with_short_window}"
+        );
+        assert!(
+            with_ttl_window <= 2 * 2_000,
+            "the TTL-sized window holds one source to about one budget: {with_ttl_window}"
+        );
+        assert!(
+            with_ttl_window * 2 <= with_short_window,
+            "the fix must bank at most half of what the short window banks"
+        );
+        // The attacker is still refused on the spot, and an unrelated
+        // source is unaffected.
+        assert!(!ttl_sized.charge_at(attacker, 66, t0 + Duration::from_secs(3_600)));
+        assert!(ttl_sized.charge_at(other, 2_000, t0 + Duration::from_secs(3_600)));
     }
 
     #[tokio::test]

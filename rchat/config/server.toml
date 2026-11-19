@@ -195,15 +195,21 @@ max_circuits = 200000
 # (reason="circuit_evicted") instead of being refused.
 # max_circuits_per_source = 3125
 
-# Offline message store (messages for recipients that are not connected).
-# A message that would exceed either cap is REFUSED: the sender gets no
-# MessageAck and receives a RateLimited error instead
-# (rchat_rejections_total{reason="queue_overflow"}). Queued messages are
-# never dropped to make room. There is also a fixed cap of 1000 messages per
-# recipient. Retention: see [server.offline_queue] below (72 h by default).
-# Defaults: 268435456 (256 MiB) total, 16777216 (16 MiB) per recipient.
+# Offline message store (messages for recipients that are not connected):
+# a global byte ceiling (offline_queue_max_total_bytes, below) plus, per
+# recipient account, a byte cap and a message-count cap (under
+# [server.offline_queue] below). A message that would exceed any of them is
+# REFUSED: the sender gets no MessageAck and receives a RateLimited error
+# instead (rchat_rejections_total{reason="queue_overflow"} for the total
+# budget, reason="offline_recipient_cap" for a recipient over their
+# per-account caps). Queued messages are never dropped to make room, for
+# that recipient or anyone else; they expire after the queue TTL.
+# Default: 268435456 (256 MiB).
+# (The old offline_queue_max_bytes_per_recipient key still parses for one
+# release, with a startup warning: it maps to [server.offline_queue]
+# max_bytes_per_recipient when that is unset. The new key wins when both
+# are set.)
 offline_queue_max_total_bytes = 268435456
-offline_queue_max_bytes_per_recipient = 16777216
 
 # Relay-wide memory budgets. When one is spent, the heaviest source's
 # heaviest connection is shed. Size them with the offline queue to the host's
@@ -232,6 +238,59 @@ ttl_secs = 259200
 # the oldest knock of the heaviest source is evicted (among equally heavy
 # sources, the oldest knock).
 knock_budget_bytes = 16777216
+# Per-recipient-account caps on the offline store. Senders targeting one
+# account can hold at most this many bytes and this many queued messages for
+# it at once; a message over either cap is refused for THAT account only
+# (rchat_rejections_total{reason="offline_recipient_cap"}). Nothing queued
+# for that account or any other is ever evicted to make room; messages
+# expire after ttl_secs. max_bytes_per_recipient must be at least
+# max_message_bytes and at most the total budget above;
+# max_messages_per_recipient must be 1-4096 (steady-sized cover messages may
+# fill at most half of it). Together the caps bound what any number of free
+# accounts can pin in the store: at the defaults, at least 64 accounts must
+# be (ab)used to reach the 256 MiB total budget.
+# Defaults: 4194304 (4 MiB) and 256.
+max_bytes_per_recipient = 4194304
+max_messages_per_recipient = 256
+# Per-connection budget for queueing messages to offline recipients: at most
+# this many bytes and messages per rolling sender_window_secs from ONE
+# connection. Per-recipient caps bound each recipient account; this bounds
+# one sender: without it, a single connection could fill the shared store
+# with messages for many fresh recipient accounts (64 at the defaults would
+# reach the total budget). Per connection, not per source address —
+# addresses may be shared behind NAT, and a per-connection counter names no
+# one. A message over the budget is refused for that sender only, with the
+# same queue-full answer as a full queue
+# (rchat_rejections_total{reason="offline_sender_budget"}); nothing queued
+# is evicted, and the budget refills continuously, so a sender's messages
+# are only delayed, not lost. sender_window_secs must be at least
+# ttl_secs (below) and at most 72 h — the window MUST cover the retention
+# period: the budgets refill, but queued messages stay for the TTL, so a
+# shorter window would let a source bank its full budget every window
+# while its earlier messages are still queued. sender_budget_bytes at
+# least max_message_bytes and at most the total budget;
+# sender_budget_messages 1-65536. Default 16777216 (16 MiB) and 1024; the
+# window defaults to ttl_secs.
+sender_budget_bytes = 16777216
+sender_budget_messages = 1024
+# sender_window_secs = 259200   # default: ttl_secs (see above)
+# The per-connection budget resets on reconnect, and a handful of
+# connections from one address fit under the connection cap — so the
+# sender budgets above are ALSO applied per SOURCE: one rolling budget,
+# sized sender_budget_bytes (and sender_budget_messages) x this multiple,
+# shared by every connection of a source. The source is the relay's
+# existing source bucket — a keyed digest of the IPv4 address or IPv6 /48,
+# the same buckets as the connection caps and the per-source fair shares;
+# only counters are kept and nothing is logged. A multiple (not the bare
+# cap) tolerates a few users behind one NAT address while keeping one
+# source well under the total store. Refusals count
+# rchat_rejections_total{reason="offline_source_budget"}. Where a
+# connection's source is unknown (max_connections_per_ip = 0 without
+# proxy_protocol) the per-source budget does not apply and startup says
+# so; the per-connection budget still bounds each connection. At least 1,
+# and sender_budget_bytes x this must stay at most the total budget.
+# Default: 4.
+sender_source_budget_multiplier = 4
 # Keep queued items across restarts, encrypted. Requires a 32-byte key on a
 # memory filesystem (tmpfs/ramfs/mfs), owned by the service user, mode 0600
 # or stricter, on a different filesystem from persist_path.

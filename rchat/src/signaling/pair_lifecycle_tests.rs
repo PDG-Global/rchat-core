@@ -72,6 +72,11 @@ fn fake_conn(
             peer_bundle: None,
             held: None,
             media: None,
+            offline_send_budget: crate::limits::OfflineSendBudget::new(
+                16 << 20,
+                1024,
+                Duration::from_secs(900),
+            ),
         },
     );
     if let Some(i) = id {

@@ -386,7 +386,7 @@ mod tests {
     /// offline store's budget untouched.
     #[test]
     fn held_copies_never_touch_the_offline_budget() {
-        let offline = crate::limits::OfflineBudget::new(1 << 20, 1 << 20);
+        let offline = crate::limits::OfflineBudget::new(1 << 20, 1 << 20, 1000);
         let budget = Arc::new(HeldBudget::new(1000, 1000));
         let held = new_held(&budget);
         for _ in 0..20 {

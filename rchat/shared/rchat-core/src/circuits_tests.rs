@@ -3426,7 +3426,7 @@ fn unpadded_ratchet_plaintext_is_dropped_without_receipt() {
             p.a.session_manager
                 .get_mut(&p.pb.hex)
                 .unwrap()
-                .encrypt_message(raw)
+                .encrypt_message(raw, &[9; 16])
                 .unwrap();
         let mut body = header.encode();
         body.extend_from_slice(&ciphertext);

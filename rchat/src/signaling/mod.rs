@@ -237,6 +237,14 @@ pub(crate) struct RelayState {
     pub(crate) knocks: Arc<knock_store::KnockStore>,
     /// Byte budget of the offline message store (knocks excluded).
     pub(crate) offline_budget: Arc<OfflineBudget>,
+    /// Per-source rolling budgets of offline sends, keyed by the source
+    /// buckets the relay already uses for the connection caps and the fair
+    /// shares ([`limits::SourceKey`]: a keyed digest of the IPv4 address or
+    /// IPv6 /48). Counters only. Bounds what one address can pin in the
+    /// shared store across many connections or a reconnect loop, whatever
+    /// the per-connection budget; connections whose source is unknown
+    /// (`max_connections_per_ip = 0` without `proxy_protocol`) skip it.
+    pub(crate) source_send_budgets: Arc<limits::SourceSendBudgets>,
     /// Bytes waiting in all outbound queues together, and who holds them
     /// (R-17, H-1).
     pub(crate) outbound: Arc<limits::OutboundBudget>,
@@ -287,7 +295,14 @@ impl RelayState {
         ));
         let offline_budget = Arc::new(OfflineBudget::new(
             config.offline_queue_max_total_bytes,
-            config.offline_queue_max_bytes_per_recipient,
+            config.offline_queue_max_bytes_per_recipient(),
+            config.offline_queue.max_messages_per_recipient,
+        ));
+        let source_send_budgets = Arc::new(limits::SourceSendBudgets::new(
+            config.offline_queue.sender_budget_bytes,
+            config.offline_queue.sender_budget_messages,
+            config.offline_queue.sender_source_budget_multiplier,
+            Duration::from_secs(config.offline_queue.sender_window_secs()),
         ));
         let outbound = limits::OutboundBudget::new(config.outbound_budget_bytes);
         let buffers = limits::BufferBudget::new(config.buffer_budget_bytes);
@@ -310,6 +325,7 @@ impl RelayState {
             message_queues: Arc::new(DashMap::new()),
             knocks,
             offline_budget,
+            source_send_budgets,
             outbound,
             writer_stall: limits::WRITER_STALL_TIMEOUT,
             keepalive_ping_every: None,
@@ -512,6 +528,16 @@ pub(crate) struct UnifiedConnection {
     held: Option<Arc<held::HeldCopies>>,
     /// Set once this connection joined a call (it is then a call connection).
     media: Option<media::LaneState>,
+    /// Rolling-window budget of offline sends (bytes + messages per
+    /// `[server.offline_queue] sender_window_secs`) this connection may
+    /// spend queueing messages for offline recipients (security fix #2,
+    /// review): bounds what one connection can pin in the shared store with
+    /// many fresh recipient accounts. Per connection, not per source
+    /// address: addresses may be shared behind NAT, and a per-connection
+    /// counter names no one. A spent budget refuses the connection's NEW
+    /// message, answered exactly like a full queue; nothing queued is
+    /// evicted.
+    offline_send_budget: limits::OfflineSendBudget,
 }
 
 /// (pin, version) of the identity at `path`. A missing key is an error
@@ -1128,6 +1154,7 @@ fn sweep_stale_state(now: Instant, state: &RelayState) {
     prune_pending_charges(now, state);
     expire_queues(crate::protocol::timestamp(), state);
     state.knocks.prune_quota(now);
+    state.source_send_budgets.prune();
     let asks = circuits::sweep_asks(now, &live, state);
     let pairs = circuits::sweep_pairs(now, &live, state);
     if asks + pairs > 0 {
@@ -1680,6 +1707,11 @@ where
             peer_bundle: None,
             held: Some(held.clone()),
             media: None,
+            offline_send_budget: limits::OfflineSendBudget::new(
+                _config.offline_queue.sender_budget_bytes,
+                _config.offline_queue.sender_budget_messages,
+                Duration::from_secs(_config.offline_queue.sender_window_secs()),
+            ),
         },
     );
 
@@ -2388,7 +2420,10 @@ fn requeue_salvaged(tag: IdTag, msgs: Vec<StoredMessage>, state: &RelayState) ->
         let cost = m.budget_cost();
         match state.offline_budget.try_reserve(bytes, count, cost) {
             Ok(()) => {
-                if !limits::steady_sized_admits(steady_sized, m.payload.len()) {
+                if !state
+                    .offline_budget
+                    .steady_sized_admits(steady_sized, m.payload.len())
+                {
                     over_sub_cap += 1;
                 }
                 if m.payload.len() == limits::STEADY_SEALED_LEN {
@@ -3018,7 +3053,16 @@ async fn handle_relay_packet(
     // under a new token. Offline, the packet is filed in its queue; live
     // elsewhere, the row ends and the sender gets `CircuitNotFound`.
     let hand_over = matches!(routing.pair, PairKey::Identity(_));
-    match forward_to_live_identity(target_tag, target_id, &packet.payload, hand_over, state).await {
+    match forward_to_live_identity(
+        target_tag,
+        target_id,
+        from,
+        &packet.payload,
+        hand_over,
+        state,
+    )
+    .await
+    {
         ForwardOutcome::Forwarded | ForwardOutcome::Queued => {
             send_message_ack(from, &message_id, connections)
         }
@@ -3039,8 +3083,8 @@ async fn handle_relay_packet(
         }
         ForwardOutcome::Refused => {
             // Only members of a circuit (accepted contacts) can get here.
-            // The refusal was counted where it happened (`store_offline` or
-            // `requeue_salvaged`).
+            // The refusal was counted where it happened (`store_offline`,
+            // the sender-budget check or `requeue_salvaged`).
             let error_msg = FrameBuilder::error(
                 ControlErrorCode::RateLimited,
                 format!(
@@ -3070,6 +3114,33 @@ enum ForwardOutcome {
     Moved,
 }
 
+/// Charge `bytes` (and one message) against the sender's rolling
+/// offline-send budgets — first the per-connection one, then the
+/// per-source one for the connection's source bucket. Returns the metric
+/// label to count when a budget is spent (`None` = admitted). Checked
+/// where a sender's message enters the offline store (the offline branch
+/// and the failed-hand-over requeue of `forward_to_live_identity`), so one
+/// address cannot fill the shared store with messages for many fresh
+/// recipient accounts — however many connections it opens or reconnects
+/// it makes. Both refusals are answered exactly like a full queue (no ack,
+/// so the sender keeps the message tracked); nothing queued is evicted.
+/// A connection whose source is unknown (`max_connections_per_ip = 0`
+/// without `proxy_protocol`) is bounded by the per-connection budget only.
+/// A vanished connection has no read loop left to flood from: admit.
+fn charge_offline_send(state: &RelayState, sender: ClientId, bytes: usize) -> Option<&'static str> {
+    let mut conn = state.connections.get_mut(&sender)?;
+    if !conn.offline_send_budget.try_take(bytes) {
+        return Some(metrics::REJECT_OFFLINE_SENDER_BUDGET);
+    }
+    let source = conn.source;
+    match source {
+        Some(key) if !state.source_send_budgets.charge(key, bytes) => {
+            Some(metrics::REJECT_OFFLINE_SOURCE_BUDGET)
+        }
+        _ => None,
+    }
+}
+
 /// D34: the decision is made under `ID_LOCKS(target_tag)`, the lock publish
 /// holds while it maps the identity and takes its queue, so a packet is
 /// either queued before the take (and drained by it) or sees the new
@@ -3078,6 +3149,7 @@ enum ForwardOutcome {
 async fn forward_to_live_identity(
     target_tag: IdTag,
     slot_client: ClientId,
+    sender: ClientId,
     payload: &[u8],
     hand_over: bool,
     state: &RelayState,
@@ -3143,7 +3215,9 @@ async fn forward_to_live_identity(
             .map(|q| (q.bytes, q.message_count(), q.steady_sized_count()))
             .unwrap_or((0, 0, 0));
         if !state.offline_budget.would_admit(bytes, count, cost)
-            || !limits::steady_sized_admits(steady_sized, payload.len())
+            || !state
+                .offline_budget
+                .steady_sized_admits(steady_sized, payload.len())
         {
             drop(guard);
             metrics::reject(metrics::REJECT_QUEUE_OVERFLOW);
@@ -3153,6 +3227,21 @@ async fn forward_to_live_identity(
     }
     let Some(tx) = live else {
         // Offline: queue under the lock (drained by the next publish).
+        // The sender's rolling budget is charged first: a spent budget is
+        // answered exactly like a full queue, so the refusal reveals nothing
+        // about the recipient (same answer online-without-resume). The
+        // charge is what the store will hold for the message, the same
+        // accounting as the per-recipient caps and the total budget.
+        if let Some(label) = charge_offline_send(
+            state,
+            sender,
+            OfflineBudget::message_cost(payload.len(), 0, 0),
+        ) {
+            drop(guard);
+            metrics::reject(label);
+            debug!("Offline send budget spent; refusing message");
+            return ForwardOutcome::Refused;
+        }
         #[cfg(test)]
         tests_hook::before_offline_store(target_tag);
         let admitted = store_offline(target_tag, payload.to_vec(), state);
@@ -3176,6 +3265,18 @@ async fn forward_to_live_identity(
         return ForwardOutcome::Forwarded;
     }
     debug!("Relay: hand-over to a member that has not resumed failed; re-queueing");
+    // The message did not reach the member and is about to enter the
+    // offline store: the sender's rolling budget is charged, as in the
+    // offline branch above.
+    if let Some(label) = charge_offline_send(
+        state,
+        sender,
+        OfflineBudget::message_cost(payload.len(), 0, 0),
+    ) {
+        metrics::reject(label);
+        debug!("Offline send budget spent; refusing message");
+        return ForwardOutcome::Refused;
+    }
     requeue_after_failed_forward(target_tag, payload.to_vec(), state).await
 }
 
@@ -3236,15 +3337,16 @@ fn store_offline(tag: IdTag, payload: Vec<u8>, state: &RelayState) -> bool {
     let admitted = {
         let mut queue = message_queues.entry(tag).or_default();
         let messages = queue.message_count();
-        let steady_ok =
-            limits::steady_sized_admits(queue.steady_sized_count(), stored_msg.payload.len());
+        let steady_ok = state
+            .offline_budget
+            .steady_sized_admits(queue.steady_sized_count(), stored_msg.payload.len());
         // R26: over the steady-size sub-cap reads as a full queue.
         let reserved = if steady_ok {
             state
                 .offline_budget
                 .try_reserve(queue.bytes, messages, cost)
         } else {
-            Err(limits::OfflineRejection::RecipientFull)
+            Err(limits::OfflineRejection::SteadyCap)
         };
         match reserved {
             Ok(()) => {
@@ -3265,7 +3367,15 @@ fn store_offline(tag: IdTag, payload: Vec<u8>, state: &RelayState) -> bool {
     match admitted {
         Ok(()) => true,
         Err(reason) => {
-            metrics::reject(metrics::REJECT_QUEUE_OVERFLOW);
+            // The per-account caps get their own label (security fix #2): a
+            // recipient over their cap reveals nothing about other
+            // recipients, and nothing queued is ever evicted to make room.
+            // No identifiers in this log line, per privacy.rs.
+            let label = match reason {
+                limits::OfflineRejection::RecipientFull => metrics::REJECT_OFFLINE_RECIPIENT_CAP,
+                _ => metrics::REJECT_QUEUE_OVERFLOW,
+            };
+            metrics::reject(label);
             debug!("Offline queue full ({:?}); refusing message", reason);
             false
         }
