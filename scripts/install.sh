@@ -41,7 +41,7 @@ RCHAT_SIGN_NAMESPACE="rchat-release"
 # (same ceremony as the release version). A genuinely signed OLD release
 # served by a compromised download host is refused because its signed
 # manifest version is below this floor.
-RCHAT_MIN_VERSION="2.1.0"
+RCHAT_MIN_VERSION="2.1.1"
 VERIFIED_MANIFEST=""
 
 TMP=""
