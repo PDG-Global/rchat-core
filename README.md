@@ -1,7 +1,7 @@
 # rChat
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 rChat is a self-hosted end-to-end encrypted messenger. Messages are encrypted on your phone and decrypted only by the person you send them to. The relay in between passes on ciphertext it cannot read, and keeps no lasting record of who talks to whom.
 
@@ -39,7 +39,7 @@ rchat/
 
 ## Building
 
-Requires Rust 1.75+. The client library builds BoringSSL, so it also needs cmake and a C toolchain.
+Requires Rust 1.88+. The client library builds BoringSSL, so it also needs cmake and a C toolchain.
 
 ```bash
 cd rchat

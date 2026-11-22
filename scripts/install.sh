@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/PDG-Global/rchat-core/<tag>/scripts/install.sh -o install.sh
 #   sudo sh install.sh
-#   sudo sh install.sh --version 2.1.0 --dry-run
+#   sudo sh install.sh --version 2.1.1 --dry-run
 #
 # Downloads the rchat-server binary for this platform and installs it. Every
 # downloaded file is verified against the SIGNED aggregate manifest

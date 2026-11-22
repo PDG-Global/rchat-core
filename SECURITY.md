@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 1.1.x   | Yes       |
-| < 1.1   | No        |
+| 2.1.x   | Yes       |
+| < 2.1   | No        |
 
 ## Reporting a Vulnerability
 
@@ -32,7 +32,7 @@ We will acknowledge receipt within 48 hours and send a more detailed response wi
 In scope:
 
 - The relay (`rchat-server`): connection handling, key authentication, circuits, the offline queue, rate limits and budgets, TLS and ACME handling.
-- The client library (`shared/rchat-core`): X3DH v2, the Double Ratchet, sealed payloads, key authentication, relay pinning, key rotation, session persistence and recovery, and the C FFI.
+- The client library (`shared/rchat-core`): X3DH v3 (X25519 with ML-KEM-768), the Double Ratchet, sealed payloads, key authentication, relay pinning, key rotation, session persistence and recovery, and the C FFI.
 
 Out of scope:
 
