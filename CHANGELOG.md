@@ -37,7 +37,7 @@ Protocol v3, a hard cutover: update the relay and the app together; v2 apps are 
 - Disappearing messages: per-conversation timer (5 min to 4 weeks), synced inside the session.
 - Alerts while the app is closed: local notifications from background checks, no notification server; name only by default.
 - Contact codes are v3 (about 1.7 KB, with the ML-KEM key); older codes are refused. Knocks are 5120 bytes.
-- Relay: blind asks have their own caps, `max_pending_blind_per_connection` (default 1024) and `max_pending_blind_per_source` (default 4096); `max_pending_per_connection` and `max_pending_per_source` count identity asks only. Busy relays should raise `max_pending_circuit_targets` (default 10,000; blind asks take about 4 per offline contact per online user, about 2.8 KB each).
+- Relay: blind asks have their own caps, `max_pending_blind_per_connection` (default 1024) and `max_pending_blind_per_source` (default 4096); `max_pending_per_connection` and `max_pending_per_source` count identity asks only. Busy relays should raise `max_pending_circuit_targets` (default 18,000; blind asks take about 4 per offline contact per online user, about 2.8 KB each).
 - Relay: `offline_queue.ttl_secs` is capped at 72 hours; steady-size entries capped at half a recipient's queue; new blinded-pairing metrics; unknown frame types close the connection.
 - Known limitation: re-pairing can take up to about 3–4 minutes when the first asker drops before the other side's first reply.
 
